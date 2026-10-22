@@ -7,7 +7,7 @@
 #include <optional>
 #include "exl3/retained_descriptor_ledger.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace bounded_shared_detail {
 template<class T,std::size_t ControlBytes> struct Storage {
     static_assert(ControlBytes>0);

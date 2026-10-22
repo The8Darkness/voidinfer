@@ -2,7 +2,7 @@
 #include "exl3/vericache_request.h"
 #include <optional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // One physical execution lane, bounded independent active requests. A lease
 // covers tentative work through repair/publication; cancellation invalidates
 // publication without pretending already issued GPU work was free.
@@ -65,4 +65,4 @@ public:
     const std::shared_ptr<const Exl3VeriCacheRequest>& state(std::size_t id) const {return slots_.at(id).state;}
     std::size_t size() const noexcept {return slots_.size();}
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

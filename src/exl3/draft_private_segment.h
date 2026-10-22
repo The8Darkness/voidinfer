@@ -4,7 +4,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // One actual B8 proposal, never a causal M16 sequence. Physical owners remain
 // with the caller's exclusive lane; this fixed descriptor owns no ring storage.
 struct Exl3DraftPrivateSegment {

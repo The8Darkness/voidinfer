@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // One copy of a verifier row's per-row state when an accepted sibling leaf is
 // promoted into its chain slot: dst[i * stride] = src[i * stride] for
@@ -18,7 +18,8 @@ struct Exl3SiblingRowCopy {
     int stride = 1;
     int slot_elements = 0;
     // Window-ring entries (L0 OSCAR): src/dst are ring bases and the rows
-    // src_row/dst_row relative to the attempt base wrap with ring_mask.
+    // src_row/dst_row relative to the attempt base wrap modulo ring_mask
+    // (ring rows; 0 = linear).
     int ring_mask = 0;
     int src_row = 0;
     int dst_row = 0;
@@ -41,4 +42,4 @@ inline int exl3_pack_sibling_offsets(std::span<const int> offsets, int chain_row
     return packed;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

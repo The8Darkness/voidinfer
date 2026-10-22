@@ -1,7 +1,7 @@
 #include "exl3/retirement_state.h"
 #include <stdexcept>
 #include <iostream>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 void need(bool value){if(!value)throw std::runtime_error("retirement transition");}
 int main(){try{
     Exl3RetirementState good;need(good.begin(false));need(!good.result().reusable());

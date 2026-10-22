@@ -1,19 +1,19 @@
 #pragma once
 
-void capture_k6_stream_inputs(const ninfer::exl3::Exl3TargetProjectionObservation& item,void* user){
+void capture_k6_stream_inputs(const voidinfer::exl3::Exl3TargetProjectionObservation& item,void* user){
     if(item.metadata.K==6 && item.metadata.in_features!=17408 && item.metadata.out_features!=248320)
         capture_target_k6_projection(item,user);
 }
 
 void run_k6_stream_operator_gate(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose,const std::filesystem::path& dir,int prefix=512){
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     require(!std::filesystem::exists(dir),"preserve stream operator receipt");std::filesystem::create_directories(dir);
     std::ofstream checks(dir/"operators.csv");checks<<"fixture,record,layer,operation,rows,values,exact,repeat,guards,input_unchanged\n";
     std::array<std::unique_ptr<DeviceBuffer>,5> storage;std::array<std::uint16_t*,5> staging{};
     for(int t=0;t<5;++t){storage[t]=std::make_unique<DeviceBuffer>(16ULL*kHidden*2);staging[t]=static_cast<std::uint16_t*>(storage[t]->get());}
     std::uint64_t values=0,cases=0;
-    _putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","0");
+    _putenv_s("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","0");
     for(int fixture=0;fixture<2;++fixture){
         const auto& input=fixture?prose:code;require(input.size()>=prefix,"operator prefix length");
         auto context=target.create_context(true);context->prepare_continuation(8);
@@ -28,7 +28,7 @@ void run_k6_stream_operator_gate(Exl3TextModel& target,Exl3Dflash2DraftModel& dr
         context.reset();root.reset();
         for(std::size_t index=0;index<captured.size();++index){
             const auto& item=captured[index];const auto& op=item.operation;
-            auto make=[&](bool candidate){_putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",candidate?"1":"0");
+            auto make=[&](bool candidate){_putenv_s("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",candidate?"1":"0");
                 return std::make_unique<Exl3CudaLinearWorkspace>(item.metadata.in_features,item.metadata.out_features,8,false,
                     op=="gate"||op=="up",op=="down",op=="o",op=="z",true,false,Exl3CudaAccumulationView{},Exl3CudaTransformView{},op=="qkv",op=="k"||op=="v",op=="q");};
             auto control=make(false),candidate=make(true);require(control->workspace_bytes()==candidate->workspace_bytes(),"K6 stream reserve changed");
@@ -59,7 +59,7 @@ void run_k6_stream_operator_gate(Exl3TextModel& target,Exl3Dflash2DraftModel& dr
             }
             require(candidate->stream_reduction_calls()>0,"candidate was not executed");
         }
-        _putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","0");
+        _putenv_s("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","0");
     }
     std::ofstream(dir/"result.json")<<nlohmann::ordered_json{{"status","PASS_K6_STREAM_OPERATORS"},{"cases",cases},{"values",values},{"artifacts","same pinned target/draft"}}.dump(2);
     std::cout<<"K6_STREAM_OPERATORS PASS cases="<<cases<<" values="<<values<<'\n'<<std::flush;

@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Passed by value as a kernel argument. No device pointer table allocation or
 // asynchronous metadata upload is needed; pointed-to pages have separate leases.
 struct Exl3AttentionPageRanges {

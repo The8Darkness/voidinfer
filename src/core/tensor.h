@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <initializer_list>
 
-namespace ninfer {
+namespace voidinfer {
 
 struct Tensor {
     void* data         = nullptr;
@@ -70,4 +70,4 @@ struct Weight {
     float input_scale_divisor  = 0.0F;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

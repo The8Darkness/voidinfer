@@ -23,7 +23,7 @@ struct V1Clock {
 };
 
 struct V1Oracle {
-#if defined(NINFER_V1_EXPORT)
+#if defined(VOIDINFER_V1_EXPORT)
     static constexpr bool exporting=true;
 #else
     static constexpr bool exporting=false;
@@ -43,19 +43,19 @@ struct V1Oracle {
     std::uint64_t get64(){std::uint64_t v=0;for(int i=0;i<8;++i){int c=file.get();require(c!=EOF,"V1 truncated header");v|=std::uint64_t(static_cast<unsigned char>(c))<<(8*i);}return v;}
     void text(const std::string& s){put64(s.size());file.write(s.data(),s.size());require(file.good(),"V1 write label");}
     std::string text(){auto n=get64();require(n<=4096,"V1 oversized label");std::string s(static_cast<std::size_t>(n),'\0');file.read(s.data(),s.size());require(file.good(),"V1 truncated label");return s;}
-    explicit V1Oracle(const std::filesystem::path& report):cache(env("NINFER_V1_CACHE")),report(report) {
+    explicit V1Oracle(const std::filesystem::path& report):cache(env("VOIDINFER_V1_CACHE")),report(report) {
         require(!cache.empty() && std::filesystem::is_directory(cache),"V1 wrapper-owned cache required");
-        const auto identity=env("NINFER_V1_IDENTITY");
+        const auto identity=env("VOIDINFER_V1_IDENTITY");
         require(identity.size()==64 && identity.find_first_not_of("0123456789abcdefABCDEF")==std::string::npos,"V1 identity SHA256 required");
         const auto payload=cache/"records.bin";
         if(exporting){
             require(!std::filesystem::exists(payload) && !std::filesystem::exists(cache/"complete.json"),"V1 cannot overwrite payload");
             file.open(payload,std::ios::binary|std::ios::out);
-            require(file.is_open(),"V1 open export");text("NINFER_V1_EXACT_LE_1");text(identity);
+            require(file.is_open(),"V1 open export");text("VOIDINFER_V1_EXACT_LE_1");text(identity);
         }else{
             require(std::filesystem::exists(cache/"complete.json"),"V1 incomplete cache");
             file.open(payload,std::ios::binary|std::ios::in);require(file.is_open(),"V1 open consume");
-            require(text()=="NINFER_V1_EXACT_LE_1" && text()==identity,"V1 schema/identity mismatch");
+            require(text()=="VOIDINFER_V1_EXACT_LE_1" && text()==identity,"V1 schema/identity mismatch");
         }
         index.open(report/"records.csv");index<<"ordinal,event,field,layer,position,rows,columns,dtype,bytes,checksum\n";
     }
@@ -124,8 +124,8 @@ struct V1Reference {
     std::vector<std::uint16_t> embedding_bits_host_for_test(){return oracle.value<std::uint16_t>("embedding",-1,position_,1,kHidden,"F16_BITS",[&]{return context->embedding_bits_host_for_test();});}
     struct Logits { V1Reference* reference; };
     Logits logits_device(){return {this};}
-    ninfer::exl3::Exl3FullAttentionQKVHost full_attention_qkv_host(int layer){
-        ninfer::exl3::Exl3FullAttentionQKVHost source,result;
+    voidinfer::exl3::Exl3FullAttentionQKVHost full_attention_qkv_host(int layer){
+        voidinfer::exl3::Exl3FullAttentionQKVHost source,result;
         if(context){V1Clock::Scope s(oracle.clock,V1Clock::reference_download);source=context->full_attention_qkv_host(layer);require(source.rows==1,"V1 reference QKV rows");}
         result.layer=layer;result.rows=1;
         result.q_rope=oracle.value<std::uint16_t>("q_rope",layer,position_,1,6144,"F16_BITS",[&]{return source.q_rope;});

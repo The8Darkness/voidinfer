@@ -1,0 +1,35 @@
+{
+ "engine": "ninfer",
+ "artifact": "qwen3_8_27b_nvfp4.ninfer",
+ "kv_capacity": "conc",
+ "prefix_reuse": true,
+ "kv": "fp8",
+ "spec": "dflash2",
+ "conc": 4,
+ "prompt": "code_4k",
+ "wall_s": 7.988004684448242,
+ "completion_tokens": 4096,
+ "aggregate_tps": 512.7688530246429,
+ "per_request": [
+  {
+   "s": 7.848350524902344,
+   "tokens": 1024,
+   "tps": 130.47327546736219
+  },
+  {
+   "s": 7.988004684448242,
+   "tokens": 1024,
+   "tps": 128.19221325616073
+  },
+  {
+   "s": 7.8965394496917725,
+   "tokens": 1024,
+   "tps": 129.67705746597264
+  },
+  {
+   "s": 7.330387353897095,
+   "tokens": 1024,
+   "tps": 139.69248152426832
+  }
+ ]
+}

@@ -2,7 +2,7 @@
 #include "exl3/exact_kv_extent.h"
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Geometry proof only. Strong published page ownership and device readiness stay
 // in the caller's independent extent/reader leases. Private current rows are
 // produced by the layer after this complete history prefix has been established.

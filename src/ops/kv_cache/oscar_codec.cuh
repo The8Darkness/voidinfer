@@ -18,7 +18,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 
 inline constexpr int kCyclicKVCacheOscarHeadDim       = 128;
 inline constexpr int kCyclicKVCacheOscarKVHeads       = 8;
@@ -238,4 +238,4 @@ cyclic_oscar_quant_params(float (&values)[8], int lane) {
     return {.scale = scale, .zero = zero};
 }
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

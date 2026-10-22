@@ -1,25 +1,25 @@
 #pragma once
 
 inline void configure_exact_host_kv_pinned_d2h() {
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS","1");
 }
 
 void run_exact_host_kv_pinned_d2h_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,bool candidate_default=false) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     const int prefix=target.max_context()>=4352?4096:96;
     require(code.size()>=prefix&&prose.size()>=prefix,
         "host KV pinned D2H fixture/context extent");
     configure_exact_host_kv_pinned_d2h();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    if(candidate_default)_putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","");
-    else _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+    if(candidate_default)_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","");
+    else _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -81,7 +81,7 @@ void run_exact_host_kv_pinned_d2h_t3(
     const std::vector<std::int64_t>& structured,
     const std::vector<std::int64_t>& heldout,
     bool deferred_scatter=false) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352,"host KV pinned D2H T3 context extent");
     configure_exact_host_kv_pinned_d2h();
@@ -103,19 +103,19 @@ void run_exact_host_kv_pinned_d2h_t3(
         require(fixture.second->size()>=prefix,"host KV pinned D2H T3 fixture extent");
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H",
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H",
             deferred_scatter?"1":"0");
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER",
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER",
             deferred_scatter?"1":"0");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         struct Result {
             double prefill_ms=0;
             std::vector<std::int64_t> tokens;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-            ninfer::exl3::Exl3HostKVStats delta;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+            voidinfer::exl3::Exl3HostKVStats delta;
         };
         const auto run=[&](Exl3TextContext& context) {
             const auto before=context.host_kv_stats();
@@ -198,15 +198,15 @@ void run_exact_host_kv_pinned_d2h_t3(
 void run_exact_host_kv_deferred_scatter_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352 && code.size()>=prefix && prose.size()>=prefix,
         "deferred exact host KV scatter fixture/context extent");
     configure_exact_host_kv_pinned_d2h();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -218,8 +218,8 @@ void run_exact_host_kv_deferred_scatter_screen(
     };
     struct Result {
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-        ninfer::exl3::Exl3HostKVStats delta;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+        voidinfer::exl3::Exl3HostKVStats delta;
     };
     const auto run=[&](Exl3TextContext& context,
                        const std::vector<std::int64_t>& input) {
@@ -300,7 +300,7 @@ void run_exact_host_kv_deferred_scatter_screen(
             <<std::endl;
     }
     for(const char* malformed:{"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER",malformed);
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER",malformed);
         bool rejected=false;
         try {auto invalid=target.create_context(true);}
         catch(const std::runtime_error&) {rejected=true;}
@@ -314,25 +314,25 @@ void run_exact_host_kv_deferred_scatter_screen(
 void run_exact_host_kv_banked_d2h_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096,rows=8;
     constexpr std::uint64_t banked_bytes=16ULL*2*rows*1024*2;
     require(target.max_context()==4352 &&
             code.size()>=prefix && prose.size()>=prefix,
         "banked D2H fixture/context extent");
     configure_exact_host_kv_pinned_d2h();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","0");
     const auto retirement_before=Exl3TextContext::retirement_quarantine_witness();
     {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","0");
         auto control=target.create_context(true);control->prepare_continuation(rows);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(rows);
         struct Result {
             std::vector<std::uint16_t> logits;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-            ninfer::exl3::Exl3HostKVStats delta;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+            voidinfer::exl3::Exl3HostKVStats delta;
         };
         const auto run=[&](Exl3TextContext& context,
                            const std::vector<std::int64_t>& source) {
@@ -394,13 +394,13 @@ void run_exact_host_kv_banked_d2h_screen(
     require(Exl3TextContext::retirement_quarantine_witness()==retirement_before,
         "banked D2H normal destruction changed retirement quarantine");
     for(const char* malformed:{"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H",malformed);
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H",malformed);
         bool rejected=false;
         try {auto invalid=target.create_context(true);}
         catch(const std::runtime_error&) {rejected=true;}
         require(rejected,"banked D2H accepted malformed flag");
     }
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H","0");
     std::cout<<"EXACT_HOST_KV_BANKED_D2H PASS fixtures=2 prefix="<<prefix
         <<" rows="<<rows<<" exact_logits_state=1 route_counters=1"
         <<" bounded_extra_pinned_bytes="<<(512U<<10)
@@ -410,14 +410,14 @@ void run_exact_host_kv_banked_d2h_screen(
 void run_exact_host_kv_unique_tail_reuse_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352 && code.size()>=prefix && prose.size()>=prefix,
         "unique-tail reuse fixture/context extent");
     configure_exact_host_kv_pinned_d2h();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","1");
-    _putenv_s("NINFER_EXL3_HOST_KV_CPU_PROFILE","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","1");
+    _putenv_s("VOIDINFER_EXL3_HOST_KV_CPU_PROFILE","1");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
@@ -428,9 +428,9 @@ void run_exact_host_kv_unique_tail_reuse_screen(
     };
     struct Result {
         std::vector<std::int64_t> tokens;
-        std::vector<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>> retained;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-        ninfer::exl3::Exl3HostKVStats delta;
+        std::vector<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>> retained;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+        voidinfer::exl3::Exl3HostKVStats delta;
     };
     const auto run=[&](Exl3TextContext& context,
                        const std::vector<std::int64_t>& input,bool retain_each) {
@@ -471,9 +471,9 @@ void run_exact_host_kv_unique_tail_reuse_screen(
         std::pair{"prose",&prose}}) for(bool retain_each:{false,true}) {
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         const auto baseline=run(*control,input,retain_each);
         const auto changed=run(*candidate,input,retain_each);
@@ -523,7 +523,7 @@ void run_exact_host_kv_unique_tail_reuse_screen(
             <<" candidate_page_cpu_ns="<<b.page_extension_cpu_ns<<std::endl;
     }
     for(const char* malformed:{"2","true","01"}) {
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE",malformed);
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE",malformed);
         bool rejected=false;
         try {auto invalid=target.create_context(true);}
         catch(const std::runtime_error&) {rejected=true;}
@@ -537,14 +537,14 @@ void run_exact_host_kv_unique_tail_reuse_screen(
 void run_exact_host_kv_unique_tail_reuse_t1(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352 && code.size()>=prefix && prose.size()>=prefix,
         "unique-tail T1 fixture/context extent");
     configure_exact_host_kv_pinned_d2h();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","1");
-    _putenv_s("NINFER_EXL3_HOST_KV_CPU_PROFILE","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER","1");
+    _putenv_s("VOIDINFER_EXL3_HOST_KV_CPU_PROFILE","0");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
@@ -559,16 +559,16 @@ void run_exact_host_kv_unique_tail_reuse_t1(
     struct Result {
         double wall_ms=0;
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
     };
     for(const auto& fixture:std::array<std::pair<const char*,
         const std::vector<std::int64_t>*>,2>{std::pair{"code",&code},
         std::pair{"prose",&prose}}) {
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         const auto run=[&](Exl3TextContext& context) {
             const auto started=std::chrono::steady_clock::now();

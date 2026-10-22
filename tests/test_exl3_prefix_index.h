@@ -2,8 +2,8 @@
 
 void run_prefix_index_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Index=ninfer::exl3::Exl3VeriCachePrefixIndex;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Index=voidinfer::exl3::Exl3VeriCachePrefixIndex;
     {
         bool refused=false;
         try{Index excessive(Index::maximum_entries+1);}
@@ -12,7 +12,7 @@ void run_prefix_index_qualification(Exl3TextModel& target,
         require(refused,"prefix index admitted capacity outside its fixed range metadata");
     }
     {
-        ninfer::exl3::Exl3TokenHistory empty;
+        voidinfer::exl3::Exl3TokenHistory empty;
         require(empty.equals({}),"empty token history equality");
         std::vector<std::int64_t> expected(129);
         for(std::size_t i=0;i<expected.size();++i)expected[i]=static_cast<std::int64_t>(i+1);
@@ -53,7 +53,7 @@ void run_prefix_index_qualification(Exl3TextModel& target,
         }
     }
     {
-        using History=ninfer::exl3::Exl3TokenHistory;
+        using History=voidinfer::exl3::Exl3TokenHistory;
         struct Disarm {~Disarm(){History::fail_allocation_for_test(0);}} disarm;
         for(unsigned depth=1;depth<=3;++depth) {
             const std::size_t boundary=std::size_t{64}<<(5*(depth-1));
@@ -81,7 +81,7 @@ void run_prefix_index_qualification(Exl3TextModel& target,
                 "prevalidation or empty append consumed pending history allocation fault");
         }
         {
-            ninfer::exl3::RetainedDescriptorLedger metadata;
+            voidinfer::exl3::RetainedDescriptorLedger metadata;
             const auto reserve_node=[&](std::uint64_t bytes){return metadata.acquire(bytes);};
             const std::vector<std::int64_t> tokens(64,17);
             auto parent=History{}.append(tokens,reserve_node);
@@ -90,9 +90,9 @@ void run_prefix_index_qualification(Exl3TextModel& target,
             const std::array<std::int64_t,1> suffix{18};
             unsigned reservations=0;bool refused=false;
             try {auto failed=parent.append(suffix,[&](std::uint64_t bytes){
-                if(++reservations==2)throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+                if(++reservations==2)throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
                 return metadata.acquire(bytes);
-            });}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            });}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && reservations==2 && metadata.bytes()==parent_bytes &&
                 History::live_node_blocks_for_test()==live && parent.equals(tokens),
                 "radix promotion refusal retained partial node or changed shared parent");
@@ -118,7 +118,7 @@ void run_prefix_index_qualification(Exl3TextModel& target,
             const auto fork=parent;
             const std::array<const History*,2> aliases{&parent,&fork};
             const auto alias_stats=History::visit(aliases);
-            ninfer::exl3::RetainedDescriptorLedger control_ledger;
+            voidinfer::exl3::RetainedDescriptorLedger control_ledger;
             for(const auto* history:aliases)history->visit_control_owners([&](const auto& node){
                 if(!History::control_credit_belongs_to(node,control_ledger))
                     require(History::attach_control_credit(node,control_ledger.acquire(History::node_metadata_bytes())),
@@ -133,12 +133,12 @@ void run_prefix_index_qualification(Exl3TextModel& target,
                 "history fork copied persistent index or double charged shared nodes");
             const std::array<std::int64_t,2> suffix{18,19};
             {
-                ninfer::exl3::RetainedDescriptorLedger provisional;
+                voidinfer::exl3::RetainedDescriptorLedger provisional;
                 unsigned calls=0;bool refused=false;
                 try {auto failed=parent.append(suffix,[&](std::uint64_t bytes){
-                    if(++calls==2)throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+                    if(++calls==2)throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
                     return provisional.acquire(bytes);
-                });}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                });}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                 // A leaf-only append has one allocation; deeper paths must
                 // unwind their first node when the second reservation fails.
                 require((calls==1 || refused) && provisional.bytes()==0 && parent.fingerprint()==fingerprint &&
@@ -216,8 +216,8 @@ void run_prefix_index_qualification(Exl3TextModel& target,
     constexpr int prefix_rows=321,tail_rows=64;
     require(target.max_context()>=prefix_rows+tail_rows &&
         source.size()>=prefix_rows+tail_rows,"prefix index fixture extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto builder=target.create_context(true);builder->prepare_continuation(8);
     auto cached=target.create_context(true);cached->prepare_continuation(8);
     auto fresh=target.create_context(true);fresh->prepare_continuation(8);
@@ -228,7 +228,7 @@ void run_prefix_index_qualification(Exl3TextModel& target,
     const auto root=Request::initialize(*builder,prefix,128);
     const auto root_state=root->state();
     {
-        using History=ninfer::exl3::Exl3TokenHistory;
+        using History=voidinfer::exl3::Exl3TokenHistory;
         struct Disarm {~Disarm(){History::fail_allocation_for_test(0);}} disarm;
         const auto suffix=std::span<const std::int64_t>(source).subspan(prefix_rows,1);
         const auto fingerprint=root->token_fingerprint();

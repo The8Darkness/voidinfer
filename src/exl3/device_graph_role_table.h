@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 enum class Exl3GraphPointerRole : std::uint8_t {
     token_ids=0,hidden_output=1,embedding_trace=2,count=3
 };

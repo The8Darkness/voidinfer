@@ -54,13 +54,13 @@ std::string graph_plan_boundary_signed(const std::array<std::int32_t, 5>& values
 }
 
 void run_graph_plan_boundary(const std::string& out_path) {
-    require(!out_path.empty(), "graphplanboundary requires NINFER_E5A4_OUT");
+    require(!out_path.empty(), "graphplanboundary requires VOIDINFER_E5A4_OUT");
     require(!std::filesystem::exists(out_path),
             "graphplanboundary output must be a new file");
     std::ofstream report(out_path);
     require(report.good(), "graphplanboundary cannot open output");
     report << "mode=graphplanboundary\n"
-           << "required_environment=NINFER_E5A4_MODE=graphplanboundary,NINFER_E5A4_OUT=new; no target or draft path\n"
+           << "required_environment=VOIDINFER_E5A4_MODE=graphplanboundary,VOIDINFER_E5A4_OUT=new; no target or draft path\n"
            << "kernel_scope=actual oscar_exl3_plan_kernel only; no cache append, cache write, decode, model load, or graph lifecycle\n"
            << "oracle_scope=independent canonical begin=max(64,context-256) after64; raw unsigned plan words and signed count words retained\n"
            << "positions=0..1023\n";
@@ -70,7 +70,7 @@ void run_graph_plan_boundary(const std::string& out_path) {
         cuda_check(cudaDeviceSynchronize(), "graphplanboundary initial sync");
         int mismatches = 0;
         for (int old_position = 0; old_position <= 1023; ++old_position) {
-            const auto actual = ninfer::exl3::oscar_plan_boundary_observe_for_test(old_position);
+            const auto actual = voidinfer::exl3::oscar_plan_boundary_observe_for_test(old_position);
             const auto expected = graph_plan_boundary_oracle(old_position);
             if (actual.plan != expected.plan || actual.counts != expected.counts) {
                 ++mismatches;

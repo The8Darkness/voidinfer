@@ -14,8 +14,8 @@ void run_outer_batched_qualification(Exl3TextModel& target,const std::vector<std
         for(int width:{2,4,8}) for(int rejection=-1;rejection<width;++rejection) {
             std::vector<std::int64_t> proposals(greedy.begin(),greedy.begin()+width);
             if(rejection>=0) proposals[rejection]=(proposals[rejection]+1)%kVocab;
-            const auto expected=ninfer::exl3::verify_exl3_outer_reference(*scalar,*root,proposals);
-            const auto actual=ninfer::exl3::verify_exl3_outer_batched_reference(*batch,*root,proposals);
+            const auto expected=voidinfer::exl3::verify_exl3_outer_reference(*scalar,*root,proposals);
+            const auto actual=voidinfer::exl3::verify_exl3_outer_batched_reference(*batch,*root,proposals);
             require(actual.committed_tokens==expected.committed_tokens && actual.accepted==expected.accepted &&
                     actual.rejected==expected.rejected && actual.committed_state->same_payload(*expected.committed_state),
                     "outerbatch scalar mismatch prefix="+std::to_string(prefix)+" width="+std::to_string(width)+

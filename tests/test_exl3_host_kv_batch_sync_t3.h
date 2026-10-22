@@ -3,11 +3,11 @@
 void run_exact_host_kv_batch_sync_t3(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose,
     const std::vector<std::int64_t>& structured,const std::vector<std::int64_t>& heldout) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352,"host KV batch-sync T3 context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty() && std::none_of(logits.begin(),logits.end(),
@@ -23,15 +23,15 @@ void run_exact_host_kv_batch_sync_t3(Exl3TextModel& target,
     for(const auto& fixture:fixtures) {
         require(fixture.second->size()>=prefix,"host KV batch-sync T3 fixture extent");
         const std::vector<std::int64_t> input(fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         struct Result {
             double prefill_ms=0;
             std::int64_t token=0;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
-            ninfer::exl3::Exl3HostKVStats delta;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
+            voidinfer::exl3::Exl3HostKVStats delta;
         };
         const auto run=[&](Exl3TextContext& context) {
             const auto before=context.host_kv_stats();
@@ -42,7 +42,7 @@ void run_exact_host_kv_batch_sync_t3(Exl3TextModel& target,
             const auto token=greedy(context);context.decode(token);
             const auto state=context.export_exact_host_state();
             const auto after=context.host_kv_stats();
-            ninfer::exl3::Exl3HostKVStats delta=after;
+            voidinfer::exl3::Exl3HostKVStats delta=after;
             delta.h2d_bytes-=before.h2d_bytes;delta.d2h_bytes-=before.d2h_bytes;
             delta.transfer_calls-=before.transfer_calls;delta.completed_rows-=before.completed_rows;
             return Result{prefill_ms,token,state,delta};

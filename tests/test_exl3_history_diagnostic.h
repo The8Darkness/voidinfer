@@ -2,17 +2,17 @@
 
 void run_history_diagnostic(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
     using Lane=Exl3Dflash2Execution;
     using Json=nlohmann::ordered_json;
     using Clock=std::chrono::steady_clock;
     const auto ms=[](auto start){return std::chrono::duration<double,std::milli>(Clock::now()-start).count();};
-    const int requested=std::stoi(env("NINFER_REAL_DFLASH_PREFIX"));
-    const bool profile=env("NINFER_HISTORY_PROFILE")=="1";
+    const int requested=std::stoi(env("VOIDINFER_REAL_DFLASH_PREFIX"));
+    const bool profile=env("VOIDINFER_HISTORY_PROFILE")=="1";
     constexpr int outputs=32;
     require(requested==0||requested==4096,"history diagnostic bounded prefix");
-    const std::filesystem::path dir=env("NINFER_REAL_DFLASH_OUT");
+    const std::filesystem::path dir=env("VOIDINFER_REAL_DFLASH_OUT");
     require(!dir.empty()&&!std::filesystem::exists(dir),"preserve history diagnostic receipt");
     std::filesystem::create_directories(dir);
     std::ofstream checks(dir/"checks.csv");checks<<"case,pass\n";
@@ -24,7 +24,7 @@ void run_history_diagnostic(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     struct Reference {Root initial;std::shared_ptr<const Exl3ExactHostState> final;int prefix=0;
         std::vector<std::int64_t> tokens;std::array<std::vector<std::uint16_t>,5> taps;};
     std::array<Reference,2> refs;Json prefix_costs=Json::array();
-    _putenv_s("NINFER_EXL3_PINNED_RECURRENT_EXPORT","0");
+    _putenv_s("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT","0");
     for(int i=0;i<2;++i){
         auto& ref=refs[i];const auto& input=i?prose:code;
         ref.prefix=requested?requested:static_cast<int>(input.size());
@@ -39,7 +39,7 @@ void run_history_diagnostic(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     }
     std::ofstream(dir/"prefix-costs.json")<<prefix_costs.dump(2);
     gate("pageable_reference_owners",Exl3RecurrentPinBudget::snapshot()[0]==0);
-    _putenv_s("NINFER_EXL3_PINNED_RECURRENT_EXPORT","1");
+    _putenv_s("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT","1");
     Exl3VeriCacheServingIdentity identity{"solo-history","SC_6.00bpw_H6_V6","pinned-ids","exact-B8-greedy","text"};
     Exl3VeriCacheServingPrefixCache cache({2,64,2ULL<<30,8ULL<<30},identity);
     Exl3VeriCacheServingCoordinator coordinator(cache,{1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});

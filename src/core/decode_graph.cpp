@@ -1,12 +1,15 @@
 #include "core/decode_graph.h"
+#include "core/capture_guard.h"
 
 #include "core/device.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -46,6 +49,7 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
     CUDA_CHECK(try_reset());
 
+    const CudaCaptureScope capture_scope;
     CUDA_CHECK(provider_.begin(stream));
 
     try {
@@ -101,6 +105,30 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
     return *this;
 }
 
+
+namespace {
+// VOIDINFER_EXL3_MEMORY_TRACE: device memory taken by graph instantiation/upload.
+double graph_trace_free_mib() {
+    static const bool enabled=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    if(!enabled)return -1.0;
+    std::size_t free=0,total=0;
+    if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return -1.0;
+    return free/1048576.0;
+}
+void graph_trace_report(const char* stage,double before,std::size_t nodes) {
+    if(before<0)return;
+    const double after=graph_trace_free_mib();
+    // Running total over all instantiations/uploads (most take < 1 MiB each).
+    static double total=0;static std::size_t count=0;
+    total+=before-after;
+    if(++count%250==0)
+        std::fprintf(stderr,"GRAPH_MEMORY_TOTAL graphs=%zu took=%.1f MiB%c",count,total,10);
+    if(before-after>=1.0)
+        std::fprintf(stderr,"GRAPH_MEMORY %s nodes=%zu took=%.1f MiB free=%.1f MiB%c",
+            stage,nodes,before-after,after,10);
+}
+} // namespace
+
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
     CUDA_CHECK(definition.retirement_error_);
     if (!definition.ready()) {
@@ -108,11 +136,13 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     }
     CUDA_CHECK(try_reset());
 
+    const double before=graph_trace_free_mib();
     const cudaError_t err = provider_.instantiate(&exec_, definition.graph_);
     if (err != cudaSuccess) {
         (void)try_reset();
         CUDA_CHECK(err);
     }
+    graph_trace_report("instantiate",before,0);
 }
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
@@ -137,8 +167,13 @@ void DecodeGraphExecutable::upload(cudaStream_t stream) {
     // The default upload and launch callback pointers aliased in an
     // Engine-linked Windows binary. Dispatch ordinary CUDA calls directly;
     // explicit providers remain available for failure injection.
+    const double before=graph_trace_free_mib();
     CUDA_CHECK(custom_provider_?provider_.upload(exec_,stream):
         cudaGraphUpload(exec_,stream));
+    if(before>=0) {
+        (void)cudaStreamSynchronize(stream);
+        graph_trace_report("upload",before,0);
+    }
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
@@ -156,4 +191,4 @@ cudaError_t DecodeGraphExecutable::try_reset() noexcept {
 
 void DecodeGraphExecutable::reset() noexcept { log_cuda_error("cudaGraphExecDestroy",try_reset()); }
 
-} // namespace ninfer
+} // namespace voidinfer

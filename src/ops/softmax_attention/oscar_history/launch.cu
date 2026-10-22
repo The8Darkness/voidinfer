@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace voidinfer::ops::detail {
 namespace {
 
 constexpr int kQHeads = 24;
@@ -187,4 +187,4 @@ OscarHistoryKernelResources oscar_int2_g128_history_kernel_resources() {
     return result;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace voidinfer::ops::detail

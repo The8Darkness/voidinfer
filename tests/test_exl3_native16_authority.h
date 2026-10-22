@@ -5,14 +5,14 @@
 void run_native16_authority(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::array<std::uint16_t*,5>& staging,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     using Root=std::shared_ptr<const Request>;
-    using Frontiers=ninfer::exl3::Exl3HierarchyFrontiers;
-    using L1=ninfer::exl3::Exl3TurboAngleL1Context;
-    using Registry=ninfer::exl3::Exl3HostResidentSet;
+    using Frontiers=voidinfer::exl3::Exl3HierarchyFrontiers;
+    using L1=voidinfer::exl3::Exl3TurboAngleL1Context;
+    using Registry=voidinfer::exl3::Exl3HostResidentSet;
     using Clock=std::chrono::steady_clock;
     const auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
-    const std::filesystem::path output=env("NINFER_NATIVE16_AUTHORITY_OUT");
+    const std::filesystem::path output=env("VOIDINFER_NATIVE16_AUTHORITY_OUT");
     require(!output.empty() && !std::filesystem::exists(output),"native16 authority new directory");
     std::filesystem::create_directories(output);
     std::ofstream rows(output/"runs.csv"),releases(output/"releases.csv"),checks(output/"correctness.csv");
@@ -31,12 +31,12 @@ void run_native16_authority(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
         void set(const char* key,const char* value) {saved.emplace_back(key,env(key));_putenv_s(key,value);}
         ~Environment(){for(auto i=saved.rbegin();i!=saved.rend();++i)_putenv_s(i->first.c_str(),i->second.c_str());}
     } settings;
-    settings.set("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7","0");
-    settings.set("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
-    settings.set("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
-    settings.set("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
-    settings.set("NINFER_EXL3_EXACT_HOST_KV","1");settings.set("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    settings.set("NINFER_EXL3_NATIVE_CONTINUATION16","0");
+    settings.set("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7","0");
+    settings.set("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
+    settings.set("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
+    settings.set("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+    settings.set("VOIDINFER_EXL3_EXACT_HOST_KV","1");settings.set("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    settings.set("VOIDINFER_EXL3_NATIVE_CONTINUATION16","0");
     MEMORYSTATUSEX physical{};physical.dwLength=sizeof(physical);
     require(GlobalMemoryStatusEx(&physical)!=0 && physical.ullAvailPhys>(8ULL<<30),"native16 authority host reserve");
     Registry registry(physical.ullTotalPhys-(8ULL<<30),8ULL<<30);
@@ -68,7 +68,7 @@ void run_native16_authority(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
             std::pair{"code",&code},std::pair{"prose",&prose}}) {
         const char* name=fixture.first;Root initial;
         std::vector<std::int64_t> oracle_tokens;std::array<std::vector<std::uint16_t>,5> oracle_taps;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> oracle_state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> oracle_state;
         {
             auto ctx=target.create_context(true);ctx->prepare_continuation(8);
             auto input=Request::initialize(*ctx,std::span<const std::int64_t>(fixture.second->data(),4096),1024);
@@ -86,16 +86,16 @@ void run_native16_authority(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
             initial->restore_draft(draft,staging);cuda_check(cudaDeviceSynchronize(),"native16 authority reset draft");
             Result result;result.tokens.reserve(128);result.release_rows.reserve(128);result.release_ms.reserve(128);
             peak_pages=page_bytes;const auto started=Clock::now();
-            Environment exact_flags;exact_flags.set("NINFER_EXL3_NATIVE_CONTINUATION16",native16?"1":"0");
+            Environment exact_flags;exact_flags.set("VOIDINFER_EXL3_NATIVE_CONTINUATION16",native16?"1":"0");
             auto exact=std::shared_ptr<Exl3TextContext>(target.create_context(true));
             exact->prepare_continuation(native16?16:8);
             std::unique_ptr<Exl3TextContext> l0,l1_native;
             {
                 Environment light;
-                light.set("NINFER_EXL3_NATIVE_CONTINUATION16","0");
-                for(const char* key:{"NINFER_EXL3_WIDE_PREFILL","NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-                        "NINFER_EXL3_SHARED_ACCUM","NINFER_EXL3_SHARED_TRANSFORM","NINFER_EXL3_SHARED_LAYER_SCRATCH","NINFER_EXL3_GDN_WIDE_SLAB"})light.set(key,"0");
-                light.set("NINFER_EXL3_EXACT_HOST_KV","0");light.set("NINFER_EXL3_OSCAR_L0_ONLY","1");
+                light.set("VOIDINFER_EXL3_NATIVE_CONTINUATION16","0");
+                for(const char* key:{"VOIDINFER_EXL3_WIDE_PREFILL","VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+                        "VOIDINFER_EXL3_SHARED_ACCUM","VOIDINFER_EXL3_SHARED_TRANSFORM","VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","VOIDINFER_EXL3_GDN_WIDE_SLAB"})light.set(key,"0");
+                light.set("VOIDINFER_EXL3_EXACT_HOST_KV","0");light.set("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
                 l0=target.create_context(true);l1_native=target.create_context(true);
                 require(l0->try_enable_oscar_from_environment() && l1_native->try_enable_oscar_from_environment(),"native16 authority OSCAR contexts");
                 l0->prepare_continuation(8);
@@ -146,7 +146,7 @@ void run_native16_authority(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
                 }
                 result.shape_ok=result.shape_ok &&
                     segment_rows==static_cast<int>(verified.committed_tokens.size());
-                const auto* d2d=std::getenv("NINFER_EXL3_COMMITTED_TAP_D2D");
+                const auto* d2d=std::getenv("VOIDINFER_EXL3_COMMITTED_TAP_D2D");
                 if(d2d && std::string_view(d2d)=="1")
                     result.shape_ok=result.shape_ok && verified.committed_tap_d2d_bytes==
                         verified.committed_tokens.size()*5*5120*2;

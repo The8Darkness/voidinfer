@@ -8,7 +8,7 @@
 #include <memory>
 #include <optional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Construct under metadata reservation before submission. Registration is an
 // independently acquired owner, not a promise inferred from page retention or
 // a Windows lock. This record does not itself certify registration coverage.

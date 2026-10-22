@@ -3,13 +3,13 @@
 void run_gdn_pair_vector_io_qualification(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4352,"GDN pair vector-I/O context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","1");
-    _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_QUAD_COLUMNS","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_QUAD_COLUMNS","0");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
@@ -23,9 +23,9 @@ void run_gdn_pair_vector_io_qualification(
         std::pair<const char*,const std::vector<std::int64_t>*>,2>{
             std::pair{"code",&code},std::pair{"prose",&prose}}) {
         require(fixture.second->size()>=512,"GDN pair vector-I/O fixture extent");
-        _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         const auto control_coefficients=
             control->gdn_coefficient_owner_for_test(5);
@@ -44,7 +44,7 @@ void run_gdn_pair_vector_io_qualification(
                 fixture.second->begin(),fixture.second->begin()+prefix);
             struct Result {
                 std::vector<std::int64_t> tokens;
-                std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+                std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
             };
             const auto run=[&](Exl3TextContext& context) {
                 const auto request=Request::initialize(context,input,1024);
@@ -76,14 +76,14 @@ void run_gdn_pair_vector_io_qualification(
 void run_gdn_pair_vector_io_route_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4352,"GDN pair vector-I/O route context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","1");
-    _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_QUAD_COLUMNS","0");
-    const int measured_pairs=env_int("NINFER_T25_MEASURED_PAIRS",4);
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_QUAD_COLUMNS","0");
+    const int measured_pairs=env_int("VOIDINFER_T25_MEASURED_PAIRS",4);
     require(measured_pairs>=1&&measured_pairs<=4,
         "GDN pair vector-I/O route measured pair extent");
     const auto greedy=[](Exl3TextContext& context) {
@@ -98,7 +98,7 @@ void run_gdn_pair_vector_io_route_screen(
         double prefill_ms=0;
         double route_ms=0;
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
     };
     constexpr int prefix=4096;
     for(const auto& fixture:std::array<
@@ -108,9 +108,9 @@ void run_gdn_pair_vector_io_route_screen(
             "GDN pair vector-I/O route fixture extent");
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_VECTOR_IO","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         const auto run=[&](Exl3TextContext& context) {
             const auto route_started=std::chrono::steady_clock::now();

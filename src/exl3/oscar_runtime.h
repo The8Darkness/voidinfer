@@ -13,7 +13,7 @@
 
 #include <cuda_runtime_api.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 inline constexpr int kExl3OscarQHeads = 24;
 inline constexpr int kExl3OscarKVHeads = 4;
@@ -342,4 +342,4 @@ private:
     std::array<std::unique_ptr<Exl3OscarLayerCache>, 16> layers_;
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

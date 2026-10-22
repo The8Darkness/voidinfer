@@ -7,7 +7,7 @@
 #include <utility>
 #include <optional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Registry operations serialize acquisition; a moved plan may retire elsewhere.
 // Tickets keep the counter alive without retaining or dereferencing the registry.
 template<class DomainTag> class RetainedByteLedger {

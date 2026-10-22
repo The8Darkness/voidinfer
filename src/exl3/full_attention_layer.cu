@@ -1,5 +1,10 @@
+#include "core/poll_wait.h"
+#include "exl3/l0_history_mark.h"
+#include "exl3/segment_copy.cuh"
+#include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/sibling_rows.cuh"
+#include "exl3/rope_map.cuh"
 #include "exl3/kv_fakequant.cuh"
 #include "exl3/l0_oscar.cuh"
 #include "exl3/full_attention_layer.h"
@@ -9,6 +14,7 @@
 #include "exl3/block_tree_sum.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <mma.h>
@@ -20,12 +26,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
+
 namespace {
 
 constexpr int kHidden = 5120;
@@ -41,7 +49,17 @@ constexpr float kRmsEps = 1.0e-6f;
 constexpr std::array<int,17> kBufferFeatures={{kHidden,kQProjection,kKVProjection,kKVProjection,
     kQHeads*kHeadDim,kKVHeads*kHeadDim,kQHeads*kHeadDim,kKVHeads*kHeadDim,
     kQHeads*kHeadDim,kHidden,kHidden,kHidden,kIntermediate,kIntermediate,kIntermediate,kHidden,kHidden}};
-constexpr bool transient_buffer(std::size_t i) {return i!=3 && i!=6 && i!=7;}
+// Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep every
+// prompt-scale buffer in the shared scratch: rows retained across forwards
+// live in each layer's private small tier instead (enable_small_tier).
+bool tiered_prompt_buffers() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    return enabled;
+}
+bool transient_buffer(std::size_t i) {return tiered_prompt_buffers() || (i!=3 && i!=6 && i!=7);}
 
 std::atomic<std::uint64_t> prefill_shared_score_launch_counter{0};
 std::atomic<std::uint64_t> prefill_shared_score_row_counter{0};
@@ -157,7 +175,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
                             int rows,
                             int position,
                             const int* position_device,const int* positions_xyz,int offset,
-                            const int* chain_rows=nullptr) {
+                            const int* chain_rows=nullptr,const int* rope_map=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kQHeads * kHeadDim;
@@ -169,6 +187,7 @@ __global__ void rope_kernel(const std::uint16_t* q_in,
     const int base_position = position_device ? *position_device : position;
     int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
+    else pos=exl3_rope_position(rope_map,pos,channel%(kRopeDim/2));
     float q = __half2float(__ushort_as_half(q_in[index]));
     float k = __half2float(__ushort_as_half(k_in[kv_index]));
     if (channel < kRopeDim) {
@@ -200,7 +219,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
                               int rows,
                               int position,
                               const int* position_device,const int* positions_xyz,int offset,
-                              const int* chain_rows=nullptr) {
+                              const int* chain_rows=nullptr,const int* rope_map=nullptr) {
     EXL3_PDL_SMALL_PROLOGUE();
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kKVHeads * kHeadDim;
@@ -210,6 +229,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
     const int base_position = position_device ? *position_device : position;
     int pos = base_position + sibling_row_offset(row, chain_rows);
     if constexpr(Mrope)pos=positions_xyz?positions_xyz[row*3+(channel%(kRopeDim/2))%3]:pos+offset;
+    else pos=exl3_rope_position(rope_map,pos,channel%(kRopeDim/2));
     float value = __half2float(__ushort_as_half(k_in[index]));
     if (channel < kRopeDim) {
         const int pair = channel < kRopeDim / 2 ? channel : channel - kRopeDim / 2;
@@ -232,7 +252,7 @@ __global__ void rope_k_kernel(const std::uint16_t* k_in,
 __global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint16_t* qg,
     const std::uint16_t* kp,const std::uint16_t* q_norm_weight,const std::uint16_t* k_norm_weight,
     std::uint16_t* qn,std::uint16_t* gate,std::uint16_t* kn,std::uint16_t* qr,std::uint16_t* kr,
-    int rows,int position,const int* position_device,const int* chain_rows) {
+    int rows,int position,const int* position_device,const int* chain_rows,const int* rope_map) {
     EXL3_PDL_SMALL_PROLOGUE();
     __shared__ float shared[256];
     __shared__ float normalized[kHeadDim];
@@ -266,7 +286,8 @@ __global__ void __launch_bounds__(256) decode_qk_prepare_kernel(const std::uint1
     normalized[channel]=__half2float(__ushort_as_half(norm_bits));
     __syncthreads();
     const int base_position=position_device?*position_device:position;
-    const int pos=base_position+sibling_row_offset(row,chain_rows);
+    const int pos=exl3_rope_position(rope_map,base_position+sibling_row_offset(row,chain_rows),
+        channel%(kRopeDim/2));
     float out=normalized[channel];
     if(channel<kRopeDim) {
         const int pair=channel<kRopeDim/2?channel:channel-kRopeDim/2;
@@ -3048,7 +3069,7 @@ __global__ void attention_cached_gqa_six_fused_flash_kernel(
 
 bool wmma32_vector_loads_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_WMMA32_VECTOR_LOADS");
+        const char* value=std::getenv("VOIDINFER_EXL3_WMMA32_VECTOR_LOADS");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -3056,7 +3077,7 @@ bool wmma32_vector_loads_enabled() {
 
 bool fused_flash_staged_k_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FLASH_STAGED_K");
+        const char* value=std::getenv("VOIDINFER_EXL3_FLASH_STAGED_K");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -5543,7 +5564,7 @@ constexpr std::size_t reg_attn_shared_bytes() {
 
 bool wmma32_register_q_global() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER_Q_GLOBAL");
+        const char* value=std::getenv("VOIDINFER_EXL3_WMMA32_REGISTER_Q_GLOBAL");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -5579,7 +5600,11 @@ __device__ __forceinline__ void mma_h(unsigned (&c)[2],const unsigned (&a)[4],
                  :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1));
 }
 
-constexpr int kQkHalfGroup=4;
+// FA2 prefill QK: k-steps of 16 dimensions accumulate in FP16 in groups of
+// kQkHalfGroup (8 = 128 dimensions, two FP32 adds per score; 4 until Oct 15
+// 2026): prefill 32K 7.72 -> 7.60 s, 128K 41.71 -> 41.17 s; KL vs BF16 at 4K
+// 0.01001 -> 0.00998, paired 0.0017 / 0.0018 at 4K / 16K. 16 is no faster.
+constexpr int kQkHalfGroup=8;
 __device__ __forceinline__ unsigned reg_attn_pack(half low,half high) {
     return static_cast<unsigned>(__half_as_ushort(low))|
         (static_cast<unsigned>(__half_as_ushort(high))<<16);
@@ -5826,7 +5851,7 @@ __global__ void __launch_bounds__(64*Heads) attention_gqa_six_wmma32_register_pr
 }
 
 
-// FA2-style GQA-6 prefill attention (NINFER_EXL3_FA2_PREFILL, default 1; 0 =
+// FA2-style GQA-6 prefill attention (VOIDINFER_EXL3_FA2_PREFILL, default 1; 0 =
 // the register WMMA32 route). Eight warps cover two query heads x 64 rows and
 // share every 32-key K/V tile; Q A-fragments stay in registers; K/V tiles are
 // double buffered with cp.async; causal masking only on diagonal tiles; row
@@ -5846,13 +5871,32 @@ __device__ __forceinline__ void cp16(void* dst,const void* src,bool valid){
 }
 __device__ __forceinline__ void commit(){ asm volatile("cp.async.commit_group;\n"); }
 template<int N> __device__ __forceinline__ void wait(){ asm volatile("cp.async.wait_group %0;\n"::"n"(N)); }
-template<int S>
+// acc += one FP16 half of a packed pair: a single FHADD (exact conversion,
+// round-to-nearest FP32 add), instead of a conversion and an FADD.
+__device__ __forceinline__ void add_lo(float& acc,unsigned packed){
+  asm("{.reg .f16 l,h; mov.b32 {l,h}, %1; add.rn.f32.f16 %0, l, %0;}":"+f"(acc):"r"(packed)); }
+__device__ __forceinline__ void add_hi(float& acc,unsigned packed){
+  asm("{.reg .f16 l,h; mov.b32 {l,h}, %1; add.rn.f32.f16 %0, h, %0;}":"+f"(acc):"r"(packed)); }
+__device__ __forceinline__ float fast_ex2(float x){ float y; asm("ex2.approx.ftz.f32 %0, %1;":"=f"(y):"f"(x)); return y; }
+// exp(-17.5) = 2^-25.25 (ex2.approx is within 2^-22 relative): FP16 rounds it to zero.
+constexpr float kFa2NegligibleNats=17.5f;
+// Fp8: K/V are rows of 1040 bytes (e4m3 [4][256] + FP16 scale per head,
+// l0_exact.cuh L0LineFp8) from `k_cache`/`v_cache` reinterpreted as bytes,
+// base 0 and no sink/ring/history mapping. Each tile arrives as FP8 by
+// cp.async (double buffered) and expands to FP16 (value x scale, rounded as
+// l0_line_fp8_kernel does) into one FP16 tile: the same scores as attending
+// the expanded planes, from half the bytes.
+constexpr int kFp8RowBytes=1040;
+constexpr int kFp8Stage=2*BN*kHeadDim; // bytes (K then V)
+constexpr std::size_t fp8_smem_bytes(){ return static_cast<std::size_t>(kStage)*sizeof(half)+2u*kFp8Stage; }
+template<int S,bool Fp8=false>
 __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(const std::uint16_t* q,const std::uint16_t* k_cache,
     const std::uint16_t* v_cache,std::uint16_t* output,int rows,int base,int capacity,
     float* split_output,float* split_stats,int history_end=0,
     const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,int ring_mask=-1){
   extern __shared__ __align__(16) unsigned char smem_raw[];
   half* sm=reinterpret_cast<half*>(smem_raw);
+  unsigned char* sm8=smem_raw+static_cast<std::size_t>(kStage)*sizeof(half);
   const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
   const int kv_head=blockIdx.y;
   const int head_group=blockIdx.z/S, split=blockIdx.z%S;
@@ -5864,12 +5908,12 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
   const int active_rows=min(BM,rows-query_base);
   if(active_rows<=0) return;
   const int maximum_count=min(base+query_base+active_rows,capacity);
-  // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT2
+  // L0 OSCAR: key tiles of [kSink, history_end) are served by the INT4
   // history kernel; virtual tile v maps to the sink tiles, then the tiles past
   // the history. Identity when history_end <= kSink.
-  const int sink_tiles=ninfer::exl3::l0_oscar::kSink/BN;
-  const int skip=history_end>ninfer::exl3::l0_oscar::kSink?
-      (history_end-ninfer::exl3::l0_oscar::kSink)/BN:0;
+  const int sink_tiles=voidinfer::exl3::l0_oscar::kSink/BN;
+  const int skip=history_end>voidinfer::exl3::l0_oscar::kSink?
+      (history_end-voidinfer::exl3::l0_oscar::kSink)/BN:0;
   const int tiles=(maximum_count+BN-1)/BN-skip;
   const auto real_tile=[&](int tile){ return tile<sink_tiles?tile:tile+skip; };
   const int per=(tiles+S-1)/S;
@@ -5884,12 +5928,57 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       qa[kk][0]=l0?q0[kk*8]:0u; qa[kk][1]=l1?q1[kk*8]:0u;
       qa[kk][2]=l0?q0[kk*8+4]:0u; qa[kk][3]=l1?q1[kk*8+4]:0u;
     }
+    // The 1/16 score scale (2^-4) is folded into Q: exact.
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/16;++kk)
+      #pragma unroll
+      for(int r=0;r<4;++r){
+        half2 h=*reinterpret_cast<half2*>(&qa[kk][r]);
+        h=__hmul2(h,__float2half2_rn(0.0625f));
+        qa[kk][r]=*reinterpret_cast<unsigned*>(&h);
+      }
   }
   float acc[kHeadDim/8][4];
   #pragma unroll
   for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
   float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
+  const auto* k8=reinterpret_cast<const unsigned char*>(k_cache);
+  const auto* v8=reinterpret_cast<const unsigned char*>(v_cache);
+  auto load8=[&](int tile,int stage){
+    unsigned char* ks8=sm8+stage*kFp8Stage; unsigned char* vs8=ks8+BN*kHeadDim;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(BN*kHeadDim/16)/256;++i){
+      const int idx=tid+i*256; const int key_off=idx/(kHeadDim/16); const int chunk=(idx%(kHeadDim/16))*16;
+      const int key=first+key_off; const bool valid=key<maximum_count;
+      const std::size_t off=static_cast<std::size_t>(valid?key:0)*kFp8RowBytes+kv_head*kHeadDim+chunk;
+      cp16(ks8+key_off*kHeadDim+chunk,k8+off,valid);
+      cp16(vs8+key_off*kHeadDim+chunk,v8+off,valid);
+    }
+    commit();
+  };
+  // FP8 tile `stage` -> the FP16 tile (one 8-dimension group per unit).
+  auto expand8=[&](int tile,int stage){
+    const unsigned char* ks8=sm8+stage*kFp8Stage;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(2*BN*kHeadDim/8)/256;++i){
+      const int idx=tid+i*256; const int kind=idx/(BN*kHeadDim/8);
+      const int key_off=(idx/(kHeadDim/8))%BN; const int dim=(idx%(kHeadDim/8))*8;
+      const int key=first+key_off;
+      const unsigned char* rows8=kind?v8:k8;
+      const float scale=key<maximum_count?__half2float(*reinterpret_cast<const __half*>(
+          rows8+static_cast<std::size_t>(key)*kFp8RowBytes+4*kHeadDim+kv_head*2)):0.f;
+      const uint2 raw=*reinterpret_cast<const uint2*>(ks8+kind*BN*kHeadDim+key_off*kHeadDim+dim);
+      const unsigned char* q8=reinterpret_cast<const unsigned char*>(&raw);
+      __align__(16) half h[8];
+      #pragma unroll
+      for(int j=0;j<8;++j){ __nv_fp8_e4m3 x; x.__x=q8[j]; h[j]=__float2half_rn(static_cast<float>(x)*scale); }
+      *reinterpret_cast<uint4*>(sm+kind*BN*kStride+key_off*kStride+dim)=*reinterpret_cast<const uint4*>(h);
+    }
+  };
   auto load=[&](int tile,int stage){
+    if constexpr(Fp8){ load8(tile,stage); return; }
     half* ks=sm+stage*kStage; half* vs=ks+BN*kStride;
     const int first=real_tile(tile)*BN;
     #pragma unroll
@@ -5897,8 +5986,8 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       const int idx=tid+i*256; const int key_off=idx/(kHeadDim/8); const int dim=(idx%(kHeadDim/8))*8;
       const int key=first+key_off; const bool valid=key<maximum_count;
       const int k_index=valid?key:0;
-      const bool in_sink=sink_k && k_index<ninfer::exl3::l0_oscar::kSink;
-      const std::size_t off=(ninfer::exl3::l0_oscar::window_row(k_index,sink_k!=nullptr,ring_mask)*
+      const bool in_sink=sink_k && k_index<voidinfer::exl3::l0_oscar::kSink;
+      const std::size_t off=(voidinfer::exl3::l0_oscar::window_row(k_index,sink_k!=nullptr,ring_mask)*
           kKVHeads+kv_head)*kHeadDim+dim;
       cp16(ks+key_off*kStride+dim,(in_sink?sink_k:k_cache)+off,valid);
       cp16(vs+key_off*kStride+dim,(in_sink?sink_v:v_cache)+off,valid);
@@ -5912,8 +6001,9 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
     const int stage=(tile-t_begin)&1;
     if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
     __syncthreads();
+    if constexpr(Fp8){ expand8(tile,stage); __syncthreads(); }
     const int first=real_tile(tile)*BN;
-    const half* ks=sm+stage*kStage; const half* vs=ks+BN*kStride;
+    const half* ks=sm+(Fp8?0:stage*kStage); const half* vs=ks+BN*kStride;
     const bool warp_live=(m_base<active_rows) && first<=warp_max_limit;
     if(warp_live){
       float s[BN/8][4];
@@ -5921,28 +6011,34 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
       for(int j=0;j<BN/8;++j) s[j][0]=s[j][1]=s[j][2]=s[j][3]=0.f;
       // Scores: kQkHalfGroup consecutive 16-dimension k-steps accumulate in
       // FP16 (the double-rate tensor path), each partial is added in FP32.
+      // All groups' partials are independent accumulators (latency hiding).
+      constexpr int kQkGroups=kHeadDim/16/kQkHalfGroup;
+      unsigned hs[kQkGroups][BN/8][2];
       #pragma unroll
-      for(int kk0=0;kk0<kHeadDim/16;kk0+=kQkHalfGroup){
-        unsigned hs[BN/8][2];
+      for(int group=0;group<kQkGroups;++group)
         #pragma unroll
-        for(int j=0;j<BN/8;++j) hs[j][0]=hs[j][1]=0u;
+        for(int j=0;j<BN/8;++j) hs[group][j][0]=hs[group][j][1]=0u;
+      #pragma unroll
+      for(int step=0;step<kQkHalfGroup;++step){
         #pragma unroll
-        for(int kk=kk0;kk<kk0+kQkHalfGroup;++kk){
+        for(int group=0;group<kQkGroups;++group){
+          const int kk=group*kQkHalfGroup+step;
           #pragma unroll
           for(int pair=0;pair<BN/16;++pair){
             unsigned b[4];
             reg_attn_ldmatrix_x4(b,ks+(pair*16+(lane&7)+((lane>>4)<<3))*kStride+kk*16+((lane>>3)&1)*8);
-            mma_h(hs[2*pair],qa[kk],b[0],b[1]);
-            mma_h(hs[2*pair+1],qa[kk],b[2],b[3]);
+            mma_h(hs[group][2*pair],qa[kk],b[0],b[1]);
+            mma_h(hs[group][2*pair+1],qa[kk],b[2],b[3]);
           }
         }
+      }
+      #pragma unroll
+      for(int group=0;group<kQkGroups;++group)
         #pragma unroll
         for(int j=0;j<BN/8;++j){
-          const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hs[j][0]));
-          const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hs[j][1]));
-          s[j][0]+=lo.x; s[j][1]+=lo.y; s[j][2]+=hi.x; s[j][3]+=hi.y;
+          add_lo(s[j][0],hs[group][j][0]); add_hi(s[j][1],hs[group][j][0]);
+          add_lo(s[j][2],hs[group][j][1]); add_hi(s[j][3],hs[group][j][1]);
         }
-      }
       const bool need_mask=first+BN-1>warp_min_limit;
       float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
       #pragma unroll
@@ -5950,26 +6046,40 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         #pragma unroll
         for(int e=0;e<4;++e){
           const int row=e<2?row0:row1; const int key=first+8*j+2*t+(e&1);
-          float sc=s[j][e]*0.0625f;
+          float sc=s[j][e];
           if(need_mask && (key>base+query_base+row || row>=active_rows)) sc=-3.402823466e+38F;
           s[j][e]=sc; tmax[e>>1]=fmaxf(tmax[e>>1],sc);
         }
       #pragma unroll
       for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
+      // Every live row's tile scores below run_max - kFa2NegligibleNats: each P
+      // rounds to FP16 zero (<= 2^-25), so the row sums, the accumulator and
+      // the running max would not change. Skip the exponentials and PV (exact).
+      const bool negligible=__all_sync(0xffffffffu,
+          (row0>=active_rows || tmax[0]<run_max[0]-kFa2NegligibleNats) &&
+          (row1>=active_rows || tmax[1]<run_max[1]-kFa2NegligibleNats));
+      if(!negligible){
       float scale[2];
       #pragma unroll
-      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:exp2f((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:fast_ex2((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      // P = 2^((s - max) log2 e): one FFMA and one MUFU.EX2 per score. A
+      // masked score (-FLT_MAX) gives 0 (explicitly on masked tiles, where
+      // the row max itself may still be the mask value).
       unsigned pp[BN/8][2]; float rs[2]={0.f,0.f};
+      const float bias[2]={-run_max[0]*1.4426950408889634f,-run_max[1]*1.4426950408889634f};
       #pragma unroll
       for(int j=0;j<BN/8;++j){
-        half p[4];
+        float p[4];
         #pragma unroll
         for(int e=0;e<4;++e){
           const float x=s[j][e];
-          p[e]=__float2half(x==-3.402823466e+38F?0.f:exp2f((x-run_max[e>>1])*1.4426950408889634f));
-          rs[e>>1]+=__half2float(p[e]);
+          p[e]=fast_ex2(fmaf(x,1.4426950408889634f,bias[e>>1]));
+          if(need_mask && x==-3.402823466e+38F) p[e]=0.f;
         }
-        pp[j][0]=reg_attn_pack(p[0],p[1]); pp[j][1]=reg_attn_pack(p[2],p[3]);
+        const half2 lo=__floats2half2_rn(p[0],p[1]), hi=__floats2half2_rn(p[2],p[3]);
+        pp[j][0]=*reinterpret_cast<const unsigned*>(&lo); pp[j][1]=*reinterpret_cast<const unsigned*>(&hi);
+        // Row sums of the rounded P (the weights PV uses).
+        add_lo(rs[0],pp[j][0]); add_hi(rs[0],pp[j][0]); add_lo(rs[1],pp[j][1]); add_hi(rs[1],pp[j][1]);
       }
       #pragma unroll
       for(int i=0;i<2;++i){ rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],1); rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],2); den[i]=den[i]*scale[i]+rs[i]; }
@@ -5978,25 +6088,32 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
         for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
       }
       // PV: each key tile accumulates in FP16 (double-rate tensor path) and
-      // is added into the FP32 accumulator.
-      unsigned hacc[kHeadDim/8][2];
+      // is added into the FP32 accumulator, one half of the head dimension
+      // at a time (half the FP16 accumulator registers: no spills).
       #pragma unroll
-      for(int n=0;n<kHeadDim/8;++n) hacc[n][0]=hacc[n][1]=0u;
-      #pragma unroll
-      for(int kk=0;kk<BN/16;++kk){
-        const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
+      for(int half_dim=0;half_dim<2;++half_dim){
+        constexpr int kHalfTiles=kHeadDim/16;
+        unsigned hacc[kHalfTiles][2];
         #pragma unroll
-        for(int pair=0;pair<kHeadDim/16;++pair){
-          unsigned b[4];
-          reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+pair*16+(lane>>4)*8);
-          mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
+        for(int n=0;n<kHalfTiles;++n) hacc[n][0]=hacc[n][1]=0u;
+        #pragma unroll
+        for(int kk=0;kk<BN/16;++kk){
+          const unsigned a[4]={pp[2*kk][0],pp[2*kk][1],pp[2*kk+1][0],pp[2*kk+1][1]};
+          #pragma unroll
+          for(int pair=0;pair<kHalfTiles/2;++pair){
+            const int column=half_dim*(kHeadDim/2)+pair*16;
+            unsigned b[4];
+            reg_attn_ldmatrix_x4_trans(b,vs+(16*kk+(lane&7)+((lane>>3)&1)*8)*kStride+column+(lane>>4)*8);
+            mma_h(hacc[2*pair],a,b[0],b[1]); mma_h(hacc[2*pair+1],a,b[2],b[3]);
+          }
+        }
+        #pragma unroll
+        for(int n=0;n<kHalfTiles;++n){
+          const int out=half_dim*kHalfTiles+n;
+          add_lo(acc[out][0],hacc[n][0]); add_hi(acc[out][1],hacc[n][0]);
+          add_lo(acc[out][2],hacc[n][1]); add_hi(acc[out][3],hacc[n][1]);
         }
       }
-      #pragma unroll
-      for(int n=0;n<kHeadDim/8;++n){
-        const float2 lo=__half22float2(*reinterpret_cast<half2*>(&hacc[n][0]));
-        const float2 hi=__half22float2(*reinterpret_cast<half2*>(&hacc[n][1]));
-        acc[n][0]+=lo.x; acc[n][1]+=lo.y; acc[n][2]+=hi.x; acc[n][3]+=hi.y;
       }
     }
     __syncthreads();
@@ -6024,33 +6141,273 @@ __global__ void __launch_bounds__(256,1) attention_gqa_six_fa2_prefill_kernel(co
     }
   }
 }
+// FP8 math over FP8 history rows (l0_exact.cuh L0LineFp8 layout; staged
+// line passes, VOIDINFER_EXL3_LINE_FP8_MATH=1): QK and PV run as e4m3 MMA
+// (m16n8k32) instead of expanding K/V to FP16. Q is quantized per (row,
+// head); scores take the per-key K scale;
+// P is folded with the per-key V scale and quantized per (row, key tile).
+// Same CTA layout, splits and output format as the FA2 kernel (base 0, no
+// masking beyond the key count). K tiles land in shared memory permuted so
+// each QK n-tile's keys are adjacent rows (no bank conflicts) and its score
+// columns are the PV A-fragment keys; V tiles are transposed (dims x keys).
+// FP16-accumulated e4m3 MMA from a zero accumulator: d[0] = row g columns
+// 2t, 2t+1, d[1] = row g + 8.
+__device__ __forceinline__ void mma_e4m3_h(unsigned (&d)[2],const unsigned (&a)[4],unsigned b0,unsigned b1){
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
+    :"=r"(d[0]),"=r"(d[1]):"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b0),"r"(b1),"r"(0u));
+}
+__device__ __forceinline__ unsigned pack_e4m3x4(float a,float b,float c,float d){
+  const unsigned lo=__nv_cvt_float2_to_fp8x2(make_float2(a,b),__NV_SATFINITE,__NV_E4M3);
+  const unsigned hi=__nv_cvt_float2_to_fp8x2(make_float2(c,d),__NV_SATFINITE,__NV_E4M3);
+  return lo|(hi<<16);
+}
+constexpr int kF8Ks=kHeadDim+16;   // K row stride (bytes)
+constexpr int kF8Vt=BN+16;         // V^T row stride (bytes)
+constexpr std::size_t fp8math_smem_bytes(){
+  return 2u*kFp8Stage+static_cast<std::size_t>(BN)*kF8Ks+static_cast<std::size_t>(kHeadDim)*kF8Vt+2u*BN*sizeof(float);
+}
+// MMAs accumulate in FP16 (twice the e4m3 tensor rate of FP32 accumulation),
+// one 32-wide k step each, added in FP32. The mirror rows are e4m3 within
+// +-448; Q and P are quantized to absmax 4, so one step's sum stays within
+// 32 x 4 x 448 = 57344 < 65504.
+template<int S>
+__global__ void __launch_bounds__(256,1) attention_fp8_history_kernel(const std::uint16_t* q,const unsigned char* k8,
+    const unsigned char* v8,int rows,int keys,float* split_output,float* split_stats){
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  unsigned char* ksm=smem_raw+2*kFp8Stage;
+  unsigned char* vtm=ksm+BN*kF8Ks;
+  float* ksc=reinterpret_cast<float*>(vtm+kHeadDim*kF8Vt);
+  float* vsc=ksc+BN;
+  const int query_base=(static_cast<int>(gridDim.x)-1-static_cast<int>(blockIdx.x))*BM;
+  const int kv_head=blockIdx.y;
+  const int head_group=blockIdx.z/S, split=blockIdx.z%S;
+  const int tid=threadIdx.x, warp=tid>>5, lane=tid&31;
+  const int head_local=warp>>2, m_base=(warp&3)*16;
+  const int g=lane>>2, t=lane&3;
+  const int row0=m_base+g, row1=row0+8;
+  const int q_head=kv_head*(kQHeads/kKVHeads)+head_group*2+head_local;
+  const int active_rows=min(BM,rows-query_base);
+  if(active_rows<=0) return;
+  const int tiles=(keys+BN-1)/BN;
+  const int per=(tiles+S-1)/S;
+  const int t_begin=split*per, t_end=min(tiles,t_begin+per);
+  constexpr float kQMax=4.f, kPMax=4.f;
+  // Q A fragments (e4m3) and per-row scales (natural-log score units).
+  unsigned qa[kHeadDim/32][4];
+  float qscale[2];
+  {
+    const bool l0=row0<active_rows, l1=row1<active_rows;
+    const __half* q0=reinterpret_cast<const __half*>(q)+(static_cast<std::size_t>(query_base+(l0?row0:0))*kQHeads+q_head)*kHeadDim;
+    const __half* q1=reinterpret_cast<const __half*>(q)+(static_cast<std::size_t>(query_base+(l1?row1:0))*kQHeads+q_head)*kHeadDim;
+    float x[2][kHeadDim/32][8];
+    float amax[2]={0.f,0.f};
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/32;++kk)
+      #pragma unroll
+      for(int h=0;h<2;++h){
+        const uint2 r0=*reinterpret_cast<const uint2*>(q0+kk*32+16*h+4*t);
+        const uint2 r1=*reinterpret_cast<const uint2*>(q1+kk*32+16*h+4*t);
+        const __half* a=reinterpret_cast<const __half*>(&r0);
+        const __half* b=reinterpret_cast<const __half*>(&r1);
+        #pragma unroll
+        for(int i=0;i<4;++i){
+          x[0][kk][4*h+i]=l0?__half2float(a[i]):0.f; x[1][kk][4*h+i]=l1?__half2float(b[i]):0.f;
+          amax[0]=fmaxf(amax[0],fabsf(x[0][kk][4*h+i])); amax[1]=fmaxf(amax[1],fabsf(x[1][kk][4*h+i]));
+        }
+      }
+    #pragma unroll
+    for(int r=0;r<2;++r){
+      amax[r]=fmaxf(amax[r],__shfl_xor_sync(0xffffffffu,amax[r],1));
+      amax[r]=fmaxf(amax[r],__shfl_xor_sync(0xffffffffu,amax[r],2));
+      qscale[r]=amax[r]/kQMax*0.0625f;
+    }
+    const float inv[2]={amax[0]>0.f?kQMax/amax[0]:0.f,amax[1]>0.f?kQMax/amax[1]:0.f};
+    #pragma unroll
+    for(int kk=0;kk<kHeadDim/32;++kk){
+      qa[kk][0]=pack_e4m3x4(x[0][kk][0]*inv[0],x[0][kk][1]*inv[0],x[0][kk][2]*inv[0],x[0][kk][3]*inv[0]);
+      qa[kk][1]=pack_e4m3x4(x[1][kk][0]*inv[1],x[1][kk][1]*inv[1],x[1][kk][2]*inv[1],x[1][kk][3]*inv[1]);
+      qa[kk][2]=pack_e4m3x4(x[0][kk][4]*inv[0],x[0][kk][5]*inv[0],x[0][kk][6]*inv[0],x[0][kk][7]*inv[0]);
+      qa[kk][3]=pack_e4m3x4(x[1][kk][4]*inv[1],x[1][kk][5]*inv[1],x[1][kk][6]*inv[1],x[1][kk][7]*inv[1]);
+    }
+  }
+  float acc[kHeadDim/8][4];
+  #pragma unroll
+  for(int n=0;n<kHeadDim/8;++n) acc[n][0]=acc[n][1]=acc[n][2]=acc[n][3]=0.f;
+  float run_max[2]={-3.402823466e+38F,-3.402823466e+38F}, den[2]={0.f,0.f};
+  auto load=[&](int tile,int stage){
+    unsigned char* ks8=smem_raw+stage*kFp8Stage; unsigned char* vs8=ks8+BN*kHeadDim;
+    const int first=tile*BN;
+    #pragma unroll
+    for(int i=0;i<(BN*kHeadDim/16)/256;++i){
+      const int idx=tid+i*256; const int key_off=idx/(kHeadDim/16); const int chunk=(idx%(kHeadDim/16))*16;
+      const int key=first+key_off; const bool valid=key<keys;
+      const std::size_t off=static_cast<std::size_t>(valid?key:0)*kFp8RowBytes+kv_head*kHeadDim+chunk;
+      cp16(ks8+key_off*kHeadDim+chunk,k8+off,valid);
+      cp16(vs8+key_off*kHeadDim+chunk,v8+off,valid);
+    }
+    commit();
+  };
+  if(t_begin<t_end) load(t_begin,0);
+  for(int tile=t_begin;tile<t_end;++tile){
+    const int stage=(tile-t_begin)&1;
+    if(tile+1<t_end){ load(tile+1,stage^1); wait<1>(); } else wait<0>();
+    __syncthreads();
+    {
+      const unsigned char* ks8=smem_raw+stage*kFp8Stage; const unsigned char* vs8=ks8+BN*kHeadDim;
+      const int first=tile*BN;
+      // K rows: key k -> slot 8 j + g of the QK n-tile j / column g that scores it.
+      {
+        const int key=tid>>3, part=(tid&7)*32;
+        const int j=2*(key>>4)+((key>>1)&1), gg=2*((key>>2)&3)+(key&1);
+        const uint4* src=reinterpret_cast<const uint4*>(ks8+key*kHeadDim+part);
+        uint4* dst=reinterpret_cast<uint4*>(ksm+(8*j+gg)*kF8Ks+part);
+        dst[0]=src[0]; dst[1]=src[1];
+      }
+      // V transposed: thread = (key quad, 8-dim group).
+      {
+        const int kq=tid&7, dg=tid>>3;
+        uint2 r[4];
+        #pragma unroll
+        for(int i=0;i<4;++i) r[i]=*reinterpret_cast<const uint2*>(vs8+(4*kq+i)*kHeadDim+8*dg);
+        #pragma unroll
+        for(int h=0;h<2;++h){
+          const unsigned x0=h?r[0].y:r[0].x,x1=h?r[1].y:r[1].x,x2=h?r[2].y:r[2].x,x3=h?r[3].y:r[3].x;
+          const unsigned t0=__byte_perm(x0,x1,0x5140),t1=__byte_perm(x2,x3,0x5140);
+          const unsigned t2=__byte_perm(x0,x1,0x7362),t3=__byte_perm(x2,x3,0x7362);
+          unsigned char* d=vtm+(8*dg+4*h)*kF8Vt+4*kq;
+          *reinterpret_cast<unsigned*>(d)=__byte_perm(t0,t1,0x5410);
+          *reinterpret_cast<unsigned*>(d+kF8Vt)=__byte_perm(t0,t1,0x7632);
+          *reinterpret_cast<unsigned*>(d+2*kF8Vt)=__byte_perm(t2,t3,0x5410);
+          *reinterpret_cast<unsigned*>(d+3*kF8Vt)=__byte_perm(t2,t3,0x7632);
+        }
+      }
+      if(tid<2*BN){
+        const int key=tid%BN, kind=tid/BN;
+        const bool valid=first+key<keys;
+        const float sc=valid?__half2float(*reinterpret_cast<const __half*>((kind?v8:k8)+
+            static_cast<std::size_t>(first+key)*kFp8RowBytes+4*kHeadDim+kv_head*2)):0.f;
+        (kind?vsc:ksc)[key]=sc;
+      }
+    }
+    __syncthreads();
+    const int first=tile*BN;
+    if(m_base<active_rows){
+      // QK: n-tile j column c is key 4 (c >> 1) + 2 (j & 1) + (c & 1) + 16 (j >> 1).
+      float c[BN/8][4];
+      #pragma unroll
+      for(int j=0;j<BN/8;++j) c[j][0]=c[j][1]=c[j][2]=c[j][3]=0.f;
+      #pragma unroll
+      for(int kk=0;kk<kHeadDim/32;++kk)
+        #pragma unroll
+        for(int j=0;j<BN/8;++j){
+          const unsigned char* kr=ksm+(8*j+g)*kF8Ks+kk*32+4*t;
+          unsigned h[2];
+          mma_e4m3_h(h,qa[kk],*reinterpret_cast<const unsigned*>(kr),*reinterpret_cast<const unsigned*>(kr+16));
+          add_lo(c[j][0],h[0]); add_hi(c[j][1],h[0]); add_lo(c[j][2],h[1]); add_hi(c[j][3],h[1]);
+        }
+      float s[BN/8][4];
+      float tmax[2]={-3.402823466e+38F,-3.402823466e+38F};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j)
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const int key=4*t+2*(j&1)+16*(j>>1)+(e&1);
+          const float x=first+key<keys?c[j][e]*qscale[e>>1]*ksc[key]:-3.402823466e+38F;
+          s[j][e]=x; tmax[e>>1]=fmaxf(tmax[e>>1],x);
+        }
+      #pragma unroll
+      for(int i=0;i<2;++i){ tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],1)); tmax[i]=fmaxf(tmax[i],__shfl_xor_sync(0xffffffffu,tmax[i],2)); }
+      float scale[2];
+      #pragma unroll
+      for(int i=0;i<2;++i){ const float nm=fmaxf(run_max[i],tmax[i]); scale[i]=(nm==run_max[i])?1.f:fast_ex2((run_max[i]-nm)*1.4426950408889634f); run_max[i]=nm; }
+      const float bias[2]={-run_max[0]*1.4426950408889634f,-run_max[1]*1.4426950408889634f};
+      float pv[BN/8][4]; float rs[2]={0.f,0.f}, pmax[2]={0.f,0.f};
+      #pragma unroll
+      for(int j=0;j<BN/8;++j)
+        #pragma unroll
+        for(int e=0;e<4;++e){
+          const int key=4*t+2*(j&1)+16*(j>>1)+(e&1);
+          const float x=s[j][e];
+          const float p=x==-3.402823466e+38F?0.f:fast_ex2(fmaf(x,1.4426950408889634f,bias[e>>1]));
+          rs[e>>1]+=p;
+          pv[j][e]=p*vsc[key];
+          pmax[e>>1]=fmaxf(pmax[e>>1],pv[j][e]);
+        }
+      #pragma unroll
+      for(int i=0;i<2;++i){
+        rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],1); rs[i]+=__shfl_xor_sync(0xffffffffu,rs[i],2); den[i]=den[i]*scale[i]+rs[i];
+        pmax[i]=fmaxf(pmax[i],__shfl_xor_sync(0xffffffffu,pmax[i],1)); pmax[i]=fmaxf(pmax[i],__shfl_xor_sync(0xffffffffu,pmax[i],2));
+      }
+      if(!__all_sync(0xffffffffu,scale[0]==1.f && scale[1]==1.f)){
+        #pragma unroll
+        for(int n=0;n<kHeadDim/8;++n){ acc[n][0]*=scale[0]; acc[n][1]*=scale[0]; acc[n][2]*=scale[1]; acc[n][3]*=scale[1]; }
+      }
+      const float pinv[2]={pmax[0]>0.f?kPMax/pmax[0]:0.f,pmax[1]>0.f?kPMax/pmax[1]:0.f};
+      const float pq[2]={pmax[0]/kPMax,pmax[1]/kPMax};
+      // A: row g keys 4t..4t+3 (n-tiles 0, 1), row g + 8, then keys 16 + 4t.. (n-tiles 2, 3).
+      const unsigned pa[4]={
+        pack_e4m3x4(pv[0][0]*pinv[0],pv[0][1]*pinv[0],pv[1][0]*pinv[0],pv[1][1]*pinv[0]),
+        pack_e4m3x4(pv[0][2]*pinv[1],pv[0][3]*pinv[1],pv[1][2]*pinv[1],pv[1][3]*pinv[1]),
+        pack_e4m3x4(pv[2][0]*pinv[0],pv[2][1]*pinv[0],pv[3][0]*pinv[0],pv[3][1]*pinv[0]),
+        pack_e4m3x4(pv[2][2]*pinv[1],pv[2][3]*pinv[1],pv[3][2]*pinv[1],pv[3][3]*pinv[1])};
+      #pragma unroll
+      for(int n=0;n<kHeadDim/8;++n){
+        const unsigned char* vr=vtm+(8*n+g)*kF8Vt+4*t;
+        unsigned h[2];
+        mma_e4m3_h(h,pa,*reinterpret_cast<const unsigned*>(vr),*reinterpret_cast<const unsigned*>(vr+16));
+        const float2 lo=__half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+        const float2 hi=__half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+        acc[n][0]=fmaf(pq[0],lo.x,acc[n][0]); acc[n][1]=fmaf(pq[0],lo.y,acc[n][1]);
+        acc[n][2]=fmaf(pq[1],hi.x,acc[n][2]); acc[n][3]=fmaf(pq[1],hi.y,acc[n][3]);
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for(int i=0;i<2;++i){
+    const int row=i==0?row0:row1;
+    if(row>=active_rows) continue;
+    const std::size_t row_base=(static_cast<std::size_t>(query_base+row)*kQHeads+q_head)*kHeadDim;
+    const float inv=den[i]>0.f?1.f/den[i]:0.f;
+    #pragma unroll
+    for(int n=0;n<kHeadDim/8;++n){
+      const int dim=8*n+2*t;
+      float2* d=reinterpret_cast<float2*>(split_output+static_cast<std::size_t>(split)*rows*kQHeads*kHeadDim+row_base+dim);
+      *d=make_float2(acc[n][2*i]*inv,acc[n][2*i+1]*inv);
+    }
+    if(t==0){
+      const std::size_t stat=(static_cast<std::size_t>(split)*rows*kQHeads+(query_base+row)*kQHeads+q_head)*2;
+      split_stats[stat]=run_max[i]; split_stats[stat+1]=den[i];
+    }
+  }
+}
 } // namespace fa2_prefill
 
 bool exl3_fa2_prefill_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FA2_PREFILL");
+        const char* value=std::getenv("VOIDINFER_EXL3_FA2_PREFILL");
         if(!value || std::strcmp(value,"1")==0) return true;
         if(std::strcmp(value,"0")==0) return false;
-        throw std::invalid_argument("NINFER_EXL3_FA2_PREFILL must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_FA2_PREFILL must be 0 or 1");
     }();
     return enabled;
 }
 
-template<int S>
+template<int S,bool Fp8=false>
 static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_t* k,
     const std::uint16_t* v,std::uint16_t* output,int rows,int position,int capacity,
     float* split_output,float* split_stats,cudaStream_t stream,int history_end=0,
     bool merge=true,const std::uint16_t* sink_k=nullptr,const std::uint16_t* sink_v=nullptr,
     int ring_mask=-1) {
-    constexpr std::size_t bytes=fa2_prefill::smem_bytes();
+    constexpr std::size_t bytes=Fp8?fa2_prefill::fp8_smem_bytes():fa2_prefill::smem_bytes();
     static const bool configured=[] {
-        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S>,
+        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S,Fp8>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
             "configure FA2 prefill shared memory");
         return true;
     }();
     (void)configured;
-    fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S><<<
+    fa2_prefill::attention_gqa_six_fa2_prefill_kernel<S,Fp8><<<
         dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*S),256,
         bytes,stream>>>(q,k,v,output,rows,position,capacity,split_output,split_stats,
             history_end,sink_k,sink_v,ring_mask);
@@ -6061,6 +6418,24 @@ static void launch_fa2_prefill_variant(const std::uint16_t* q,const std::uint16_
             split_output,split_stats,output,rows);
         cuda_check(cudaGetLastError(),"launch FA2 prefill split merge");
     }
+}
+
+// Staged FP8 history with FP8 math (attention_fp8_history_kernel), four key splits.
+static void launch_fp8_history(const std::uint16_t* q,const std::uint16_t* k8,const std::uint16_t* v8,
+    int rows,int keys,float* split_output,float* split_stats,cudaStream_t stream) {
+    constexpr std::size_t bytes=fa2_prefill::fp8math_smem_bytes();
+    static const bool configured=[] {
+        cuda_check(cudaFuncSetAttribute(fa2_prefill::attention_fp8_history_kernel<4>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(bytes)),
+            "configure FP8 history shared memory");
+        return true;
+    }();
+    (void)configured;
+    fa2_prefill::attention_fp8_history_kernel<4><<<
+        dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,kKVHeads,(kQHeads/kKVHeads/2)*4),256,bytes,stream>>>(
+            q,reinterpret_cast<const unsigned char*>(k8),reinterpret_cast<const unsigned char*>(v8),
+            rows,keys,split_output,split_stats);
+    cuda_check(cudaGetLastError(),"launch FP8 history attention");
 }
 
 static void launch_fa2_prefill(const std::uint16_t* q,const std::uint16_t* k,
@@ -6109,11 +6484,11 @@ void launch_wmma32_register_prefill(const std::uint16_t* q,const std::uint16_t* 
 
 int wmma32_register_heads() {
     static const int heads=[] {
-        const char* value=std::getenv("NINFER_EXL3_WMMA32_REGISTER");
+        const char* value=std::getenv("VOIDINFER_EXL3_WMMA32_REGISTER");
         if(!value) return 2;
         const int parsed=std::atoi(value);
         if(parsed!=0 && parsed!=1 && parsed!=2 && parsed!=3)
-            throw std::invalid_argument("NINFER_EXL3_WMMA32_REGISTER must be 0, 1, 2 or 3");
+            throw std::invalid_argument("VOIDINFER_EXL3_WMMA32_REGISTER must be 0, 1, 2 or 3");
         return parsed;
     }();
     return heads;
@@ -6376,9 +6751,9 @@ __global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_m
     const int count=base+query+1;
     std::uint16_t* out=output+(query*kQHeads+kv_head*H+head)*kHeadDim+tid;
     if(count<1 || count>capacity) { if(group==0) *out=0; return; }
-    const int l0_end=history_slot?min(ninfer::exl3::l0_oscar::history_end(
+    const int l0_end=history_slot?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
-    const int live_segments=l0_end>ninfer::exl3::l0_oscar::kSink?
+    const int live_segments=l0_end>voidinfer::exl3::l0_oscar::kSink?
         min(segments,1+(count-l0_end+keys-1)/keys):min(segments,(count+keys-1)/keys);
     const float* slots=workspace+
         (static_cast<std::size_t>(query)*kKVHeads+kv_head)*segments*kFastFusedFlashStride;
@@ -6395,8 +6770,8 @@ __global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_m
     const bool history_live=history && history[kFastFusedFlashValues+H+head]>0.0f;
     float self_score=-INFINITY,self_value=0.0f;
     if(self_q) {
-        const bool in_sink=sink_k && count-1<ninfer::exl3::l0_oscar::kSink;
-        const std::size_t kv=ninfer::exl3::l0_oscar::window_row(count-1,sink_k!=nullptr,ring_mask)*
+        const bool in_sink=sink_k && count-1<voidinfer::exl3::l0_oscar::kSink;
+        const std::size_t kv=voidinfer::exl3::l0_oscar::window_row(count-1,sink_k!=nullptr,ring_mask)*
             kKVHeads*kHeadDim+kv_head*kHeadDim+tid;
         const std::uint16_t* key_plane=in_sink?sink_k:self_k;
         const std::uint16_t* value_plane=in_sink?sink_v:self_v;
@@ -6461,7 +6836,7 @@ __global__ void __launch_bounds__(kMergeGroups*kHeadDim) attention_fused_flash_m
 
 bool fused_flash_merge_heads_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_FLASH_MERGE_HEADS");
+        const char* value=std::getenv("VOIDINFER_EXL3_FLASH_MERGE_HEADS");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -6508,18 +6883,18 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
     const int t=lane&3;
     const int base=(position_device?*position_device:position)+query_offset;
     // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
-    // history end; the history itself is served by the INT2 kernel.
-    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    // history end; the history itself is served by the INT4 kernel.
+    const int l0_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
-    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const bool l0_remap=l0_end>voidinfer::exl3::l0_oscar::kSink;
     const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
-    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT4
     // history kernel; a segment wholly inside it only publishes an empty slot.
-    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
-    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    const int history_begin=l0_history?voidinfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     if(first>=history_begin && segment_end<=history_end) {
         if(tid<rows*H) {
@@ -6562,8 +6937,8 @@ __global__ void __launch_bounds__(96) attention_verify_flash_mma_kernel(
             const int key=chunk_first+key_offset;
             uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
             if(key<segment_end) {
-                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
-                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                const bool in_sink=sink_k && key<voidinfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(voidinfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
                     ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
                 key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
                 value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
@@ -6700,18 +7075,18 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
     const int t=lane&3;
     const int base=(position_device?*position_device:position)+query_offset;
     // L0 OSCAR: virtual segment 0 is the sink, segment s >= 1 starts at the
-    // history end; the history itself is served by the INT2 kernel.
-    const int l0_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    // history end; the history itself is served by the INT4 kernel.
+    const int l0_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
-    const bool l0_remap=l0_end>ninfer::exl3::l0_oscar::kSink;
+    const bool l0_remap=l0_end>voidinfer::exl3::l0_oscar::kSink;
     const int first=l0_remap&&segment>0?l0_end+(segment-1)*kVerifyMmaKeys:segment*kVerifyMmaKeys;
     const int last_count=base+rows;  // largest live key count of the block
     if(first>=last_count || base+1<1 || last_count>capacity) return;
     const int segment_end=min(first+kVerifyMmaKeys,last_count);
-    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT2
+    // L0 OSCAR: keys in [history_begin, history_end) are served by the INT4
     // history kernel; a segment wholly inside it only publishes an empty slot.
-    const int history_begin=l0_history?ninfer::exl3::l0_oscar::kSink:0;
-    const int history_end=l0_history?min(ninfer::exl3::l0_oscar::history_end(
+    const int history_begin=l0_history?voidinfer::exl3::l0_oscar::kSink:0;
+    const int history_end=l0_history?min(voidinfer::exl3::l0_oscar::history_end(
         position_device?*position_device:position),capacity):0;
     if(first>=history_begin && segment_end<=history_end) {
         if(tid<rows*H) {
@@ -6755,8 +7130,8 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
             const int key=chunk_first+key_offset;
             uint4 key_bits=make_uint4(0,0,0,0),value_bits=make_uint4(0,0,0,0);
             if(key<segment_end) {
-                const bool in_sink=sink_k && key<ninfer::exl3::l0_oscar::kSink;
-                const std::size_t offset=(ninfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
+                const bool in_sink=sink_k && key<voidinfer::exl3::l0_oscar::kSink;
+                const std::size_t offset=(voidinfer::exl3::l0_oscar::window_row(key,sink_k!=nullptr,
                     ring_mask)*kKVHeads+kv_head)*kHeadDim+dim;
                 key_bits=*reinterpret_cast<const uint4*>((in_sink?sink_k:k_cache)+offset);
                 value_bits=*reinterpret_cast<const uint4*>((in_sink?sink_v:v_cache)+offset);
@@ -6871,7 +7246,7 @@ __global__ void __launch_bounds__(128) attention_decode_flash_mma_kernel(
 
 bool verify_flash_mma_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA");
+        const char* value=std::getenv("VOIDINFER_EXL3_VERIFY_FLASH_MMA");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -6883,11 +7258,11 @@ bool verify_flash_mma_enabled() {
 // scratch would exceed the owned plane falls back to the next longer one.
 int verify_flash_mma_keys() {
     static const int keys=[] {
-        const char* value=std::getenv("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
+        const char* value=std::getenv("VOIDINFER_EXL3_VERIFY_FLASH_MMA_KEYS");
         if(!value) return 64;
         const int parsed=std::atoi(value);
         if(parsed!=64 && parsed!=128 && parsed!=256)
-            throw std::invalid_argument("NINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
+            throw std::invalid_argument("VOIDINFER_EXL3_VERIFY_FLASH_MMA_KEYS must be 64, 128 or 256");
         return parsed;
     }();
     return keys;
@@ -6900,7 +7275,7 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     std::uint16_t* output,int rows,int position,int capacity,
     const int* position_device,cudaStream_t stream,int requested_keys=0,
     const float* history_slot=nullptr,const std::uint16_t* sink_k=nullptr,
-    const std::uint16_t* sink_v=nullptr,int ring_mask=-1) {
+    const std::uint16_t* sink_v=nullptr,int ring_mask=-1,cudaEvent_t history_join=nullptr) {
     const int count=position+rows;
     const int l0_history=history_slot?1:0;
     int keys=requested_keys?requested_keys:verify_flash_mma_keys();
@@ -6918,7 +7293,7 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
     const int segments=segment_count(keys);
     const dim3 grid(segments,kKVHeads);
     static const bool decode_kernel=[] {
-        const char* value=std::getenv("NINFER_EXL3_DECODE_FLASH_MMA");
+        const char* value=std::getenv("VOIDINFER_EXL3_DECODE_FLASH_MMA");
         return !value || std::strcmp(value,"0")!=0;
     }();
     if(decode_kernel && rows*kFastFusedFlashHeads<=16) {
@@ -6947,6 +7322,9 @@ int launch_verify_flash_mma(const std::uint16_t* q,const std::uint16_t* k,
         exl3_launch_small(attention_verify_flash_mma_kernel<256>,dim3(grid),dim3(96),0,stream,
             q,k,v,workspace,rows,position,capacity,segments,position_device,0,l0_history,
             sink_k,sink_v,ring_mask);
+    // The L0 history branch (other stream) produced history_slot.
+    if(history_join)
+        cuda_check(cudaStreamWaitEvent(stream,history_join,0),"L0 history join");
     launch_fused_flash_merge(workspace,output,rows,segments,position,capacity,keys,
         position_device,stream,q,k,v,history_slot,sink_k,sink_v,ring_mask);
     return keys;
@@ -7079,6 +7457,23 @@ std::size_t Exl3FullAttentionLayer::workspace_bytes_required(int rows,bool borro
     return bytes;
 }
 
+// Batched multi-agent rounds run the verifier rows of several agents (up to
+// 16) as one launch per projection on the 16-row continuation routes.
+static Exl3CudaLinearAdmission batched_continuation_admission(Exl3TargetProjectionOperator operation) {
+    switch(operation) {
+    case Exl3TargetProjectionOperator::q: return Exl3CudaLinearAdmission::target_continuation_q;
+    case Exl3TargetProjectionOperator::k:
+    case Exl3TargetProjectionOperator::v: return Exl3CudaLinearAdmission::target_continuation_kv;
+    case Exl3TargetProjectionOperator::o: return Exl3CudaLinearAdmission::target_continuation_o;
+    case Exl3TargetProjectionOperator::gate:
+    case Exl3TargetProjectionOperator::up: return Exl3CudaLinearAdmission::target_continuation_gate_up;
+    case Exl3TargetProjectionOperator::down: return Exl3CudaLinearAdmission::target_continuation_down;
+    case Exl3TargetProjectionOperator::qkv: return Exl3CudaLinearAdmission::target_continuation_qkv;
+    case Exl3TargetProjectionOperator::z: return Exl3CudaLinearAdmission::target_continuation_z;
+    default: return Exl3CudaLinearAdmission::ordinary;
+    }
+}
+
 void Exl3FullAttentionLayer::ensure_fast_cublas_attention_resources(int capacity) {
     if (!fast_cublas_attention_) return;
     if (capacity < 1) throw std::invalid_argument(
@@ -7122,61 +7517,61 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
         fakequant_bank_ = constructed++ % 16;
     }
     coalesce_input_mlp_=coalesce_input_mlp;
-    small_m_fused_gate_up_transform_ = read_binary_option("NINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
+    small_m_fused_gate_up_transform_ = read_binary_option("VOIDINFER_EXL3_SMALL_M_FUSED_GATE_UP_TRANSFORM",
         "small-M fused gate/up transform must be 0 or 1");
-    fast_fused_flash_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH",
+    fast_fused_flash_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH",
         "FAST same-weight FP16-KV fused flash must be 0 or 1");
-    fast_fused_flash_attention_keys256_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256",
+    fast_fused_flash_attention_keys256_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_KEYS256",
         "FAST same-weight FP16-KV fused flash keys256 must be 0 or 1");
     fast_fused_flash_multirow_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW",
         "FAST same-weight FP16-KV fused flash multirow must be 0 or 1");
-    fast_cublas_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION",
+    fast_cublas_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_CUBLAS_ATTENTION",
         "FAST same-weight FP16-KV cuBLAS attention must be 0 or 1");
-    fast_online_decode_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE",
+    fast_online_decode_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE",
         "FAST same-weight FP16-KV online decode attention must be 0 or 1");
-    fast_online_decode_attention_warp_heads_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS",
+    fast_online_decode_attention_warp_heads_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_ONLINE_DECODE_WARP_HEADS",
         "FAST same-weight FP16-KV online decode warp-heads must be 0 or 1");
-    fast_whole_context_fused_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT",
+    fast_whole_context_fused_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_WHOLE_CONTEXT",
         "FAST same-weight FP16-KV whole-context fused attention must be 0 or 1");
-    fast_prefill_tiled_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED",
+    fast_prefill_tiled_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED",
         "FAST same-weight FP16-KV tiled prefill attention must be 0 or 1");
-    fast_prefill_rows4_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4",
+    fast_prefill_rows4_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS4",
         "FAST same-weight FP16-KV four-row prefill attention must be 0 or 1");
-    fast_prefill_rows8_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8",
+    fast_prefill_rows8_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8",
         "FAST same-weight FP16-KV eight-row prefill attention must be 0 or 1");
-    fast_prefill_rows8_threads128_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128",
+    fast_prefill_rows8_threads128_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS8_THREADS128",
         "FAST same-weight FP16-KV eight-row prefill 128-thread launch must be 0 or 1");
-    fast_prefill_wmma_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA",
+    fast_prefill_wmma_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA",
         "FAST same-weight FP16-KV WMMA prefill must be 0 or 1");
     const char* explicit_wmma32 = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32");
     const char* fast_prefill_scope = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     fast_prefill_wmma32_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32",
         "FAST same-weight FP16-KV WMMA32 prefill must be 0 or 1") ||
         (!explicit_wmma32 && fast_prefill_scope &&
          std::strcmp(fast_prefill_scope, "1") == 0);
     fast_prefill_wmma64_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64",
         "FAST same-weight FP16-KV WMMA64 prefill must be 0 or 1");
     if (fast_prefill_wmma64_attention_ && !fast_prefill_wmma32_attention_)
         throw std::invalid_argument("WMMA64 requires WMMA32 prefill policy");
     fast_prefill_wmma64_register_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER",
         "FAST same-weight FP16-KV WMMA64 register prefill must be 0 or 1");
     if (fast_prefill_wmma64_register_attention_ &&
         !fast_prefill_wmma64_attention_)
         throw std::invalid_argument("WMMA64 register candidate requires WMMA64");
     fast_prefill_wmma64_register_keys64_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER_KEYS64",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_REGISTER_KEYS64",
         "FAST same-weight FP16-KV WMMA64 register keys64 must be 0 or 1");
     if (fast_prefill_wmma64_register_keys64_attention_ &&
         !fast_prefill_wmma64_register_attention_)
         throw std::invalid_argument("WMMA64 keys64 requires register candidate");
     fast_prefill_wmma64_shared_heads_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_HEADS2",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA64_HEADS2",
         "FAST same-weight FP16-KV WMMA64 shared heads must be 0 or 1");
     if (fast_prefill_wmma64_shared_heads_attention_ &&
         !fast_prefill_wmma64_register_attention_)
@@ -7185,33 +7580,33 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
         fast_prefill_wmma64_shared_heads_attention_)
         throw std::invalid_argument("WMMA64 keys64 excludes shared heads");
     fast_prefill_wmma32_padded_attention_ = read_binary_option(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32_PADDED",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32_PADDED",
         "FAST same-weight FP16-KV WMMA32 padded tile must be 0 or 1");
     if (fast_prefill_wmma32_padded_attention_ &&
         !fast_prefill_wmma32_attention_)
         throw std::invalid_argument("padded WMMA32 requires WMMA32 prefill");
-    fast_prefill_rows2_attention_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2",
+    fast_prefill_rows2_attention_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_ROWS2",
         "FAST same-weight FP16-KV two-row prefill attention must be 0 or 1");
-    fast_same_weights_fp16kv_m1_gate_up_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR",
+    fast_same_weights_fp16kv_m1_gate_up_pair_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR",
         "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
     const auto* m1_kv_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
     if(m1_kv_pair && std::strcmp(m1_kv_pair,"0")!=0 &&
        std::strcmp(m1_kv_pair,"1")!=0)
         throw std::invalid_argument(
             "FAST same-weight FP16-KV M1 K/V pair must be 0 or 1");
     fast_same_weights_fp16kv_m1_kv_pair_=m1_kv_pair &&
         std::strcmp(m1_kv_pair,"1")==0;
-    fast_same_weights_fp16kv_m1_kv_wide_pair_ = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR",
+    fast_same_weights_fp16kv_m1_kv_wide_pair_ = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR",
         "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
-    const bool m1_kv_pair_graph = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH",
+    const bool m1_kv_pair_graph = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR_GRAPH",
         "FAST same-weight FP16-KV M1 K/V graph pair must be 0 or 1");
     fast_same_weights_fp16kv_m1_kv_pair_graph_ = fast_same_weights_fp16kv_m1_kv_pair_ && m1_kv_pair_graph;
     if(fast_fused_flash_attention_ && fast_whole_context_fused_attention_)
         throw std::invalid_argument(
             "FAST segmented and whole-context fused attention are mutually exclusive");
     const auto* query_pair_scores=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_QUERY_PAIR_SCORES");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_QUERY_PAIR_SCORES");
     if(query_pair_scores && std::strcmp(query_pair_scores,"0")!=0 &&
        std::strcmp(query_pair_scores,"1")!=0)
         throw std::invalid_argument(
@@ -7219,7 +7614,7 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     exact_attention_gqa_six_query_pair_scores_=query_pair_scores &&
         std::strcmp(query_pair_scores,"1")==0;
     const auto* score_k_tile64=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORE_K_TILE64");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORE_K_TILE64");
     if(score_k_tile64 && std::strcmp(score_k_tile64,"0")!=0 &&
        std::strcmp(score_k_tile64,"1")!=0)
         throw std::invalid_argument(
@@ -7230,43 +7625,43 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
        exact_attention_gqa_six_query_pair_scores_)
         throw std::invalid_argument(
             "exact attention K-tile64 and query-pair scores are mutually exclusive");
-    exact_attention_gqa_six_softmax_triple_values_v_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+    exact_attention_gqa_six_softmax_triple_values_v_tile_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
         "exact attention GQA six-softmax triple-values V tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_v_tile64_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+    exact_attention_gqa_six_softmax_triple_values_v_tile64_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
         "exact attention GQA six-softmax triple-values V tile64 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_full_cta_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+    exact_attention_gqa_six_softmax_triple_values_full_cta_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
         "exact attention GQA six-softmax triple-values full CTA must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_threads128_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+    exact_attention_gqa_six_softmax_triple_values_threads128_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
         "exact attention GQA six-softmax triple-values threads128 must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_score_tile_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+    exact_attention_gqa_six_softmax_triple_values_score_tile_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
         "exact attention GQA six-softmax triple-values score tile must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
+    exact_attention_gqa_six_softmax_triple_values_key_pair_pipeline_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
         "exact attention GQA triple-values key-pair pipeline must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+    exact_attention_gqa_six_softmax_triple_values_warp_score_broadcast_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
         "exact attention GQA triple-values warp score broadcast must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+    exact_attention_gqa_six_softmax_triple_values_pair_dimensions_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
         "exact attention GQA six-softmax triple-values pair-dimensions must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+    exact_attention_gqa_six_softmax_six_values_single_load_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
         "exact attention GQA six-softmax six-values single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_six_values_scalar_single_load_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+    exact_attention_gqa_six_softmax_six_values_scalar_single_load_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
         "exact attention GQA six-softmax six-values scalar single-load must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_scalar_dim_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+    exact_attention_gqa_six_softmax_triple_values_scalar_dim_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
         "exact attention GQA six-softmax triple-values scalar-dim must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_two_query_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+    exact_attention_gqa_six_softmax_triple_values_two_query_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
         "exact attention GQA six-softmax triple-values two-query must be 0 or 1");
-    exact_attention_gqa_six_softmax_triple_values_fused_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+    exact_attention_gqa_six_softmax_triple_values_fused_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
         "exact attention GQA six-softmax triple-values fused must be 0 or 1");
-    exact_attention_gqa_six_softmax_fused_scalar_values_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES",
+    exact_attention_gqa_six_softmax_fused_scalar_values_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_FUSED_SCALAR_VALUES",
         "exact attention GQA six-softmax fused scalar values must be 0 or 1");
     const auto* decode_fused=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_DECODE_FUSED");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_DECODE_FUSED");
     if(decode_fused && std::strcmp(decode_fused,"0")!=0 &&
        std::strcmp(decode_fused,"1")!=0)
         throw std::invalid_argument(
             "exact attention GQA six decode-fused route must be 0 or 1");
     exact_attention_gqa_six_decode_fused_=decode_fused &&
         std::strcmp(decode_fused,"1")==0;
-    exact_attention_gqa_six_softmax_tile512_ = read_binary_option("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512",
+    exact_attention_gqa_six_softmax_tile512_ = read_binary_option("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TILE512",
         "exact attention GQA six softmax tile512 must be 0 or 1");
     if(exact_attention_gqa_six_softmax_tile512_ &&
        (exact_attention_gqa_six_softmax_triple_values_fused_ ||
@@ -7397,7 +7792,64 @@ Exl3FullAttentionLayer::Exl3FullAttentionLayer(
     }
 }
 
+void Exl3FullAttentionLayer::enable_small_tier(const Exl3SmallTierViews& views) {
+    const Exl3SmallTierViews* batch=views.batch;
+    if(small_storage_ || views.rows<1 || views.rows>max_rows_ || !views.scratch.data || coalesce_input_mlp_ ||
+       views.scratch.bytes<shared_scratch_bytes(views.rows,false) ||
+       (batch && (batch->rows<=views.rows || batch->rows>max_rows_ || !batch->scratch.data ||
+                  batch->scratch.bytes<shared_scratch_bytes(batch->rows,false))))
+        throw std::invalid_argument("full-attention small tier");
+    // Rows retained across forwards (retained-prefix Q/K rotations and V)
+    // stay private (at the widest tier's rows); the rest share the context's
+    // small scratch, or the model's batch scratch for wider batched rounds.
+    constexpr std::array<std::size_t,3> retained{{3,6,7}};
+    const int retained_rows=batch?batch->rows:views.rows;
+    std::size_t private_bytes=0;
+    for(const auto i:retained)private_bytes+=static_cast<std::size_t>(retained_rows)*kBufferFeatures[i]*sizeof(std::uint16_t);
+    cuda_check(cudaMalloc(&small_storage_,private_bytes),"allocate full-attention small tier");
+    auto* own=static_cast<std::byte*>(small_storage_);
+    auto* shared=static_cast<std::byte*>(views.scratch.data);
+    auto* wide=batch?static_cast<std::byte*>(batch->scratch.data):nullptr;
+    for(std::size_t i=0;i<kBufferFeatures.size();++i) {
+        const auto row_bytes=static_cast<std::size_t>(kBufferFeatures[i])*sizeof(std::uint16_t);
+        if(std::find(retained.begin(),retained.end(),i)!=retained.end()) {
+            small_buffers_[i]=batch_buffers_[i]=reinterpret_cast<std::uint16_t*>(own);
+            own+=retained_rows*row_bytes;
+        } else {
+            small_buffers_[i]=reinterpret_cast<std::uint16_t*>(shared);shared+=views.rows*row_bytes;
+            if(wide){batch_buffers_[i]=reinterpret_cast<std::uint16_t*>(wide);wide+=batch->rows*row_bytes;}
+        }
+    }
+    for(auto* workspace:linear_workspaces_)if(workspace) {
+        workspace->attach_small_tier(views);
+        if(batch)workspace->attach_batch_tier(*batch);
+    }
+    small_rows_=views.rows;
+    batch_rows_=batch?batch->rows:0;
+    set_prompt_tier(false);
+}
+
+void Exl3FullAttentionLayer::set_batch_tier(bool batch) noexcept {
+    if(!batch_rows_ || !small_tier_active_ || batch==batch_tier_active_)return;
+    std::swap(buffers_,batch_buffers_);
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_batch_tier();
+    batch_tier_active_=batch;
+}
+
+void Exl3FullAttentionLayer::set_prompt_tier(bool prompt) noexcept {
+    if(!small_rows_ || prompt==!small_tier_active_ || batch_tier_active_)return;
+    std::swap(buffers_,small_buffers_);
+    for(auto* workspace:linear_workspaces_)if(workspace)workspace->swap_tier();
+    small_tier_active_=!prompt;
+}
+
+void Exl3FullAttentionLayer::require_tier_rows(int rows) const {
+    if(small_tier_active_ && rows>(batch_tier_active_?batch_rows_:small_rows_))
+        throw std::logic_error("full-attention rows exceed the small tier (prompt tier not selected)");
+}
+
 Exl3FullAttentionLayer::~Exl3FullAttentionLayer() {
+    if(small_storage_)(void)cudaFree(small_storage_);
     if (fast_cublas_handle_) {
         (void)cublasDestroy(reinterpret_cast<cublasHandle_t>(fast_cublas_handle_));
         fast_cublas_handle_ = nullptr;
@@ -7470,29 +7922,90 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         l.segments=l0_oscar::kHistorySegments;
         const std::size_t cells=static_cast<std::size_t>(capacity)*kKVHeads;
         const auto alloc=[](auto*& p,std::size_t bytes) {
-            if(cudaMalloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
+            if(exl3_packed_malloc(reinterpret_cast<void**>(&p),bytes)!=cudaSuccess)
                 throw std::runtime_error("L0 OSCAR storage allocation");
+            static const bool trace_alloc=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
+            if(trace_alloc && bytes>=(256u<<10))std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB FA L0%c",bytes/1048576.0,10);
         };
-        alloc(l.k_codes,cells*l0_oscar::kCodeBytes);
-        alloc(l.v_codes,cells*l0_oscar::kCodeBytes);
-        alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
-        alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        // VOIDINFER_EXL3_L0_GROWABLE (default 1): the INT4 code/meta planes keep
+        // one max_context address range per layer, physically backed only up
+        // to the rows the context occupies (released at request reset).
+        static const bool growable=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_GROWABLE");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(growable) {
+            const std::array<std::size_t,4> bytes{{cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()),cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()),
+                cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t),cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t)}};
+            // A meta plane within one 2 MiB granule (contexts up to 64K)
+            // is allocated exactly instead of a granule-backed range.
+            constexpr std::size_t kGranule=2u<<20;
+            // An exact line encodes no history: no meta planes either.
+            for(std::size_t i=0;i<l0_regions_.size();++i) {
+                if(i>=2 && (bytes[i]<=kGranule || l0_exact_only_))continue;
+                l0_regions_[i]=std::make_unique<Exl3GrowableDeviceRegion>();
+                l0_regions_[i]->reserve(bytes[i]);
+            }
+            l.k_codes=l0_regions_[0]->data<std::uint8_t>();
+            l.v_codes=l0_regions_[1]->data<std::uint8_t>();
+            if(l0_regions_[2])l.k_meta=l0_regions_[2]->data<std::uint16_t>();
+            else if(!l0_exact_only_)alloc(l.k_meta,bytes[2]);
+            if(l0_regions_[3])l.v_meta=l0_regions_[3]->data<std::uint16_t>();
+            else if(!l0_exact_only_)alloc(l.v_meta,bytes[3]);
+            ensure_l0_rows(0);
+        } else {
+        alloc(l.k_codes,cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+        alloc(l.v_codes,cells*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+        if(!l0_exact_only_) {
+            alloc(l.k_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+            alloc(l.v_meta,cells*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+        }
+        }
         alloc(l.state,2*sizeof(int));
         cudaMemset(l.state,0,2*sizeof(int));
-        const std::size_t ring_bytes=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
+        // Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1;
+        // VOIDINFER_EXL3_L0_RING_TIER=0 disables): rounds (<= 32 rows) use a
+        // private ring of the exact window plus one round; prompt passes
+        // (exclusive) switch to one 2048-row ring shared per layer, copying
+        // the live window rows across on the device (l0_select_ring).
+        static const bool tiered_ring=[] {
+            const char* shared=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_RING_TIER");
+            return shared && std::strcmp(shared,"1")==0 && !(value && std::strcmp(value,"0")==0);
+        }();
+        const int small_ring_rows=(l0_oscar::recent_rows()+2*l0_oscar::kAlign-1+32+
+            l0_oscar::kAlign-1)/l0_oscar::kAlign*l0_oscar::kAlign;
+        const bool small_ring=tiered_ring && small_ring_rows<l0_oscar::kRingRows;
+        const int ring_rows=small_ring?small_ring_rows:l0_oscar::kRingRows;
+        l0_ring_rows_=ring_rows;
+        l0_other_ring_rows_=l0_oscar::kRingRows;
+        const std::size_t ring_bytes=static_cast<std::size_t>(ring_rows)*kKVHeads*kHeadDim*2;
         const std::size_t sink_bytes=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*2;
         alloc(l.k_ring,ring_bytes); alloc(l.v_ring,ring_bytes);
+        if(small_ring) {
+            static std::mutex shared_ring_mutex;
+            static std::map<const void*,std::pair<std::uint16_t*,std::uint16_t*>> shared_rings;
+            const std::lock_guard lock(shared_ring_mutex);
+            auto& shared=shared_rings[weights_.q.trellis];
+            if(!shared.first) {
+                const std::size_t large=static_cast<std::size_t>(l0_oscar::kRingRows)*kKVHeads*kHeadDim*2;
+                alloc(shared.first,large);
+                alloc(shared.second,large);
+            }
+            l0_prompt_k_ring_=shared.first;
+            l0_prompt_v_ring_=shared.second;
+        }
         alloc(l.k_sink,sink_bytes); alloc(l.v_sink,sink_bytes);
-        // NINFER_EXL3_L0_EXACT (research): 1 = exact history everywhere,
+        // VOIDINFER_EXL3_L0_EXACT (research): 1 = exact history everywhere,
         // prefill / decode = only for prefill chunks / verifier rows.
-        if(const char* exact=std::getenv("NINFER_EXL3_L0_EXACT")) {
+        if(const char* exact=std::getenv("VOIDINFER_EXL3_L0_EXACT")) {
             const std::string_view mode(exact);
             if(mode!="0" && mode!="1" && mode!="prefill" && mode!="decode")
-                throw std::invalid_argument("NINFER_EXL3_L0_EXACT must be 0, 1, prefill or decode");
+                throw std::invalid_argument("VOIDINFER_EXL3_L0_EXACT must be 0, 1, prefill or decode");
             l0_exact_=mode=="1" || mode=="decode";
             l0_exact_prefill_=mode=="1" || mode=="prefill";
         }
-        l.hot_slots=l0_oscar::hot_config().slots;
+        l.hot_slots=l0_exact_only_?0:l0_oscar::hot_config().slots;
         if(l.hot_slots) {
             const std::size_t slots=static_cast<std::size_t>(kKVHeads)*l.hot_slots;
             l.hot_words=(capacity+31)/32;
@@ -7509,29 +8022,36 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
             cuda_check(cudaDeviceSynchronize(),"L0 OSCAR hot rows initialization");
         }
         // Query and history scratch is consumed within one layer's attention on
-        // the layer stream, so all full-attention layers of the process share it
-        // (one target context executes layers sequentially).
-        static l0_oscar::LayerStorage shared{};
-        // Partial slots per (row, KV head): the INT2 segments, then one per CTA with hot tiles.
+        // the layer stream, so the full-attention layers of one context share it
+        // (a context executes its layers sequentially). Concurrent contexts
+        // (Engine lanes) decode at the same time: one set per owning context.
+        static std::map<const void*,l0_oscar::LayerStorage> per_context;
+        auto& shared=per_context[l0_scratch_owner_];
+        // Partial slots per (row, KV head): the INT4 segments, then one per CTA with hot tiles.
         const int slot_stride=l.segments*kL0HistoryStreams+std::min(l0_hot_tiles(l.hot_slots),l.segments);
         if(shared.segments<slot_stride) {
             // Earlier layers keep their (smaller) scratch; it is never released.
             shared.segments=slot_stride;
-            alloc(shared.q_rot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(std::uint16_t));
-            alloc(shared.q_mu,static_cast<std::size_t>(l.rows)*kQHeads*sizeof(float));
             alloc(shared.hist_work,static_cast<std::size_t>(l.rows)*kKVHeads*slot_stride*
                 kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_slot,static_cast<std::size_t>(l.rows)*kKVHeads*kFastFusedFlashStride*sizeof(float));
             alloc(shared.hist_rotated,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
             alloc(shared.hist_hot,static_cast<std::size_t>(l.rows)*kQHeads*kHeadDim*sizeof(float));
         }
+        // Prompt-ingestion scratch stays process-wide: concurrent contexts
+        // ingest one at a time (the Engine serializes prefill).
         static l0_oscar::LayerStorage prefill{};
         l.prefill_rows=std::max(max_rows_,8);
+        // Rotated queries serve both decode and prefill rows: per context.
+        if(shared.prefill_rows<l.prefill_rows) {
+            shared.prefill_rows=l.prefill_rows;
+            const std::size_t r=static_cast<std::size_t>(l.prefill_rows);
+            alloc(shared.q_rot,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
+            alloc(shared.q_mu,r*kQHeads*sizeof(float));
+        }
         if(prefill.prefill_rows<l.prefill_rows) {
             prefill.prefill_rows=l.prefill_rows;
             const std::size_t r=static_cast<std::size_t>(l.prefill_rows);
-            alloc(prefill.q_rot,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
-            alloc(prefill.q_mu,r*kQHeads*sizeof(float));
             alloc(prefill.prefill_hist,4*r*kQHeads*kHeadDim*sizeof(float));
             alloc(prefill.prefill_hist_stats,4*r*kQHeads*2*sizeof(float));
             alloc(prefill.prefill_numer,r*kQHeads*kHeadDim*sizeof(std::uint16_t));
@@ -7541,12 +8061,65 @@ void Exl3FullAttentionLayer::set_kv_cache(std::uint16_t* k_cache,
         l.prefill_hist=prefill.prefill_hist; l.prefill_hist_stats=prefill.prefill_hist_stats;
         l.prefill_numer=prefill.prefill_numer;
         l.prefill_split=prefill.prefill_split; l.prefill_split_stats=prefill.prefill_split_stats;
-        shared.q_rot=prefill.q_rot; shared.q_mu=prefill.q_mu;
         l.q_rot=shared.q_rot; l.q_mu=shared.q_mu; l.hist_work=shared.hist_work; l.hist_slot=shared.hist_slot; l.hist_rotated=shared.hist_rotated; l.hist_hot=shared.hist_hot;
     }
     if (kv_fakequant::config().mode && fakequant_watermark_ == nullptr &&
         cudaMalloc(&fakequant_watermark_, 4 * sizeof(int)) == cudaSuccess)
         cudaMemset(fakequant_watermark_, 0, 4 * sizeof(int));
+}
+
+static constexpr int kL0GrowthMarginRows=1024;
+
+void Exl3FullAttentionLayer::ensure_l0_rows(int rows) {
+    if(!l0_regions_[0])return;
+    // Every forward and graph replay ensures its own end row first; the
+    // margin only spaces host map calls (backing grows in 2 MiB granules,
+    // 8192 code rows).
+    const std::size_t target=static_cast<std::size_t>(std::min(cache_capacity_,
+        std::max(rows,0)+kL0GrowthMarginRows))*kKVHeads;
+    l0_regions_[0]->ensure(target*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+    l0_regions_[1]->ensure(target*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+    if(l0_regions_[2])l0_regions_[2]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    if(l0_regions_[3])l0_regions_[3]->ensure(target*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+}
+
+void Exl3FullAttentionLayer::release_l0_rows_beyond(int rows) {
+    if(!l0_regions_[0])return;
+    const std::size_t keep=static_cast<std::size_t>(std::min(cache_capacity_,
+        std::max(rows,0)+kL0GrowthMarginRows))*kKVHeads;
+    l0_regions_[0]->shrink(keep*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+    l0_regions_[1]->shrink(keep*static_cast<std::size_t>(l0_oscar_format::code_bytes()));
+    if(l0_regions_[2])l0_regions_[2]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+    if(l0_regions_[3])l0_regions_[3]->shrink(keep*l0_oscar::kMetaFloats*sizeof(std::uint16_t));
+}
+
+std::size_t Exl3FullAttentionLayer::l0_code_bytes(int rows) const noexcept {
+    if(!l0_regions_[0])return 0;
+    const auto heads=static_cast<std::size_t>(std::clamp(rows,0,cache_capacity_))*kKVHeads;
+    std::size_t bytes=2*heads*static_cast<std::size_t>(l0_oscar_format::code_bytes());
+    for(int plane=2;plane<4;++plane)
+        if(l0_regions_[plane])bytes+=heads*l0_oscar::kMetaFloats*sizeof(std::uint16_t);
+    return bytes;
+}
+
+void Exl3FullAttentionLayer::copy_l0_codes(std::byte* host,int rows,bool to_host,cudaStream_t stream) {
+    if(!l0_regions_[0])return;
+    const auto heads=static_cast<std::size_t>(std::clamp(rows,0,cache_capacity_))*kKVHeads;
+    for(int plane=0;plane<4;++plane) {
+        if(!l0_regions_[plane])continue;
+        const std::size_t bytes=plane<2?heads*static_cast<std::size_t>(l0_oscar_format::code_bytes()):
+            heads*l0_oscar::kMetaFloats*sizeof(std::uint16_t);
+        if(!bytes)continue;
+        auto* device=l0_regions_[plane]->data<std::byte>();
+        cuda_check(cudaMemcpyAsync(to_host?static_cast<void*>(host):device,to_host?static_cast<const void*>(device):host,
+            bytes,to_host?cudaMemcpyDeviceToHost:cudaMemcpyHostToDevice,stream),
+            to_host?"suspend L0 code plane":"resume L0 code plane");
+        host+=bytes;
+    }
+}
+
+void Exl3FullAttentionLayer::release_l0_codes() {
+    for(auto& region:l0_regions_)if(region)region->shrink(0);
 }
 
 void Exl3FullAttentionLayer::set_oscar(Exl3OscarContext* oscar, int model_layer) noexcept {
@@ -7564,7 +8137,46 @@ void Exl3FullAttentionLayer::append_sibling_row_copies(Exl3SiblingRowCopies& out
             cache+static_cast<std::size_t>(destination)*row,row,1,row});
     if(l0_.k_ring)
         for(auto* ring:{l0_.k_ring,l0_.v_ring})
-            out.push_back({ring,ring,row,1,row,l0_oscar::kRingRows-1,source,destination});
+            out.push_back({ring,ring,row,1,row,l0_ring_rows_,source,destination});
+}
+
+void Exl3FullAttentionLayer::l0_select_ring(bool prompt,int position,cudaStream_t stream) {
+    if(!l0_prompt_k_ring_ || prompt==l0_prompt_ring_active_)return;
+    std::uint16_t* const from_k=l0_.k_ring;
+    std::uint16_t* const from_v=l0_.v_ring;
+    const int from_rows=l0_ring_rows_;
+    std::swap(l0_.k_ring,l0_prompt_k_ring_);
+    std::swap(l0_.v_ring,l0_prompt_v_ring_);
+    std::swap(l0_ring_rows_,l0_other_ring_rows_);
+    l0_prompt_ring_active_=prompt;
+    constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+    const int window=std::max(l0_oscar::kSink,l0_oscar::history_end(position));
+    // Entering a prompt pass: the pass may rewind (VeriCache verify blocks)
+    // and needs every key the 2048-row ring would hold. Rows older than the
+    // live window come from the authoritative FP16 L2 record.
+    if(prompt && k_cache_ && v_cache_) {
+        const int oldest=std::max(l0_oscar::kSink,position-l0_ring_rows_+1);
+        for(int first=oldest;first<window;) {
+            const int to_slot=first%l0_ring_rows_;
+            const int rows=std::min(window-first,l0_ring_rows_-to_slot);
+            const std::size_t at=static_cast<std::size_t>(first)*row;
+            for(int plane=0;plane<2;++plane)
+                cuda_check(cudaMemcpyAsync((plane?l0_.v_ring:l0_.k_ring)+to_slot*row,
+                    (plane?v_cache_:k_cache_)+at,rows*row*sizeof(std::uint16_t),
+                    cudaMemcpyDefault,stream),"L0 OSCAR prompt ring history fill");
+            first+=rows;
+        }
+    }
+    // Carry the live window rows [max(kSink, history_end), position) across.
+    for(int first=window;first<position;) {
+        const int from_slot=first%from_rows,to_slot=first%l0_ring_rows_;
+        const int rows=std::min({position-first,from_rows-from_slot,l0_ring_rows_-to_slot});
+        for(int plane=0;plane<2;++plane)
+            cuda_check(cudaMemcpyAsync((plane?l0_.v_ring:l0_.k_ring)+to_slot*row,
+                (plane?from_v:from_k)+from_slot*row,rows*row*sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice,stream),"L0 OSCAR window ring switch");
+        first+=rows;
+    }
 }
 
 void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream) {
@@ -7579,8 +8191,8 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
     copy(l0_.v_sink,v_cache_,sink);
     // Ring rows cover [max(kSink, history_end(position)), position), split at the wrap.
     for(int first=std::max(l0_oscar::kSink,l0_oscar::history_end(position));first<position;) {
-        const int slot=first&(l0_oscar::kRingRows-1);
-        const int rows=std::min(position-first,l0_oscar::kRingRows-slot);
+        const int slot=first%l0_ring_rows_;
+        const int rows=std::min(position-first,l0_ring_rows_-slot);
         const std::size_t at=static_cast<std::size_t>(first)*kKVHeads*kHeadDim;
         const std::size_t to=static_cast<std::size_t>(slot)*kKVHeads*kHeadDim;
         copy(l0_.k_ring+to,k_cache_+at,rows);
@@ -7594,10 +8206,65 @@ void Exl3FullAttentionLayer::l0_refresh_window(int position, cudaStream_t stream
     }
 }
 
+void Exl3FullAttentionLayer::l0_rebind(int position, cudaStream_t stream) {
+    if(!l0_.k_ring || position<=0) return;
+    if(l0_ring_rows_<l0_oscar::kRingRows) {
+        constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
+        const int sink=std::min(position,l0_oscar::kSink);
+        cuda_check(cudaMemcpyAsync(l0_.k_sink,k_cache_,sink*row,cudaMemcpyDefault,stream),"L0 line sink rebind");
+        cuda_check(cudaMemcpyAsync(l0_.v_sink,v_cache_,sink*row,cudaMemcpyDefault,stream),"L0 line sink rebind");
+        cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 line state rebind");
+    } else {
+        l0_refresh_window(position,stream);
+    }
+    invalidate_retained_prefix();
+}
+
+void Exl3FullAttentionLayer::l0_reset_history(cudaStream_t stream) {
+    if(!l0_.k_codes) return;
+    cuda_check(cudaMemsetAsync(l0_.state,0,2*sizeof(int),stream),"L0 OSCAR history reset");
+    if(l0_.hot_slots && !l0_exact_only_) {
+        l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
+        cuda_check(cudaGetLastError(),"L0 OSCAR hot rows reset");
+    }
+}
+
 void Exl3FullAttentionLayer::l0_rewind(int position, cudaStream_t stream) {
     if(!l0_.k_codes) return;
-    l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,l0_oscar::hot_view(l0_),position);
+    // An exact line keeps no hot rows (its hot arrays were never initialized).
+    l0_oscar::rewind_kernel<<<16,256,0,stream>>>(l0_.state,
+        l0_exact_only_?l0_oscar::HotView{}:l0_oscar::hot_view(l0_),position);
     cuda_check(cudaGetLastError(),"L0 OSCAR verified-root rewind");
+    // Hot rows are keyed by row index and filled from the FP16 planes, which
+    // a root restore or a lane's next request may have held for another
+    // history in the meantime (multi-lane prefix reuse served stale rows:
+    // NoLiMa 4K on a C2 server differed from C1 on 10-19 of 60 answers, 0
+    // with this clear). Every rewind starts them empty; they refill within a
+    // few rounds (VOIDINFER_EXL3_L0_REWIND_KEEP_HOT=1 keeps rows below the
+    // window, the previous behavior, for research).
+    static const bool keep_hot=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_REWIND_KEEP_HOT");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    if(!keep_hot && l0_.hot_slots && !l0_exact_only_) {
+        l0_oscar::hot_clear_kernel<<<64,256,0,stream>>>(l0_oscar::hot_view(l0_));
+        cuda_check(cudaGetLastError(),"L0 OSCAR hot rows rewind");
+    }
+    // A window ring smaller than 2048 rows no longer holds the window of a
+    // rewound position: rebuild it from the FP16 L2 record.
+    if(l0_.k_ring && l0_ring_rows_<l0_oscar::kRingRows && k_cache_ && v_cache_) {
+        constexpr std::size_t row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+        for(int first=std::max(l0_oscar::kSink,l0_oscar::history_end(position));first<position;) {
+            const int slot=first%l0_ring_rows_;
+            const int rows=std::min(position-first,l0_ring_rows_-slot);
+            const std::size_t at=static_cast<std::size_t>(first)*row;
+            for(int plane=0;plane<2;++plane)
+                cuda_check(cudaMemcpyAsync((plane?l0_.v_ring:l0_.k_ring)+slot*row,
+                    (plane?v_cache_:k_cache_)+at,rows*row*sizeof(std::uint16_t),
+                    cudaMemcpyDefault,stream),"L0 OSCAR rewound window fill");
+            first+=rows;
+        }
+    }
 }
 
 int Exl3FullAttentionLayer::l0_history_watermark(cudaStream_t stream) const {
@@ -7613,7 +8280,7 @@ void Exl3FullAttentionLayer::l0_download_history(int first,int rows,std::uint8_t
     std::uint16_t* meta,cudaStream_t stream) const {
     if(!l0_.k_codes || rows<=0) return;
     if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR park extent");
-    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
+    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*static_cast<std::size_t>(l0_oscar_format::code_bytes());
     const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;
     const std::size_t code_bytes=rows*code_row,meta_elements=rows*meta_row;
     cuda_check(cudaMemcpyAsync(codes,l0_.k_codes+first*code_row,code_bytes,cudaMemcpyDeviceToHost,stream),"L0 OSCAR park codes");
@@ -7626,8 +8293,9 @@ void Exl3FullAttentionLayer::l0_download_history(int first,int rows,std::uint8_t
 void Exl3FullAttentionLayer::l0_upload_history(int first,int rows,const std::uint8_t* codes,
     const std::uint16_t* meta,cudaStream_t stream) {
     if(!l0_.k_codes || rows<=0) return;
+    ensure_l0_rows(first+rows);
     if(first<0 || first+rows>l0_.capacity) throw std::invalid_argument("L0 OSCAR resume extent");
-    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kCodeBytes;
+    const std::size_t code_row=static_cast<std::size_t>(kKVHeads)*static_cast<std::size_t>(l0_oscar_format::code_bytes());
     const std::size_t meta_row=static_cast<std::size_t>(kKVHeads)*l0_oscar::kMetaFloats;
     const std::size_t code_bytes=rows*code_row,meta_elements=rows*meta_row;
     cuda_check(cudaMemcpyAsync(l0_.k_codes+first*code_row,codes,code_bytes,cudaMemcpyHostToDevice,stream),"L0 OSCAR resume codes");
@@ -7660,7 +8328,12 @@ void Exl3FullAttentionLayer::validate_retained_prefix_reappend(
     if (!retained_prefix_available_ || retained_rows <= 0 ||
         retained_rows > attempted_rows || attempted_rows != retained_prefix_rows_) {
         throw std::invalid_argument(
-            "EXL3 full-attention retained prefix is absent or row count is invalid");
+            "EXL3 full-attention retained prefix is absent or row count is invalid (available=" +
+            std::to_string(retained_prefix_available_) + " retained=" + std::to_string(retained_rows) +
+            " attempted=" + std::to_string(attempted_rows) + " recorded=" +
+            std::to_string(retained_prefix_rows_) + " layer=" + std::to_string(model_layer_) +
+            " cleared_by=" + retained_prefix_cleared_by_ + " cleared_rows=" +
+            std::to_string(retained_prefix_cleared_rows_) + ")");
     }
     if (base_position != retained_prefix_position_) {
         throw std::invalid_argument(
@@ -7690,6 +8363,8 @@ void Exl3FullAttentionLayer::reappend_retained_prefix(
     validate_retained_prefix_reappend(
         retained_rows, attempted_rows, base_position, stream);
     retained_prefix_available_ = false;
+    retained_prefix_cleared_by_ = "reappend";
+    retained_prefix_cleared_rows_ = retained_rows;
     if (oscar_) {
         const auto* qr = buffers_[6];
         const auto* kr = buffers_[7];
@@ -7788,13 +8463,12 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
     // The frozen/reference and default eager routes never enter this capture.
     const bool graph_gate_up_pair = rows == 1 &&
         fast_same_weights_fp16kv_m1_gate_up_pair_ &&
-        (weights_.gate_metadata.K == 5 || weights_.gate_metadata.K == 6 ||
-         weights_.gate_metadata.K == 7) &&
+        weights_.gate_metadata.K >= 4 && weights_.gate_metadata.K <= 7 &&
         weights_.up_metadata.K == weights_.gate_metadata.K &&
         !weights_.gate_metadata.mcg && !weights_.up_metadata.mcg &&
         weights_.gate_metadata.mul1 && weights_.up_metadata.mul1 &&
         !weights_.gate_metadata.has_bias && !weights_.up_metadata.has_bias;
-    const auto* graph_diag = std::getenv("NINFER_EXL3_MLP_GRAPH_DIAGNOSTIC");
+    const auto* graph_diag = std::getenv("VOIDINFER_EXL3_MLP_GRAPH_DIAGNOSTIC");
     if (graph_diag && std::strcmp(graph_diag, "1") == 0) {
         std::fprintf(stdout,
             "MLP_GRAPH_DIAG layer=%d rows=%d flag=%d gateK=%d upK=%d gateM=%d upM=%d gateMul1=%d upMul1=%d gateBias=%d upBias=%d pair=%d\n",
@@ -7836,519 +8510,27 @@ void Exl3FullAttentionLayer::capture_mlp_tail_graph(
     cuda_check(cudaGetLastError(),"capture HostKV MLP-tail residual");
 }
 
-void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
-                                     std::uint16_t* output,
-                                     int rows,
-                                     int position,
-                                     cudaStream_t stream,
-                                     bool profile,
-                                     bool preserve_m1_topology,
-                                     bool wide_prefill,
-                                     DecodeGraphExecutable* mlp_tail_graph) {
-    if(coalesce_input_mlp_ && (profile || capture_active_ || oscar_))
-        throw std::invalid_argument("coalesced attention scratch requires ordinary eager nondiagnostic execution");
-    if (!input || !output || rows <= 0 || rows > max_rows_) {
-        throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
-    }
-    // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
-    static const std::size_t prefetch_bytes=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_MB");
-        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
-    }();
-    static const int prefetch_sites=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH_FULL_SITES");
-        return value?std::atoi(value):31;
-    }();
-    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
-        !mlp_tail_graph;
-    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
-        if(prefetch && trellis && (prefetch_sites&site))
-            exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
-    };
-    if(exact_prefix_rows_ || exact_page_ranges_.count) {
-        exact_position_contract_.require_current(mrope_positions_,rope_offset_);
-        if(!supports_segmented_exact_prefix())
-            throw std::invalid_argument("segmented attention precompute extent/profile");
-        Exl3AttentionInputView input_view{k_cache_,v_cache_,cache_capacity_,1024,exact_page_ranges_};
-        if(exact_prefix_rows_)input_view.shared.append(exact_prefix_k_,exact_prefix_v_,
-            exact_prefix_first_,exact_prefix_rows_,position);
-        input_view.require_geometry(position,rows);
-    }
-    if(direct_staged_rows_) {
-        if(!direct_staged_k_ || !direct_staged_v_ ||
-           direct_staged_rows_!=position || !supports_direct_staged_history(rows,position))
-            throw std::invalid_argument("direct staged history extent/profile");
-    }
-    retained_prefix_available_ = false;
-    bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
-        ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
-         (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
-        !capture_active_;
-    if (eligible_retained_prefix) {
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        cuda_check(cudaStreamIsCapturing(stream, &capture_status),
-                   "query EXL3 full-attention retained-prefix source capture");
-        eligible_retained_prefix =
-            capture_status == cudaStreamCaptureStatusNone;
-    }
-    cudaEvent_t starts[13]{};
-    cudaEvent_t ends[13]{};
-    if (profile) {
-        for (int i = 0; i < 13; ++i) {
-            cuda_check(cudaEventCreate(&starts[i]), "create EXL3 layer start event");
-            cuda_check(cudaEventCreate(&ends[i]), "create EXL3 layer end event");
-        }
-    }
+// Stateful attention core of one forward: Q/gate split, Q/K norms and RoPE at
+// this layer's positions, K/V (and L0) cache append, causal attention over this
+// layer's cache and the output gate. Rows-independent projections stay in
+// forward(); batched multi-agent rounds call this once per agent segment on
+// that agent's layer object.
+void Exl3FullAttentionLayer::attention_middle(const AttentionMiddle& m) {
+    const std::uint16_t* input_norm=m.input_norm;
+    std::uint16_t* qg=m.qg; std::uint16_t* kp=m.kp; std::uint16_t* vp=m.vp;
+    std::uint16_t* qn=m.qn; std::uint16_t* kn=m.kn; std::uint16_t* qr=m.qr;
+    std::uint16_t* kr=m.kr; std::uint16_t* attn=m.attn; std::uint16_t* gp=m.gp;
+    const int rows=m.rows; const int position=m.position; cudaStream_t stream=m.stream;
+    const bool profile=m.profile; const bool preserve_m1_topology=m.preserve_m1_topology;
+    const bool wide_prefill=m.wide_prefill; bool eligible_retained_prefix=m.eligible_retained_prefix;
+    cudaEvent_t* starts=m.starts; cudaEvent_t* ends=m.ends;
     const auto begin = [&](int i) { if (profile) launch_profile_event(starts[i], stream); };
     const auto end = [&](int i) { if (profile) launch_profile_event(ends[i], stream); };
     const auto launch = [&](cudaError_t error, const char* op) { cuda_check(error, op); };
-    auto* input_norm = buffers_[0];
-    auto* qg = buffers_[1];
-    auto* kp = buffers_[2];
-    auto* vp = buffers_[3];
-    auto* qn = buffers_[4];
-    auto* kn = buffers_[5];
-    auto* qr = buffers_[6];
-    auto* kr = buffers_[7];
-    auto* attn = buffers_[8];
-    auto* op = buffers_[9];
-    auto* post_resid = buffers_[10];
-    auto* mlp_in = buffers_[11];
-    auto* gp = buffers_[12];
-    auto* up = buffers_[13];
-    auto* act = buffers_[14];
-    auto* down = buffers_[15];
-    const auto project_on = [&](Exl3CudaLinearWorkspace* workspace,
-                             const Exl3CudaLinearWeights& weights,
-                             const Exl3CudaLinearMetadata& metadata,
-                              const std::uint16_t* source,
-                              std::uint16_t* destination,
-                              Exl3TargetProjectionOperator operation,
-                              cudaStream_t projection_stream,
-                              const std::uint16_t* transformed_input=nullptr) {
-        const bool rowwise = preserve_m1_topology && rows > 1;
-        const bool target_initial16 = !rowwise && rows == 16 &&
-            workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
-        const bool target_wide_candidate = rowwise && wide_prefill &&
-            workspace->target_wide_prefill_candidate(metadata, rows, Exl3CudaLinearAdmission::target_wide_prefill);
-        const bool target_gateup_m16 = !rowwise && rows == 16 &&
-            (operation == Exl3TargetProjectionOperator::gate ||
-             operation == Exl3TargetProjectionOperator::up) &&
-            workspace->target_gateup_m16_candidate(metadata, rows,
-                Exl3CudaLinearAdmission::target_prefill_gate_up);
-        const bool target_gateup_candidate = rowwise &&
-            (operation == Exl3TargetProjectionOperator::gate ||
-             operation == Exl3TargetProjectionOperator::up) &&
-            (workspace->target_gateup_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up) ||
-             workspace->target_gateup_k5_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up));
-        const bool target_down_candidate = rowwise &&
-            operation == Exl3TargetProjectionOperator::down &&
-            workspace->target_down_small_m_candidate(
-                metadata, rows,
-                Exl3CudaLinearAdmission::target_continuation_down);
-        const bool target_o_k7_candidate = rowwise &&
-            operation == Exl3TargetProjectionOperator::o &&
-            (workspace->target_o_k7_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o) ||
-             workspace->target_o_k6_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o));
-        const bool target_kv_candidate = rowwise && !wide_prefill &&
-            (operation == Exl3TargetProjectionOperator::k ||
-             operation == Exl3TargetProjectionOperator::v) &&
-            workspace->target_kv_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_kv);
-        const bool target_q_k6_candidate = rowwise && !wide_prefill &&
-            operation == Exl3TargetProjectionOperator::q &&
-            workspace->target_q_k6_small_m_candidate(
-                metadata, rows, Exl3CudaLinearAdmission::target_continuation_q);
-        const auto target_k5_admission =
-            operation == Exl3TargetProjectionOperator::q
-                ? Exl3CudaLinearAdmission::target_continuation_q
-            : (operation == Exl3TargetProjectionOperator::k ||
-               operation == Exl3TargetProjectionOperator::v)
-                ? Exl3CudaLinearAdmission::target_continuation_kv
-            : operation == Exl3TargetProjectionOperator::o
-                ? Exl3CudaLinearAdmission::target_continuation_o
-            : operation == Exl3TargetProjectionOperator::down
-                ? Exl3CudaLinearAdmission::target_continuation_down
-                : Exl3CudaLinearAdmission::ordinary;
-        const bool target_k5_candidate = rowwise && !wide_prefill &&
-            workspace->target_k5_small_m_batch_candidate(
-                metadata, rows, target_k5_admission);
-        const bool target_small_m_candidate =
-            target_gateup_candidate || target_down_candidate ||
-            target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
-            target_q_k6_candidate || target_k5_candidate;
-        const char* fast_same_weights_fp16kv_decode = std::getenv(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
-        const bool fast_same_weights_fp16kv_decode_candidate =
-            reconstruct_gemm_ && rows == 1 && !wide_prefill && !capture_active_ &&
-            fast_same_weights_fp16kv_decode &&
-            std::strcmp(fast_same_weights_fp16kv_decode, "1") == 0 &&
-            reconstruct_gemm_->accepts_all_model_shapes() &&
-            reconstruct_gemm_->supports(metadata, rows) && metadata.mul1 &&
-            !metadata.mcg && !metadata.has_bias;
-        const bool numeric_reconstruct_candidate =
-            fast_same_weights_fp16kv_decode_candidate ||
-            (reconstruct_gemm_ && rowwise && wide_prefill && !capture_active_ &&
-             target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
-             metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
-             ((reconstruct_gemm_->accepts_all_model_shapes() &&
-               metadata.K >= 5 && metadata.K <= 8 && rows >= 256) ||
-              ((operation == Exl3TargetProjectionOperator::gate ||
-                operation == Exl3TargetProjectionOperator::up) &&
-               metadata.K == 6 && metadata.in_features == kHidden &&
-               metadata.out_features == kIntermediate && rows >= 512) ||
-              (operation == Exl3TargetProjectionOperator::down &&
-               metadata.K == 7 && metadata.in_features == kIntermediate &&
-               metadata.out_features == kHidden && rows >= 256)));
-        bool observed_projection = false;
-        const bool observe_prefill = !rowwise && rows == 16 &&
-            projection_observer_selection_ ==
-                Exl3TargetProjectionObserverSelection::prefill_gate_up_k6;
-        const bool observe_initial16 = !rowwise && rows == 16 &&
-            projection_observer_selection_ == Exl3TargetProjectionObserverSelection::initial16_generic;
-        const bool observe_m1_k6_n32 = rowwise &&
-            projection_observer_selection_ ==
-                Exl3TargetProjectionObserverSelection::m1_k6_n32;
-        if (projection_observer_ != nullptr &&
-            (rowwise || observe_prefill || observe_initial16 || observe_m1_k6_n32)) {
-            const bool observed_gate_up =
-                (projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::gate_up_k6 || observe_prefill) &&
-                (operation == Exl3TargetProjectionOperator::gate ||
-                 operation == Exl3TargetProjectionOperator::up) &&
-                metadata.in_features == kHidden &&
-                metadata.out_features == kIntermediate;
-            const bool observed_gate_up_k7 =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::gate_up_k7 &&
-                (operation == Exl3TargetProjectionOperator::gate ||
-                 operation == Exl3TargetProjectionOperator::up) &&
-                metadata.in_features == kHidden &&
-                metadata.out_features == kIntermediate;
-            const bool observed_down =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::down_k6 &&
-                operation == Exl3TargetProjectionOperator::down &&
-                metadata.in_features == kIntermediate &&
-                metadata.out_features == kHidden;
-            const bool observed_down_k7 =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::down_k7 &&
-                operation == Exl3TargetProjectionOperator::down &&
-                metadata.in_features == kIntermediate &&
-                metadata.out_features == kHidden;
-            const bool observed_output =
-                projection_observer_selection_ ==
-                    Exl3TargetProjectionObserverSelection::output_k7 &&
-                operation == Exl3TargetProjectionOperator::o &&
-                metadata.in_features == kQHeads * kHeadDim &&
-                metadata.out_features == kHidden;
-            observed_projection =
-                (((observed_gate_up || observed_down) && metadata.K == 6) ||
-                 ((observed_gate_up_k7 || observed_output || observed_down_k7) &&
-                  metadata.K == 7)) &&
-                metadata.mul1 && !metadata.mcg && !metadata.has_bias;
-            if (observe_initial16)
-                observed_projection = std::string(workspace->dispatch_name(metadata,16)) == "generic_tile" &&
-                    !(metadata.in_features == 5120 && metadata.out_features == 17408 && metadata.K == 6);
-            if (observe_m1_k6_n32)
-                observed_projection = metadata.K == 6 && metadata.mul1 &&
-                    !metadata.mcg && !metadata.has_bias &&
-                    std::string(workspace->dispatch_name(metadata, 1)) ==
-                        "generic_mma_split";
-            if (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all)
-                observed_projection = rowwise;
-        }
-        if (observed_projection) {
-            const Exl3TargetProjectionObservation observation{
-                weights, metadata, source, rows, model_layer_,
-                (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all ||
-                 observe_initial16 || observe_m1_k6_n32)
-                    ? target_projection_operator_name(operation) :
-                operation == Exl3TargetProjectionOperator::gate ? "gate" :
-                    (operation == Exl3TargetProjectionOperator::up ? "up" :
-                     (operation == Exl3TargetProjectionOperator::o ? "o" : "down")),
-                workspace->dispatch_name(metadata, 1), projection_stream};
-            projection_observer_(observation, projection_observer_user_);
-        }
-        const auto topology = numeric_reconstruct_candidate
-            ? Exl3TargetProjectionTopology::batched
-            : target_small_m_candidate
-            ? Exl3TargetProjectionTopology::small_m_mma_split
-            : (rowwise ? Exl3TargetProjectionTopology::m1_per_row
-            : (rows == 1 ? Exl3TargetProjectionTopology::m1
-                         : Exl3TargetProjectionTopology::batched));
-        const int timing_slot = projection_timing_
-            ? projection_timing_->begin(model_layer_, operation, rows, metadata.K,
-                                        metadata.in_features, metadata.out_features,
-                                        topology,
-                                        rowwise && !target_small_m_candidate ? rows : 1,
-                                        projection_stream)
-            : -1;
-        if (numeric_reconstruct_candidate) {
-            if(transformed_input)
-                throw std::logic_error(
-                    "numeric reconstruct cannot consume borrowed transformed input");
-            reconstruct_gemm_->forward_numeric_candidate(
-                weights, metadata, source, destination, rows, projection_stream);
-        } else if (rowwise && !target_small_m_candidate) {
-            for (int row = 0; row < rows; ++row) {
-                if(transformed_input)
-                    workspace->forward_from_transformed(weights,metadata,
-                        transformed_input+static_cast<std::size_t>(row)*metadata.in_features,
-                        destination+static_cast<std::size_t>(row)*metadata.out_features,
-                        1,projection_stream,Exl3CudaLinearAdmission::ordinary);
-                else workspace->forward(weights, metadata,
-                        source + static_cast<std::size_t>(row) * metadata.in_features,
-                        destination + static_cast<std::size_t>(row) * metadata.out_features,
-                        1, projection_stream);
-            }
-        } else {
-            const auto admission=target_kv_candidate
-                    ? Exl3CudaLinearAdmission::target_continuation_kv
-                    : target_q_k6_candidate
-                    ? Exl3CudaLinearAdmission::target_continuation_q
-                    : target_k5_candidate
-                    ? target_k5_admission
-                    : target_initial16
-                    ? Exl3CudaLinearAdmission::target_initial16
-                    : target_wide_candidate
-                    ? Exl3CudaLinearAdmission::target_wide_prefill
-                    : target_gateup_m16
-                    ? Exl3CudaLinearAdmission::target_prefill_gate_up
-                    : target_gateup_candidate
-                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
-                    : (target_down_candidate
-                           ? Exl3CudaLinearAdmission::target_continuation_down
-                           : (target_o_k7_candidate
-                                   ? Exl3CudaLinearAdmission::target_continuation_o
-                                   : Exl3CudaLinearAdmission::ordinary));
-            if(transformed_input)
-                workspace->forward_from_transformed(
-                    weights,metadata,transformed_input,destination,rows,
-                    projection_stream,admission);
-            else workspace->forward(
-                weights,metadata,source,destination,rows,projection_stream,
-                admission);
-        }
-        if (projection_timing_)
-            projection_timing_->end(timing_slot, projection_stream);
-    };
-    const auto project = [&](Exl3CudaLinearWorkspace* workspace,
-                             const Exl3CudaLinearWeights& weights,
-                             const Exl3CudaLinearMetadata& metadata,
-                              const std::uint16_t* source,
-                              std::uint16_t* destination,
-                              Exl3TargetProjectionOperator operation,
-                              const std::uint16_t* transformed_input=nullptr) {
-        project_on(workspace, weights, metadata, source, destination, operation,
-                   stream,transformed_input);
-    };
-
-    begin(0);
-    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,input, weights_.input_norm,
-        input_norm, rows, kHidden);
-    launch(cudaGetLastError(), "launch EXL3 input RMSNorm"); end(0);
-
-    const bool can_share_target=target_q_executor_ && !capture_active_ && !oscar_ &&
-        !profile && !projection_timing_ && !projection_observer_ &&
-        preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8;
-    const bool concurrent_qkv=prefill_qkv_concurrency_.complete() &&
-        !capture_active_ && !oscar_ && !profile && !projection_timing_ &&
-        !projection_observer_ && preserve_m1_topology && wide_prefill &&
-        rows>=17 && rows<=1024 && !can_share_target;
-    const auto* projection_chain_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
-    const auto* projection_chain_full_value=
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL");
-    if(projection_chain_full_value &&
-       std::strcmp(projection_chain_full_value,"0")!=0 &&
-       std::strcmp(projection_chain_full_value,"1")!=0)
-        throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL must be 0 or 1");
-    const bool projection_chain=projection_chain_value &&
-        std::strcmp(projection_chain_value,"1")==0 &&
-        (!projection_chain_full_value ||
-         std::strcmp(projection_chain_full_value,"1")==0) && !capture_active_ &&
-        !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
-        preserve_m1_topology && wide_prefill && rows==1024 && !can_share_target &&
-        !concurrent_qkv;
-    if(projection_chain) {
-        std::array<Exl3GraphBufferIdentity,16> buffers{};
-        std::array<Exl3GraphBoundResource,16> resources{};
-        std::size_t count=0;
-        const auto append=[&](const void* address,std::size_t bytes,
-                              const std::shared_ptr<const void>& owner) {
-            if(!address || !bytes || count==buffers.size())
-                throw std::logic_error("full-attention projection-chain resource");
-            buffers[count]={address,bytes};
-            resources[count]={owner,address,bytes,count+1};
-            ++count;
-        };
-        append(input_norm,static_cast<std::size_t>(rows)*kHidden*2,
-               prefill_projection_chain_scratch_owner_);
-        append(qg,static_cast<std::size_t>(rows)*weights_.q_metadata.out_features*2,
-               prefill_projection_chain_scratch_owner_);
-        append(kp,static_cast<std::size_t>(rows)*weights_.k_metadata.out_features*2,
-               prefill_projection_chain_scratch_owner_);
-        append(vp,static_cast<std::size_t>(rows)*weights_.v_metadata.out_features*2,
-               prefill_projection_chain_scratch_owner_);
-        const auto append_weights=[&](const Exl3CudaLinearWeights& value) {
-            if(value.trellis)append(value.trellis,2,prefill_projection_chain_model_owner_);
-            if(value.suh)append(value.suh,2,prefill_projection_chain_model_owner_);
-            if(value.svh)append(value.svh,2,prefill_projection_chain_model_owner_);
-            if(value.mul1)append(value.mul1,4,prefill_projection_chain_model_owner_);
-        };
-        append_weights(weights_.q);append_weights(weights_.k);append_weights(weights_.v);
-        Exl3GraphCompatibilityFingerprint fingerprint;
-        fingerprint.bind(prefill_projection_chain_context_owner_,
-            prefill_projection_chain_model_owner_,
-            prefill_projection_chain_scratch_owner_,
-            std::span<const Exl3GraphBufferIdentity>(buffers.data(),count),
-            rows,max_rows_,rows,kHidden,1,0x46514b56u,
-            Exl3GraphPrecision::oscar_int2_fp16,
-            Exl3GraphPositionPolicy::oscar_split_class,1,stream);
-        Exl3GraphCaptureExtent extent;extent.known=true;
-        extent.retained[static_cast<unsigned>(
-            Exl3ResourceInventory::Domain::graph_count)]=2;
-        Exl3PrefillProjectionChainGraph::Request request{
-            std::move(fingerprint),
-            std::span<const Exl3GraphBoundResource>(resources.data(),count),
-            extent,1,0x46514b560001ull,stream,true};
-        begin(1);
-        prefill_projection_chain_graph_.execute(request,[&](cudaStream_t graph_stream) {
-            project_on(linear_workspaces_[0],weights_.q,weights_.q_metadata,
-                input_norm,qg,Exl3TargetProjectionOperator::q,graph_stream);
-            project_on(linear_workspaces_[1],weights_.k,weights_.k_metadata,
-                input_norm,kp,Exl3TargetProjectionOperator::k,graph_stream);
-            project_on(linear_workspaces_[2],weights_.v,weights_.v_metadata,
-                input_norm,vp,Exl3TargetProjectionOperator::v,graph_stream);
-        });
-        launch(cudaGetLastError(),"launch prefill projection-chain QKV graph");
-        end(1);
-    } else if(concurrent_qkv) {
-        launch(cudaEventRecord(prefill_qkv_concurrency_.fork,stream),
-               "record wide-prefill QKV fork");
-        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.k_stream,
-                                   prefill_qkv_concurrency_.fork,0),
-               "fork wide-prefill K stream");
-        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.v_stream,
-                                   prefill_qkv_concurrency_.fork,0),
-               "fork wide-prefill V stream");
-        try {
-            project_on(prefill_qkv_concurrency_.k_workspace,weights_.k,
-                weights_.k_metadata,input_norm,kp,Exl3TargetProjectionOperator::k,
-                prefill_qkv_concurrency_.k_stream);
-            launch(cudaGetLastError(),"launch concurrent wide-prefill K projection");
-            launch(cudaEventRecord(prefill_qkv_concurrency_.k_done,
-                                   prefill_qkv_concurrency_.k_stream),
-                   "record wide-prefill K completion");
-            project_on(prefill_qkv_concurrency_.v_workspace,weights_.v,
-                weights_.v_metadata,input_norm,vp,Exl3TargetProjectionOperator::v,
-                prefill_qkv_concurrency_.v_stream);
-            launch(cudaGetLastError(),"launch concurrent wide-prefill V projection");
-            launch(cudaEventRecord(prefill_qkv_concurrency_.v_done,
-                                   prefill_qkv_concurrency_.v_stream),
-                   "record wide-prefill V completion");
-            project(linear_workspaces_[0],weights_.q,weights_.q_metadata,input_norm,qg,
-                    Exl3TargetProjectionOperator::q);
-            launch(cudaGetLastError(),"launch concurrent wide-prefill Q projection");
-            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0),
-                   "join wide-prefill K stream");
-            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0),
-                   "join wide-prefill V stream");
-            ++prefill_qkv_concurrent_calls_;
-            prefill_qkv_concurrent_rows_+=static_cast<std::uint64_t>(rows);
-        } catch(...) {
-            (void)cudaEventRecord(prefill_qkv_concurrency_.k_done,
-                                  prefill_qkv_concurrency_.k_stream);
-            (void)cudaEventRecord(prefill_qkv_concurrency_.v_done,
-                                  prefill_qkv_concurrency_.v_stream);
-            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0);
-            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0);
-            throw;
-        }
-    } else {
-        prefetch_weights(1,weights_.k.trellis);
-        begin(1);
-        // Suspension is explicit at the layer boundary, outside ordinary linear
-        // dispatch. Private attention/KV/MLP state resumes only after Q is complete.
-        const bool shared_q=can_share_target &&
-            target_shared_admission(Exl3TargetSharedFamily::q,weights_.q_metadata).has_value() &&
-            target_q_executor_(Exl3TargetQContinuation{weights_.q,weights_.q_metadata,
-                input_norm,qg,rows,position,model_layer_,stream});
-        if(!shared_q)project(linear_workspaces_[0],weights_.q,weights_.q_metadata,
-            input_norm,qg,Exl3TargetProjectionOperator::q);
-        launch(cudaGetLastError(),"launch EXL3 Q projection");end(1);
-        prefetch_weights(2,weights_.o.trellis);
-        const bool m1_kv_pair=(fast_same_weights_fp16kv_m1_kv_pair_ ||
-            fast_same_weights_fp16kv_m1_kv_wide_pair_) &&
-            !preserve_m1_topology && !can_share_target && rows==1 &&
-            !wide_prefill && (!capture_active_ ||
-                fast_same_weights_fp16kv_m1_kv_pair_graph_) &&
-            !oscar_ && !profile &&
-            !projection_timing_ &&
-            !projection_observer_ && linear_workspaces_[1] &&
-            linear_workspaces_[2] &&
-            (weights_.k_metadata.K==6 || weights_.k_metadata.K==7) &&
-            weights_.v_metadata.K==weights_.k_metadata.K &&
-            weights_.k_metadata.mul1 &&
-            weights_.v_metadata.mul1 && !weights_.k_metadata.mcg &&
-            !weights_.v_metadata.mcg && !weights_.k_metadata.has_bias &&
-            !weights_.v_metadata.has_bias &&
-            weights_.k_metadata.in_features==kHidden &&
-            weights_.v_metadata.in_features==kHidden &&
-            weights_.k_metadata.out_features==kKVProjection &&
-            weights_.v_metadata.out_features==kKVProjection;
-        begin(2);
-        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=8 && !can_share_target &&
-            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
-            !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
-            linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
-                weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
-                input_norm,rows,stream);
-        if(merged_kv) {
-            launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
-        } else if(m1_kv_pair) {
-            if(fast_same_weights_fp16kv_m1_kv_wide_pair_)
-                linear_workspaces_[1]->forward_target_m1_kv_wide_pair_for_test(
-                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
-                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
-            else linear_workspaces_[1]->forward_target_m1_kv_pair_for_test(
-                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
-                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
-            launch(cudaGetLastError(),"launch EXL3 paired K/V projection");
-            ++fast_same_weights_fp16kv_m1_kv_pair_submissions_;
-        } else {
-            const bool shared_k=can_share_target && target_kv_executor_enabled_ &&
-                target_shared_admission(Exl3TargetSharedFamily::k,weights_.k_metadata).has_value() &&
-                target_q_executor_(Exl3TargetQContinuation{weights_.k,weights_.k_metadata,
-                    input_norm,kp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::k});
-            if(!shared_k)project(linear_workspaces_[1],weights_.k,weights_.k_metadata,input_norm,kp,
-                Exl3TargetProjectionOperator::k);
-            launch(cudaGetLastError(),"launch EXL3 K projection");
-        }
-        end(2);
-        begin(3);
-        if(!m1_kv_pair && !merged_kv) {
-            const bool shared_v=can_share_target && target_kv_executor_enabled_ &&
-                target_shared_admission(Exl3TargetSharedFamily::v,weights_.v_metadata).has_value() &&
-                target_q_executor_(Exl3TargetQContinuation{weights_.v,weights_.v_metadata,
-                    input_norm,vp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::v});
-            if(!shared_v)project(linear_workspaces_[2],weights_.v,weights_.v_metadata,input_norm,vp,
-                Exl3TargetProjectionOperator::v);
-            launch(cudaGetLastError(),"launch EXL3 V projection");
-        }
-        end(3);
-    }
 
     // Decode rows: split, Q/K norms and RoPE in one launch (bit-identical).
     static const bool fused_qk_prepare=[] {
-        const char* value=std::getenv("NINFER_EXL3_DECODE_QK_PREPARE");
+        const char* value=std::getenv("VOIDINFER_EXL3_DECODE_QK_PREPARE");
         return !value || std::strcmp(value,"0")!=0;
     }();
     const bool qk_prepared=fused_qk_prepare && rows>=1 && rows<=8 && !wide_prefill &&
@@ -8356,7 +8538,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
     if(qk_prepared) {
         exl3_launch_small(decode_qk_prepare_kernel,dim3(rows*(kQHeads+kKVHeads)),dim3(256),0,stream,
             qg,kp,weights_.q_norm,weights_.k_norm,qn,gp,kn,qr,kr,rows,position,position_device_,
-            position_device_?position_device_+1:nullptr);
+            position_device_?position_device_+1:nullptr,rope_map_);
         launch(cudaGetLastError(), "launch EXL3 fused decode Q/K preparation");
         begin(4); end(4); begin(5); end(5);
     } else {
@@ -8375,14 +8557,14 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         exl3_launch_small(rope_k_kernel<true>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,mrope_positions_,rope_offset_);
     }else{
         const int* chain_rows=position_device_?position_device_+1:nullptr;
-        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0,chain_rows);
-        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows);
+        exl3_launch_small(rope_kernel<false>,dim3((rows * kQHeads * kHeadDim + 255) / 256),dim3(256),0,stream,qn,kn,qr,kr,rows,position,position_device_,nullptr,0,chain_rows,rope_map_);
+        exl3_launch_small(rope_k_kernel<false>,dim3((rows * kKVHeads * kHeadDim + 255) / 256),dim3(256),0,stream,kn,kr,rows,position,position_device_,nullptr,0,chain_rows,rope_map_);
     }
     launch(cudaGetLastError(), "launch EXL3 RoPE"); end(5);
     }
 
     const char* attention_core_sample_option=std::getenv(
-        "NINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
+        "VOIDINFER_EXL3_TEST_ATTENTION_CORE_SAMPLE");
     static std::atomic<int> attention_core_samples{0};
     const int attention_core_sample_index=rows>=256 && wide_prefill &&
         !capture_active_ && attention_core_sample_option &&
@@ -8492,31 +8674,40 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         launch(cudaGetLastError(), "append EXL3 attention KV cache");
         if (l0_.k_codes) {
             l0_oscar::window_append_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
-                kr,vp,l0_.k_ring,l0_.v_ring,l0_.k_sink,l0_.v_sink,rows,position,position_device_);
+                kr,vp,l0_.k_ring,l0_.v_ring,l0_.k_sink,l0_.v_sink,rows,position,position_device_,
+                l0_ring_rows_);
             const auto& a=l0_oscar::assets();
             // Hot slots won last round are filled from L2 beside the encode.
             struct HotBranch { cudaStream_t side=nullptr; cudaEvent_t fork=nullptr,join=nullptr; };
-            static const HotBranch hot_branch=[] {
+            // Per thread: concurrent Engine lanes enqueue their rounds from
+            // their own threads.
+            static thread_local const HotBranch hot_branch=[] {
                 HotBranch b;
                 cuda_check(cudaStreamCreateWithFlags(&b.side,cudaStreamNonBlocking),"L0 hot fill stream");
                 cuda_check(cudaEventCreateWithFlags(&b.fork,cudaEventDisableTiming),"L0 hot fill fork");
                 cuda_check(cudaEventCreateWithFlags(&b.join,cudaEventDisableTiming),"L0 hot fill join");
                 return b;
             }();
-            if(l0_.hot_slots) {
+            if(l0_.hot_slots && !l0_exact_only_) {
                 launch(cudaEventRecord(hot_branch.fork,stream),"L0 hot fill fork");
                 launch(cudaStreamWaitEvent(hot_branch.side,hot_branch.fork,0),"L0 hot fill fork");
                 l0_oscar::hot_fill_kernel<<<4*l0_oscar::kHotMaxInsert*2*(kHeadDim/8)/256,256,0,hot_branch.side>>>(
-                    l0_oscar::hot_view(l0_),k_cache_,v_cache_);
+                    l0_oscar::hot_view(l0_),k_cache_,v_cache_,position_device_,position);
                 launch(cudaEventRecord(hot_branch.join,hot_branch.side),"L0 hot fill join");
             }
-            l0_oscar::encode_kernel<<<256,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
-                position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
-                reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
-                l0_oscar::hot_view(l0_));
+            if(!l0_exact_only_) {
+                const auto encode=[&](auto kernel) {
+                    kernel<<<l0_oscar::kEncodeBlocks,256,0,stream>>>(k_cache_,v_cache_,cache_capacity_,
+                        position_device_,position,l0_.state,a,l0_.bank,l0_.k_codes,l0_.v_codes,
+                        reinterpret_cast<__half*>(l0_.k_meta),reinterpret_cast<__half*>(l0_.v_meta),
+                        l0_oscar::hot_view(l0_));
+                };
+                if(l0_oscar_format::code_bits()==4) encode(l0_oscar::encode_kernel<4>);
+                else encode(l0_oscar::encode_kernel<2>);
+            }
             l0_oscar::advance_kernel<<<1,1,0,stream>>>(position_device_,position,l0_.state,
                 cache_capacity_);
-            if(l0_.hot_slots) launch(cudaStreamWaitEvent(stream,hot_branch.join,0),"L0 hot fill join");
+            if(l0_.hot_slots && !l0_exact_only_) launch(cudaStreamWaitEvent(stream,hot_branch.join,0),"L0 hot fill join");
             launch(cudaGetLastError(),"L0 OSCAR history encode");
         }
         if (fakequant_watermark_)
@@ -8543,7 +8734,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         // while position_device_ supplies the live decode frontier at replay.
         // Do not freeze the prefill-only attention branch into M2..M8 graphs.
         if (ordinary_full_layer_graph_capture_ && rows == 1 && position > 0 &&
-            std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC")) {
+            std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC")) {
             std::fprintf(stderr,
                 "ordinary_full_layer_graph_attention_gate layer=%d capture=%d marker=%d fast_flash=%d direct=%d prefix=%d pages=%d exact_scores=%d score_rows=%d six_scores=%d triple_values=%d scalar_values=%d profile=%d position=%d\\n",
                 model_layer_, capture_active_ ? 1 : 0,
@@ -8559,7 +8750,11 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         // The guarded verifier route uses the same fused attention reduction
         // for scalar seeds and B2..B8 proposals.  The older tiled prefill
         // branch otherwise intercepts those small batches first.
-        const bool fused_flash_eligible=fast_fused_flash_attention_ &&
+        // The FP8 line attends its history through the staged route at every
+        // row count, so a row's verdict does not depend on its pass size.
+        const bool line_fp8_rows=l0_exact_only_ && l0_fp8_use_ && l0_.k_codes &&
+            std::min(l0_oscar::history_end(position),cache_capacity_)>l0_oscar::kSink;
+        const bool fused_flash_eligible=!line_fp8_rows && fast_fused_flash_attention_ &&
             (rows==1 || (fast_fused_flash_multirow_ && rows>=2 && rows<=8)) &&
             position>0 && (!capture_active_ || ordinary_full_layer_graph_capture_) &&
             !direct_staged_rows_ && !exact_prefix_rows_ &&
@@ -8568,27 +8763,40 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             exact_attention_gqa_six_scores_ &&
             exact_attention_gqa_six_softmax_triple_values_ &&
             !exact_attention_gqa_six_softmax_fused_scalar_values_;
-        const int l0_prefill_history=(l0_.k_codes && rows>8 && !fused_flash_eligible)?
+        const int l0_prefill_history=(l0_.k_codes && (rows>8 || line_fp8_rows) && !fused_flash_eligible)?
             std::min(l0_oscar::history_end(position),cache_capacity_):0;
         if (l0_prefill_history>l0_oscar::kSink) {
             if(capture_active_ || rows>l0_.prefill_rows || direct_staged_rows_ ||
                exact_prefix_rows_ || exact_page_ranges_.count ||
-               position+rows-l0_prefill_history>l0_oscar::kRingRows)
+               position+rows-l0_prefill_history>l0_ring_rows_)
                 throw std::invalid_argument("L0 OSCAR prefill route preconditions");
             if(l0_exact_prefill_) {
                 // Exact history from the FP16 L2 planes, merged straight into split 4.
+                const L0LineFp8 fp8{l0_fp8_k_,l0_fp8_v_,l0_fp8_valid_,l0_fp8_use_};
                 l0_exact_history_staged(qr,k_cache_,v_cache_,l0_.prefill_hist,l0_.prefill_hist_stats,
                     l0_.prefill_split+static_cast<std::size_t>(4)*rows*kQHeads*kHeadDim,l0_.prefill_split_stats,4,rows,
-                    l0_prefill_history,stream);
+                    l0_prefill_history,stream,l0_fp8_valid_?&fp8:nullptr);
             } else {
             const auto& a=l0_oscar::assets();
             constexpr std::size_t bank_elements=static_cast<std::size_t>(kKVHeads)*kHeadDim*kHeadDim;
             l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
                 rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
-            l0_history_prefill_kernel<<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
-                kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,0,stream>>>(l0_.q_rot,l0_.q_mu,
-                l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
-                l0_.prefill_hist_stats,rows,l0_prefill_history);
+            const auto prefill_history=[&](auto bits) {
+                constexpr int Bits=decltype(bits)::value;
+                static const bool configured=[&] {
+                    cuda_check(cudaFuncSetAttribute(l0_history_prefill_kernel<Bits>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(l0_prefill_smem_bytes<Bits>())),
+                        "configure L0 history prefill shared memory");
+                    return true;
+                }();
+                (void)configured;
+                l0_history_prefill_kernel<Bits><<<dim3((rows+fa2_prefill::BM-1)/fa2_prefill::BM,
+                    kKVHeads,kQHeads/kKVHeads/2*kL0PrefillSplits),kL0PrefillThreads,l0_prefill_smem_bytes<Bits>(),stream>>>(l0_.q_rot,l0_.q_mu,
+                    l0_.k_codes,l0_.v_codes,reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.prefill_hist,
+                    l0_.prefill_hist_stats,rows,l0_prefill_history);
+            };
+            if(l0_oscar_format::code_bits()==4) prefill_history(std::integral_constant<int,4>{});
+            else prefill_history(std::integral_constant<int,2>{});
             l0_history_split_merge_kernel<<<rows*kQHeads,kHeadDim,0,stream>>>(l0_.prefill_hist,
                 l0_.prefill_hist_stats,reinterpret_cast<__half*>(l0_.prefill_numer),
                 l0_.prefill_split_stats,rows,4);
@@ -8598,7 +8806,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             }
             launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                 cache_capacity_,l0_.prefill_split,l0_.prefill_split_stats,stream,
-                l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                l0_prefill_history,false,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
             attention_wmma32_split_merge_kernel<5><<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
                 l0_.prefill_split,l0_.prefill_split_stats,attn,rows);
             launch(cudaGetLastError(),"L0 OSCAR prefill attention");
@@ -8614,15 +8822,15 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 fast_wmma32_split2_capacity_rows_>=rows && exl3_fa2_prefill_enabled()) {
                 // L0 OSCAR while every key still fits the device sink and window
                 // ring: read them there, not from the host-mapped cache.
-                const bool l0_window=l0_.k_ring && position+rows<=l0_oscar::kRingRows;
+                const bool l0_window=l0_.k_ring && position+rows<=l0_ring_rows_;
                 if(l0_window && position+rows>=2048)
                     launch_fa2_prefill_variant<4>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                         cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
-                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                        0,true,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
                 else if(l0_window)
                     launch_fa2_prefill_variant<1>(qr,l0_.k_ring,l0_.v_ring,attn,rows,position,
                         cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream,
-                        0,true,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                        0,true,l0_.k_sink,l0_.v_sink,l0_ring_rows_);
                 else
                     launch_fa2_prefill(qr,attention_k,attention_v,attn,rows,position,
                         cache_capacity_,fast_wmma32_split2_output_,fast_wmma32_split2_stats_,stream);
@@ -9107,7 +9315,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 1,std::memory_order_relaxed);
         } else if(fused_flash_eligible) {
             if (ordinary_full_layer_graph_capture_ &&
-                std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+                std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                 std::fprintf(stderr,
                     "ordinary_full_layer_graph_fused_flash_branch_entered\\n");
             // The scratch allocation is the larger exact score plane.  Keep
@@ -9128,6 +9336,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             if(l0_.k_codes && !mma)
                 throw std::invalid_argument("L0 OSCAR history requires the verifier MMA route");
             const float* history_slot=nullptr;
+            cudaEvent_t history_join=nullptr;
             if(l0_.k_codes) {
                 if(rows>l0_.rows) throw std::invalid_argument("L0 OSCAR history rows");
                 const auto& a=l0_oscar::assets();
@@ -9146,36 +9355,72 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                     launch(cudaGetLastError(),"L0 OSCAR exact history attention");
                     history_slot=l0_.hist_slot;
                 } else {
+                // The INT4 history chain (rotate, history, merge, rotate) is
+                // independent of the exact-window flash pass until the final
+                // merge: it runs on a side branch of `stream` beside it.
+                // VOIDINFER_EXL3_L0_HISTORY_FORK=0 keeps one stream.
+                static const bool history_fork=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_L0_HISTORY_FORK");
+                    return !value || std::strcmp(value,"0")!=0;
+                }();
+                cudaStream_t hs=stream;
+                if(history_fork && stream && l0_.k_ring && mma) {
+                    struct Branch { cudaStream_t side=nullptr; cudaEvent_t fork=nullptr,join=nullptr; };
+                    // One branch per caller stream (batched peers keep their
+                    // own concurrency); per thread like the lanes' enqueues.
+                    static thread_local std::map<cudaStream_t,Branch> branches;
+                    auto& branch=branches[stream];
+                    if(!branch.side) {
+                        cuda_check(cudaStreamCreateWithFlags(&branch.side,cudaStreamNonBlocking),"L0 history stream");
+                        cuda_check(cudaEventCreateWithFlags(&branch.fork,cudaEventDisableTiming),"L0 history fork");
+                        cuda_check(cudaEventCreateWithFlags(&branch.join,cudaEventDisableTiming),"L0 history join");
+                    }
+                    launch(cudaEventRecord(branch.fork,stream),"L0 history fork");
+                    launch(cudaStreamWaitEvent(branch.side,branch.fork,0),"L0 history fork");
+                    hs=branch.side;
+                    history_join=branch.join;
+                }
                 l0_launch_rotate(qr,a.rk16+l0_.bank*bank_elements,reinterpret_cast<__half*>(l0_.q_rot),
-                    rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,stream);
+                    rows,a.mu+static_cast<std::size_t>(l0_.bank)*kKVHeads*kHeadDim,l0_.q_mu,hs);
                 const auto& hot_config=l0_oscar::hot_config();
                 const auto hot=l0_oscar::hot_view(l0_);
                 // Every history CTA runs its share of the exact hot tiles first;
-                // their partials follow the INT2 segment partials.
-                const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),l0_.segments);
-                const int slot_stride=l0_.segments*kL0HistoryStreams+hot_ctas;
-                const dim3 grid(l0_.segments,kKVHeads);
-                const auto history=[&](auto kernel) {
+                // their partials follow the INT4 segment partials.
+                const int segments=history_lanes_>1?
+                    std::max(4,l0_.segments/history_lanes_):l0_.segments;
+                const int hot_ctas=std::min(l0_hot_tiles(l0_.hot_slots),segments);
+                const int slot_stride=segments*kL0HistoryStreams+hot_ctas;
+                const dim3 grid(segments,kKVHeads);
+                const auto history=[&](auto kernel,auto bits) {
+                    constexpr int Bits=decltype(bits)::value;
                     static const bool configured=[&] {
                         cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            static_cast<int>(l0_history_smem_bytes())),"configure L0 history shared memory");
+                            static_cast<int>(l0_history_smem_bytes<Bits>())),"configure L0 history shared memory");
                         return true;
                     }();
                     (void)configured;
-                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes(),stream>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
+                    kernel<<<grid,kL0HistoryThreads,l0_history_smem_bytes<Bits>(),hs>>>(l0_.q_rot,l0_.q_mu,l0_.k_codes,l0_.v_codes,
                         reinterpret_cast<const __half*>(l0_.k_meta),reinterpret_cast<const __half*>(l0_.v_meta),l0_.hist_work,rows,position,cache_capacity_,
-                        l0_.segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
+                        segments,position_device_,slot_stride,hot,hot_config.log2_tau,qr,
                         hot_config.lambda);
                 };
-                if(hot_ctas) history(l0_history_mma_kernel<64,true>);
-                else history(l0_history_mma_kernel<64,false>);
-                l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,stream>>>(l0_.hist_work,
-                    l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,l0_.segments,
+                using Int4=std::integral_constant<int,4>;
+                using Int2=std::integral_constant<int,2>;
+                if(l0_oscar_format::code_bits()==4) {
+                    if(hot_ctas) history(l0_history_mma_kernel<64,true,4>,Int4{});
+                    else history(l0_history_mma_kernel<64,false,4>,Int4{});
+                } else {
+                    if(hot_ctas) history(l0_history_mma_kernel<64,true,2>,Int2{});
+                    else history(l0_history_mma_kernel<64,false,2>,Int2{});
+                }
+                l0_history_merge_kernel<<<rows*kQHeads+(hot_ctas?kKVHeads:0),256,0,hs>>>(l0_.hist_work,
+                    l0_.hist_slot,reinterpret_cast<__half*>(l0_.hist_rotated),rows,segments,
                     l0_.segment_keys,position,cache_capacity_,position_device_,slot_stride,hot_ctas,
                     hot_ctas?l0_.hot_ref:nullptr,hot_ctas?l0_.hist_hot:nullptr,hot,hot_config.insert,
                     hot_config.lambda);
                 l0_launch_rotate<float,true>(l0_.hist_rotated,a.rvt16+l0_.bank*bank_elements,
-                    l0_.hist_slot,rows,nullptr,nullptr,stream,hot_ctas?l0_.hist_hot:nullptr);
+                    l0_.hist_slot,rows,nullptr,nullptr,hs,hot_ctas?l0_.hist_hot:nullptr);
+                if(history_join)launch(cudaEventRecord(history_join,hs),"L0 history join");
                 launch(cudaGetLastError(),"L0 OSCAR history attention");
                 history_slot=l0_.hist_slot;
                 }
@@ -9184,7 +9429,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 launch_verify_flash_mma(qr,l0_.k_ring,l0_.v_ring,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
                     attn,rows,position,cache_capacity_,position_device_,stream,0,
-                    history_slot,l0_.k_sink,l0_.v_sink,l0_oscar::kRingRows-1);
+                    history_slot,l0_.k_sink,l0_.v_sink,l0_ring_rows_,history_join);
             else if(mma)
                 launch_verify_flash_mma(qr,attention_k,attention_v,exact_scores_,
                     exl3_exact_attention_score_bytes(exact_score_rows_,cache_capacity_),
@@ -9236,60 +9481,60 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         } else if(exact_scores_) {
             if(exact_score_rows_<1) throw std::invalid_argument("exact attention score row capacity");
             const auto* shared_score_value=
-                std::getenv("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE");
+                std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE");
             if(shared_score_value && std::strcmp(shared_score_value,"0")!=0 &&
                std::strcmp(shared_score_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE must be 0 or 1");
             const auto* shared_score_rows128_value=
-                std::getenv("NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128");
+                std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128");
             if(shared_score_rows128_value &&
                std::strcmp(shared_score_rows128_value,"0")!=0 &&
                std::strcmp(shared_score_rows128_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_ROWS128 must be 0 or 1");
             const bool shared_score_rows128=shared_score_rows128_value &&
                 std::strcmp(shared_score_rows128_value,"1")==0;
             const auto* shared_score_threads256_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256");
             if(shared_score_threads256_value &&
                std::strcmp(shared_score_threads256_value,"0")!=0 &&
                std::strcmp(shared_score_threads256_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_THREADS256 must be 0 or 1");
             const bool shared_score_threads256=shared_score_threads256_value &&
                 std::strcmp(shared_score_threads256_value,"1")==0;
             const auto* shared_score_parallel_softmax_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX");
             if(shared_score_parallel_softmax_value &&
                std::strcmp(shared_score_parallel_softmax_value,"0")!=0 &&
                std::strcmp(shared_score_parallel_softmax_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_PARALLEL_SOFTMAX must be 0 or 1");
             const bool shared_score_parallel_softmax=
                 shared_score_parallel_softmax_value &&
                 std::strcmp(shared_score_parallel_softmax_value,"1")==0;
             const auto* shared_score_head_split256_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256");
             if(shared_score_head_split256_value &&
                std::strcmp(shared_score_head_split256_value,"0")!=0 &&
                std::strcmp(shared_score_head_split256_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 must be 0 or 1");
             const bool shared_score_head_split256=
                 shared_score_head_split256_value &&
                 std::strcmp(shared_score_head_split256_value,"1")==0;
             if(shared_score_head_split256 &&
                (shared_score_threads256 || !shared_score_parallel_softmax))
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 requires parallel softmax and threads256=0");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_HEAD_SPLIT256 requires parallel softmax and threads256=0");
             const auto* shared_score_dimension_split256_value=std::getenv(
-                "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256");
+                "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256");
             if(shared_score_dimension_split256_value &&
                std::strcmp(shared_score_dimension_split256_value,"0")!=0 &&
                std::strcmp(shared_score_dimension_split256_value,"1")!=0)
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 must be 0 or 1");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 must be 0 or 1");
             const bool shared_score_dimension_split256=
                 shared_score_dimension_split256_value &&
                 std::strcmp(shared_score_dimension_split256_value,"1")==0;
@@ -9297,7 +9542,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                (shared_score_threads256 || shared_score_head_split256 ||
                 !shared_score_parallel_softmax))
                 throw std::invalid_argument(
-                    "NINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 requires parallel softmax, threads256=0 and head_split256=0");
+                    "VOIDINFER_EXL3_PREFILL_ATTENTION_SHARED_SCORE_DIMENSION_SPLIT256 requires parallel softmax, threads256=0 and head_split256=0");
             const bool shared_score_attention=shared_score_value &&
                 std::strcmp(shared_score_value,"1")==0 &&
                 wide_prefill && !profile &&
@@ -9323,7 +9568,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 !exact_attention_gqa_six_softmax_triple_values_fused_ &&
                 !exact_attention_gqa_six_softmax_tile512_;
             const auto* attention_chain_value=
-                std::getenv("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
+                std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
             const bool attention_chain=attention_chain_value &&
                 std::strcmp(attention_chain_value,"1")==0 &&
                 preserve_m1_topology && wide_prefill && !profile &&
@@ -9599,7 +9844,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                         score_shards,stream);
                     if(decode_fused) {
                         if (ordinary_full_layer_graph_capture_ &&
-                            std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+                            std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                             std::fprintf(stderr,
                                 "ordinary_full_layer_graph_decode_fused_branch_entered\\n");
                         attention_cached_gqa_six_decode_fused_kernel<<<
@@ -9822,6 +10067,585 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         cudaEventDestroy(attention_core_start);
         cudaEventDestroy(attention_core_end);
     }
+}
+
+void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
+                                     std::uint16_t* output,
+                                     int rows,
+                                     int position,
+                                     cudaStream_t stream,
+                                     bool profile,
+                                     bool preserve_m1_topology,
+                                     bool wide_prefill,
+                                     DecodeGraphExecutable* mlp_tail_graph) {
+    if(coalesce_input_mlp_ && (profile || capture_active_ || oscar_))
+        throw std::invalid_argument("coalesced attention scratch requires ordinary eager nondiagnostic execution");
+    if (!input || !output || rows <= 0 || rows > max_rows_) {
+        throw std::invalid_argument("invalid EXL3 full-attention layer input/output/rows");
+    }
+    require_tier_rows(rows);
+    // Side-branch L2 prefetch of upcoming GEMV weights (see the GDN layer).
+    static const std::size_t prefetch_bytes=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH_MB");
+        return static_cast<std::size_t>(value?std::atoi(value):8)<<20;
+    }();
+    static const int prefetch_sites=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH_FULL_SITES");
+        return value?std::atoi(value):31;
+    }();
+    const bool prefetch=exl3_l2_prefetch_enabled() && rows==1 && !wide_prefill && !profile &&
+        !mlp_tail_graph;
+    const auto prefetch_weights=[&](int site,const std::uint16_t* trellis) {
+        if(prefetch && trellis && (prefetch_sites&site))
+            exl3_l2_prefetch_fork(stream,trellis,prefetch_bytes);
+    };
+    if(exact_prefix_rows_ || exact_page_ranges_.count) {
+        exact_position_contract_.require_current(mrope_positions_,rope_offset_);
+        if(!supports_segmented_exact_prefix())
+            throw std::invalid_argument("segmented attention precompute extent/profile");
+        Exl3AttentionInputView input_view{k_cache_,v_cache_,cache_capacity_,1024,exact_page_ranges_};
+        if(exact_prefix_rows_)input_view.shared.append(exact_prefix_k_,exact_prefix_v_,
+            exact_prefix_first_,exact_prefix_rows_,position);
+        input_view.require_geometry(position,rows);
+    }
+    if(direct_staged_rows_) {
+        if(!direct_staged_k_ || !direct_staged_v_ ||
+           direct_staged_rows_!=position || !supports_direct_staged_history(rows,position))
+            throw std::invalid_argument("direct staged history extent/profile");
+    }
+    retained_prefix_available_ = false;
+    retained_prefix_cleared_by_ = batch_ ? "batched forward" : "forward";
+    retained_prefix_cleared_rows_ = rows;
+    // Batched multi-agent rounds: this layer's own agent owns the leading
+    // own_rows; peer agents' rows follow (run_peer_segment).
+    const int own_rows=batch_?batch_->own_rows:rows;
+    // Fused multi-row paths admit the 16 rows of a batched multi-agent
+    // round; ordinary verifier rows stay at 8.
+    const int fused_rows=batch_?16:8;
+    bool eligible_retained_prefix = preserve_m1_topology && own_rows >= 2 && own_rows <= 8 &&
+        ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
+         (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
+        !capture_active_;
+    if (eligible_retained_prefix) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture_status),
+                   "query EXL3 full-attention retained-prefix source capture");
+        eligible_retained_prefix =
+            capture_status == cudaStreamCaptureStatusNone;
+    }
+    cudaEvent_t starts[13]{};
+    cudaEvent_t ends[13]{};
+    if (profile) {
+        for (int i = 0; i < 13; ++i) {
+            cuda_check(cudaEventCreate(&starts[i]), "create EXL3 layer start event");
+            cuda_check(cudaEventCreate(&ends[i]), "create EXL3 layer end event");
+        }
+    }
+    const auto begin = [&](int i) { if (profile) launch_profile_event(starts[i], stream); };
+    const auto end = [&](int i) { if (profile) launch_profile_event(ends[i], stream); };
+    const auto launch = [&](cudaError_t error, const char* op) { cuda_check(error, op); };
+    auto* input_norm = buffers_[0];
+    auto* qg = buffers_[1];
+    auto* kp = buffers_[2];
+    auto* vp = buffers_[3];
+    auto* qn = buffers_[4];
+    auto* kn = buffers_[5];
+    auto* qr = buffers_[6];
+    auto* kr = buffers_[7];
+    auto* attn = buffers_[8];
+    auto* op = buffers_[9];
+    auto* post_resid = buffers_[10];
+    auto* mlp_in = buffers_[11];
+    auto* gp = buffers_[12];
+    auto* up = buffers_[13];
+    auto* act = buffers_[14];
+    auto* down = buffers_[15];
+    const auto project_on = [&](Exl3CudaLinearWorkspace* workspace,
+                             const Exl3CudaLinearWeights& weights,
+                             const Exl3CudaLinearMetadata& metadata,
+                              const std::uint16_t* source,
+                              std::uint16_t* destination,
+                              Exl3TargetProjectionOperator operation,
+                              cudaStream_t projection_stream,
+                              const std::uint16_t* transformed_input=nullptr) {
+        const bool rowwise = preserve_m1_topology && rows > 1;
+        const bool target_initial16 = !rowwise && rows == 16 &&
+            workspace->target_initial16_candidate(metadata, rows, Exl3CudaLinearAdmission::target_initial16);
+        // Wide passes of 9..32 rows (VeriCache verify blocks) take the coherent
+        // M32 projections of batched decode rounds instead of the wide direct
+        // kernels (VOIDINFER_EXL3_WIDE_M32=0 keeps those).
+        static const bool wide_m32_enabled = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_WIDE_M32");
+            return !value || std::strcmp(value, "0") != 0;
+        }();
+        const bool wide_m32 = wide_m32_enabled && rowwise && wide_prefill && rows > 8 && rows <= 32 &&
+            workspace->coherent_batched_rows(metadata, rows);
+        const bool target_wide_candidate = rowwise && wide_prefill && !wide_m32 &&
+            workspace->target_wide_prefill_candidate(metadata, rows, Exl3CudaLinearAdmission::target_wide_prefill);
+        const bool target_gateup_m16 = !rowwise && rows == 16 &&
+            (operation == Exl3TargetProjectionOperator::gate ||
+             operation == Exl3TargetProjectionOperator::up) &&
+            workspace->target_gateup_m16_candidate(metadata, rows,
+                Exl3CudaLinearAdmission::target_prefill_gate_up);
+        const bool target_gateup_candidate = rowwise &&
+            (operation == Exl3TargetProjectionOperator::gate ||
+             operation == Exl3TargetProjectionOperator::up) &&
+            (workspace->target_gateup_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up) ||
+             workspace->target_gateup_k5_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_gate_up));
+        const bool target_down_candidate = rowwise &&
+            operation == Exl3TargetProjectionOperator::down &&
+            workspace->target_down_small_m_candidate(
+                metadata, rows,
+                Exl3CudaLinearAdmission::target_continuation_down);
+        const bool target_o_k7_candidate = rowwise &&
+            operation == Exl3TargetProjectionOperator::o &&
+            (workspace->target_o_k7_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o) ||
+             workspace->target_o_k6_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_o));
+        const bool target_kv_candidate = rowwise && !wide_prefill &&
+            (operation == Exl3TargetProjectionOperator::k ||
+             operation == Exl3TargetProjectionOperator::v) &&
+            workspace->target_kv_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_kv);
+        const bool target_q_k6_candidate = rowwise && !wide_prefill &&
+            operation == Exl3TargetProjectionOperator::q &&
+            workspace->target_q_k6_small_m_candidate(
+                metadata, rows, Exl3CudaLinearAdmission::target_continuation_q);
+        const auto target_k5_admission =
+            operation == Exl3TargetProjectionOperator::q
+                ? Exl3CudaLinearAdmission::target_continuation_q
+            : (operation == Exl3TargetProjectionOperator::k ||
+               operation == Exl3TargetProjectionOperator::v)
+                ? Exl3CudaLinearAdmission::target_continuation_kv
+            : operation == Exl3TargetProjectionOperator::o
+                ? Exl3CudaLinearAdmission::target_continuation_o
+            : operation == Exl3TargetProjectionOperator::down
+                ? Exl3CudaLinearAdmission::target_continuation_down
+                : Exl3CudaLinearAdmission::ordinary;
+        const bool target_k5_candidate = rowwise && !wide_prefill &&
+            workspace->target_k5_small_m_batch_candidate(
+                metadata, rows, target_k5_admission);
+        const auto coherent_admission =
+            operation == Exl3TargetProjectionOperator::gate ||
+            operation == Exl3TargetProjectionOperator::up
+                ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                : target_k5_admission;
+        const bool target_coherent_candidate = rowwise && !wide_prefill &&
+            workspace->coherent_continuation_candidate(metadata, rows, coherent_admission);
+        const bool target_small_m_candidate =
+            target_gateup_candidate || target_down_candidate ||
+            target_o_k7_candidate || target_wide_candidate || target_kv_candidate ||
+            target_q_k6_candidate || target_k5_candidate || target_coherent_candidate;
+        const char* fast_same_weights_fp16kv_decode = std::getenv(
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
+        const bool fast_same_weights_fp16kv_decode_candidate =
+            reconstruct_gemm_ && rows == 1 && !wide_prefill && !capture_active_ &&
+            fast_same_weights_fp16kv_decode &&
+            std::strcmp(fast_same_weights_fp16kv_decode, "1") == 0 &&
+            reconstruct_gemm_->accepts_all_model_shapes() &&
+            reconstruct_gemm_->supports(metadata, rows) && metadata.mul1 &&
+            !metadata.mcg && !metadata.has_bias;
+        const bool numeric_reconstruct_candidate =
+            fast_same_weights_fp16kv_decode_candidate ||
+            (reconstruct_gemm_ && rowwise && wide_prefill && !capture_active_ &&
+             target_wide_candidate && reconstruct_gemm_->supports(metadata, rows) &&
+             metadata.mul1 && !metadata.mcg && !metadata.has_bias &&
+             ((reconstruct_gemm_->accepts_all_model_shapes() &&
+               metadata.K >= 4 && metadata.K <= 8 && rows >= 256) ||
+              ((operation == Exl3TargetProjectionOperator::gate ||
+                operation == Exl3TargetProjectionOperator::up) &&
+               metadata.K == 6 && metadata.in_features == kHidden &&
+               metadata.out_features == kIntermediate && rows >= 512) ||
+              (operation == Exl3TargetProjectionOperator::down &&
+               metadata.K == 7 && metadata.in_features == kIntermediate &&
+               metadata.out_features == kHidden && rows >= 256)));
+        bool observed_projection = false;
+        const bool observe_prefill = !rowwise && rows == 16 &&
+            projection_observer_selection_ ==
+                Exl3TargetProjectionObserverSelection::prefill_gate_up_k6;
+        const bool observe_initial16 = !rowwise && rows == 16 &&
+            projection_observer_selection_ == Exl3TargetProjectionObserverSelection::initial16_generic;
+        const bool observe_m1_k6_n32 = rowwise &&
+            projection_observer_selection_ ==
+                Exl3TargetProjectionObserverSelection::m1_k6_n32;
+        if (projection_observer_ != nullptr &&
+            (rowwise || observe_prefill || observe_initial16 || observe_m1_k6_n32)) {
+            const bool observed_gate_up =
+                (projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::gate_up_k6 || observe_prefill) &&
+                (operation == Exl3TargetProjectionOperator::gate ||
+                 operation == Exl3TargetProjectionOperator::up) &&
+                metadata.in_features == kHidden &&
+                metadata.out_features == kIntermediate;
+            const bool observed_gate_up_k7 =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::gate_up_k7 &&
+                (operation == Exl3TargetProjectionOperator::gate ||
+                 operation == Exl3TargetProjectionOperator::up) &&
+                metadata.in_features == kHidden &&
+                metadata.out_features == kIntermediate;
+            const bool observed_down =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::down_k6 &&
+                operation == Exl3TargetProjectionOperator::down &&
+                metadata.in_features == kIntermediate &&
+                metadata.out_features == kHidden;
+            const bool observed_down_k7 =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::down_k7 &&
+                operation == Exl3TargetProjectionOperator::down &&
+                metadata.in_features == kIntermediate &&
+                metadata.out_features == kHidden;
+            const bool observed_output =
+                projection_observer_selection_ ==
+                    Exl3TargetProjectionObserverSelection::output_k7 &&
+                operation == Exl3TargetProjectionOperator::o &&
+                metadata.in_features == kQHeads * kHeadDim &&
+                metadata.out_features == kHidden;
+            observed_projection =
+                (((observed_gate_up || observed_down) && metadata.K == 6) ||
+                 ((observed_gate_up_k7 || observed_output || observed_down_k7) &&
+                  metadata.K == 7)) &&
+                metadata.mul1 && !metadata.mcg && !metadata.has_bias;
+            if (observe_initial16)
+                observed_projection = std::string(workspace->dispatch_name(metadata,16)) == "generic_tile" &&
+                    !(metadata.in_features == 5120 && metadata.out_features == 17408 && metadata.K == 6);
+            if (observe_m1_k6_n32)
+                observed_projection = metadata.K == 6 && metadata.mul1 &&
+                    !metadata.mcg && !metadata.has_bias &&
+                    std::string(workspace->dispatch_name(metadata, 1)) ==
+                        "generic_mma_split";
+            if (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all)
+                observed_projection = rowwise;
+        }
+        if (observed_projection) {
+            const Exl3TargetProjectionObservation observation{
+                weights, metadata, source, rows, model_layer_,
+                (projection_observer_selection_ == Exl3TargetProjectionObserverSelection::wide_prefill_all ||
+                 observe_initial16 || observe_m1_k6_n32)
+                    ? target_projection_operator_name(operation) :
+                operation == Exl3TargetProjectionOperator::gate ? "gate" :
+                    (operation == Exl3TargetProjectionOperator::up ? "up" :
+                     (operation == Exl3TargetProjectionOperator::o ? "o" : "down")),
+                workspace->dispatch_name(metadata, 1), projection_stream};
+            projection_observer_(observation, projection_observer_user_);
+        }
+        const auto topology = numeric_reconstruct_candidate
+            ? Exl3TargetProjectionTopology::batched
+            : target_small_m_candidate
+            ? Exl3TargetProjectionTopology::small_m_mma_split
+            : (rowwise ? Exl3TargetProjectionTopology::m1_per_row
+            : (rows == 1 ? Exl3TargetProjectionTopology::m1
+                         : Exl3TargetProjectionTopology::batched));
+        const int timing_slot = projection_timing_
+            ? projection_timing_->begin(model_layer_, operation, rows, metadata.K,
+                                        metadata.in_features, metadata.out_features,
+                                        topology,
+                                        rowwise && !target_small_m_candidate ? rows : 1,
+                                        projection_stream)
+            : -1;
+        if (numeric_reconstruct_candidate) {
+            if(transformed_input)
+                throw std::logic_error(
+                    "numeric reconstruct cannot consume borrowed transformed input");
+            reconstruct_gemm_->forward_numeric_candidate(
+                weights, metadata, source, destination, rows, projection_stream);
+        } else if (rowwise && !target_small_m_candidate && !(batch_ && rows > 8) && !wide_m32) {
+            for (int row = 0; row < rows; ++row) {
+                if(transformed_input)
+                    workspace->forward_from_transformed(weights,metadata,
+                        transformed_input+static_cast<std::size_t>(row)*metadata.in_features,
+                        destination+static_cast<std::size_t>(row)*metadata.out_features,
+                        1,projection_stream,Exl3CudaLinearAdmission::ordinary);
+                else workspace->forward(weights, metadata,
+                        source + static_cast<std::size_t>(row) * metadata.in_features,
+                        destination + static_cast<std::size_t>(row) * metadata.out_features,
+                        1, projection_stream);
+            }
+        } else {
+            const auto admission=target_kv_candidate
+                    ? Exl3CudaLinearAdmission::target_continuation_kv
+                    : target_q_k6_candidate
+                    ? Exl3CudaLinearAdmission::target_continuation_q
+                    : target_k5_candidate
+                    ? target_k5_admission
+                    : target_initial16
+                    ? Exl3CudaLinearAdmission::target_initial16
+                    : target_wide_candidate
+                    ? Exl3CudaLinearAdmission::target_wide_prefill
+                    : target_gateup_m16
+                    ? Exl3CudaLinearAdmission::target_prefill_gate_up
+                    : target_gateup_candidate
+                    ? Exl3CudaLinearAdmission::target_continuation_gate_up
+                    : (target_down_candidate
+                           ? Exl3CudaLinearAdmission::target_continuation_down
+                           : (target_o_k7_candidate
+                                   ? Exl3CudaLinearAdmission::target_continuation_o
+                                   : target_coherent_candidate
+                                   ? coherent_admission
+                                   : Exl3CudaLinearAdmission::ordinary));
+            // Batched rounds (2-4 agents, up to 32 rows) take the coherent
+            // continuation routes (M16, or M32 for 17..32 rows).
+            const auto launch_admission = batch_ && rows > 8 && !target_small_m_candidate
+                ? batched_continuation_admission(operation) : admission;
+            if(transformed_input)
+                workspace->forward_from_transformed(
+                    weights,metadata,transformed_input,destination,rows,
+                    projection_stream,launch_admission);
+            else workspace->forward(
+                weights,metadata,source,destination,rows,projection_stream,
+                launch_admission);
+        }
+        if (projection_timing_)
+            projection_timing_->end(timing_slot, projection_stream);
+    };
+    const auto project = [&](Exl3CudaLinearWorkspace* workspace,
+                             const Exl3CudaLinearWeights& weights,
+                             const Exl3CudaLinearMetadata& metadata,
+                              const std::uint16_t* source,
+                              std::uint16_t* destination,
+                              Exl3TargetProjectionOperator operation,
+                              const std::uint16_t* transformed_input=nullptr) {
+        project_on(workspace, weights, metadata, source, destination, operation,
+                   stream,transformed_input);
+    };
+
+    begin(0);
+    exl3_launch_small(rms_norm_kernel,dim3(rows),dim3(512),512 * sizeof(float),stream,input, weights_.input_norm,
+        input_norm, rows, kHidden);
+    launch(cudaGetLastError(), "launch EXL3 input RMSNorm"); end(0);
+
+    const bool can_share_target=target_q_executor_ && !capture_active_ && !oscar_ &&
+        !profile && !projection_timing_ && !projection_observer_ &&
+        preserve_m1_topology && !wide_prefill && rows>=1 && rows<=8;
+    const bool concurrent_qkv=prefill_qkv_concurrency_.complete() &&
+        !capture_active_ && !oscar_ && !profile && !projection_timing_ &&
+        !projection_observer_ && preserve_m1_topology && wide_prefill &&
+        rows>=17 && rows<=1024 && !can_share_target;
+    const auto* projection_chain_value=
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
+    const auto* projection_chain_full_value=
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL");
+    if(projection_chain_full_value &&
+       std::strcmp(projection_chain_full_value,"0")!=0 &&
+       std::strcmp(projection_chain_full_value,"1")!=0)
+        throw std::invalid_argument(
+            "VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_FULL must be 0 or 1");
+    const bool projection_chain=projection_chain_value &&
+        std::strcmp(projection_chain_value,"1")==0 &&
+        (!projection_chain_full_value ||
+         std::strcmp(projection_chain_full_value,"1")==0) && !capture_active_ &&
+        !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+        preserve_m1_topology && wide_prefill && rows==1024 && !can_share_target &&
+        !concurrent_qkv;
+    if(projection_chain) {
+        std::array<Exl3GraphBufferIdentity,16> buffers{};
+        std::array<Exl3GraphBoundResource,16> resources{};
+        std::size_t count=0;
+        const auto append=[&](const void* address,std::size_t bytes,
+                              const std::shared_ptr<const void>& owner) {
+            if(!address || !bytes || count==buffers.size())
+                throw std::logic_error("full-attention projection-chain resource");
+            buffers[count]={address,bytes};
+            resources[count]={owner,address,bytes,count+1};
+            ++count;
+        };
+        append(input_norm,static_cast<std::size_t>(rows)*kHidden*2,
+               prefill_projection_chain_scratch_owner_);
+        append(qg,static_cast<std::size_t>(rows)*weights_.q_metadata.out_features*2,
+               prefill_projection_chain_scratch_owner_);
+        append(kp,static_cast<std::size_t>(rows)*weights_.k_metadata.out_features*2,
+               prefill_projection_chain_scratch_owner_);
+        append(vp,static_cast<std::size_t>(rows)*weights_.v_metadata.out_features*2,
+               prefill_projection_chain_scratch_owner_);
+        const auto append_weights=[&](const Exl3CudaLinearWeights& value) {
+            if(value.trellis)append(value.trellis,2,prefill_projection_chain_model_owner_);
+            if(value.suh)append(value.suh,2,prefill_projection_chain_model_owner_);
+            if(value.svh)append(value.svh,2,prefill_projection_chain_model_owner_);
+            if(value.mul1)append(value.mul1,4,prefill_projection_chain_model_owner_);
+        };
+        append_weights(weights_.q);append_weights(weights_.k);append_weights(weights_.v);
+        Exl3GraphCompatibilityFingerprint fingerprint;
+        fingerprint.bind(prefill_projection_chain_context_owner_,
+            prefill_projection_chain_model_owner_,
+            prefill_projection_chain_scratch_owner_,
+            std::span<const Exl3GraphBufferIdentity>(buffers.data(),count),
+            rows,max_rows_,rows,kHidden,1,0x46514b56u,
+            Exl3GraphPrecision::oscar_int2_fp16,
+            Exl3GraphPositionPolicy::oscar_split_class,1,stream);
+        Exl3GraphCaptureExtent extent;extent.known=true;
+        extent.retained[static_cast<unsigned>(
+            Exl3ResourceInventory::Domain::graph_count)]=2;
+        Exl3PrefillProjectionChainGraph::Request request{
+            std::move(fingerprint),
+            std::span<const Exl3GraphBoundResource>(resources.data(),count),
+            extent,1,0x46514b560001ull,stream,true};
+        begin(1);
+        prefill_projection_chain_graph_.execute(request,[&](cudaStream_t graph_stream) {
+            project_on(linear_workspaces_[0],weights_.q,weights_.q_metadata,
+                input_norm,qg,Exl3TargetProjectionOperator::q,graph_stream);
+            project_on(linear_workspaces_[1],weights_.k,weights_.k_metadata,
+                input_norm,kp,Exl3TargetProjectionOperator::k,graph_stream);
+            project_on(linear_workspaces_[2],weights_.v,weights_.v_metadata,
+                input_norm,vp,Exl3TargetProjectionOperator::v,graph_stream);
+        });
+        launch(cudaGetLastError(),"launch prefill projection-chain QKV graph");
+        end(1);
+    } else if(concurrent_qkv) {
+        launch(cudaEventRecord(prefill_qkv_concurrency_.fork,stream),
+               "record wide-prefill QKV fork");
+        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.k_stream,
+                                   prefill_qkv_concurrency_.fork,0),
+               "fork wide-prefill K stream");
+        launch(cudaStreamWaitEvent(prefill_qkv_concurrency_.v_stream,
+                                   prefill_qkv_concurrency_.fork,0),
+               "fork wide-prefill V stream");
+        try {
+            project_on(prefill_qkv_concurrency_.k_workspace,weights_.k,
+                weights_.k_metadata,input_norm,kp,Exl3TargetProjectionOperator::k,
+                prefill_qkv_concurrency_.k_stream);
+            launch(cudaGetLastError(),"launch concurrent wide-prefill K projection");
+            launch(cudaEventRecord(prefill_qkv_concurrency_.k_done,
+                                   prefill_qkv_concurrency_.k_stream),
+                   "record wide-prefill K completion");
+            project_on(prefill_qkv_concurrency_.v_workspace,weights_.v,
+                weights_.v_metadata,input_norm,vp,Exl3TargetProjectionOperator::v,
+                prefill_qkv_concurrency_.v_stream);
+            launch(cudaGetLastError(),"launch concurrent wide-prefill V projection");
+            launch(cudaEventRecord(prefill_qkv_concurrency_.v_done,
+                                   prefill_qkv_concurrency_.v_stream),
+                   "record wide-prefill V completion");
+            project(linear_workspaces_[0],weights_.q,weights_.q_metadata,input_norm,qg,
+                    Exl3TargetProjectionOperator::q);
+            launch(cudaGetLastError(),"launch concurrent wide-prefill Q projection");
+            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0),
+                   "join wide-prefill K stream");
+            launch(cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0),
+                   "join wide-prefill V stream");
+            ++prefill_qkv_concurrent_calls_;
+            prefill_qkv_concurrent_rows_+=static_cast<std::uint64_t>(rows);
+        } catch(...) {
+            (void)cudaEventRecord(prefill_qkv_concurrency_.k_done,
+                                  prefill_qkv_concurrency_.k_stream);
+            (void)cudaEventRecord(prefill_qkv_concurrency_.v_done,
+                                  prefill_qkv_concurrency_.v_stream);
+            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.k_done,0);
+            (void)cudaStreamWaitEvent(stream,prefill_qkv_concurrency_.v_done,0);
+            throw;
+        }
+    } else {
+        prefetch_weights(1,weights_.k.trellis);
+        begin(1);
+        // Suspension is explicit at the layer boundary, outside ordinary linear
+        // dispatch. Private attention/KV/MLP state resumes only after Q is complete.
+        const bool shared_q=can_share_target &&
+            target_shared_admission(Exl3TargetSharedFamily::q,weights_.q_metadata).has_value() &&
+            target_q_executor_(Exl3TargetQContinuation{weights_.q,weights_.q_metadata,
+                input_norm,qg,rows,position,model_layer_,stream});
+        if(!shared_q)project(linear_workspaces_[0],weights_.q,weights_.q_metadata,
+            input_norm,qg,Exl3TargetProjectionOperator::q);
+        launch(cudaGetLastError(),"launch EXL3 Q projection");end(1);
+        prefetch_weights(2,weights_.o.trellis);
+        const bool m1_kv_pair=(fast_same_weights_fp16kv_m1_kv_pair_ ||
+            fast_same_weights_fp16kv_m1_kv_wide_pair_) &&
+            !preserve_m1_topology && !can_share_target && rows==1 &&
+            !wide_prefill && (!capture_active_ ||
+                fast_same_weights_fp16kv_m1_kv_pair_graph_) &&
+            !oscar_ && !profile &&
+            !projection_timing_ &&
+            !projection_observer_ && linear_workspaces_[1] &&
+            linear_workspaces_[2] &&
+            (weights_.k_metadata.K==6 || weights_.k_metadata.K==7) &&
+            weights_.v_metadata.K==weights_.k_metadata.K &&
+            weights_.k_metadata.mul1 &&
+            weights_.v_metadata.mul1 && !weights_.k_metadata.mcg &&
+            !weights_.v_metadata.mcg && !weights_.k_metadata.has_bias &&
+            !weights_.v_metadata.has_bias &&
+            weights_.k_metadata.in_features==kHidden &&
+            weights_.v_metadata.in_features==kHidden &&
+            weights_.k_metadata.out_features==kKVProjection &&
+            weights_.v_metadata.out_features==kKVProjection;
+        begin(2);
+        const bool merged_kv=!m1_kv_pair && rows>=1 && rows<=fused_rows && !can_share_target &&
+            !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && linear_workspaces_[1] && linear_workspaces_[2] &&
+            linear_workspaces_[1]->forward_merged_pair(*linear_workspaces_[2],
+                weights_.k,weights_.k_metadata,kp,weights_.v,weights_.v_metadata,vp,
+                input_norm,rows,stream);
+        if(merged_kv) {
+            launch(cudaGetLastError(),"launch merged EXL3 K/V projection");
+        } else if(m1_kv_pair) {
+            if(fast_same_weights_fp16kv_m1_kv_wide_pair_)
+                linear_workspaces_[1]->forward_target_m1_kv_wide_pair_for_test(
+                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
+                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
+            else linear_workspaces_[1]->forward_target_m1_kv_pair_for_test(
+                    *linear_workspaces_[2],weights_.k,weights_.k_metadata,
+                    weights_.v,weights_.v_metadata,input_norm,kp,vp,stream);
+            launch(cudaGetLastError(),"launch EXL3 paired K/V projection");
+            ++fast_same_weights_fp16kv_m1_kv_pair_submissions_;
+        } else {
+            const bool shared_k=can_share_target && target_kv_executor_enabled_ &&
+                target_shared_admission(Exl3TargetSharedFamily::k,weights_.k_metadata).has_value() &&
+                target_q_executor_(Exl3TargetQContinuation{weights_.k,weights_.k_metadata,
+                    input_norm,kp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::k});
+            if(!shared_k)project(linear_workspaces_[1],weights_.k,weights_.k_metadata,input_norm,kp,
+                Exl3TargetProjectionOperator::k);
+            launch(cudaGetLastError(),"launch EXL3 K projection");
+        }
+        end(2);
+        begin(3);
+        if(!m1_kv_pair && !merged_kv) {
+            const bool shared_v=can_share_target && target_kv_executor_enabled_ &&
+                target_shared_admission(Exl3TargetSharedFamily::v,weights_.v_metadata).has_value() &&
+                target_q_executor_(Exl3TargetQContinuation{weights_.v,weights_.v_metadata,
+                    input_norm,vp,rows,position,model_layer_,stream,Exl3TargetSharedFamily::v});
+            if(!shared_v)project(linear_workspaces_[2],weights_.v,weights_.v_metadata,input_norm,vp,
+                Exl3TargetProjectionOperator::v);
+            launch(cudaGetLastError(),"launch EXL3 V projection");
+        }
+        end(3);
+    }
+
+    const bool fork_peers=batch_ && batch_->fork_event;
+    if(fork_peers)cuda_check(cudaEventRecord(batch_->fork_event,stream),"attention batched peer fork");
+    if(batch_) {
+        int first=own_rows;
+        for(int i=0;i<batch_->peer_count;++i) {
+            const auto& peer=batch_->peers[static_cast<std::size_t>(i)];
+            const auto row=static_cast<std::size_t>(first);
+            const cudaStream_t launch=fork_peers?batch_->fork_streams[static_cast<std::size_t>(i)]:stream;
+            if(fork_peers)cuda_check(cudaStreamWaitEvent(launch,batch_->fork_event,0),"attention peer waits fork");
+            peer.layer->run_peer_segment(
+                qg+row*weights_.q_metadata.out_features,
+                kp+row*weights_.k_metadata.out_features,
+                vp+row*weights_.v_metadata.out_features,
+                attn+row*kQHeads*kHeadDim,peer.rows,peer.position,launch,
+                peer.stream?peer.stream:stream,preserve_m1_topology,batch_->peer_count+1);
+            if(fork_peers)cuda_check(cudaEventRecord(batch_->join_events[static_cast<std::size_t>(i)],launch),
+                "attention peer join");
+            first+=peer.rows;
+        }
+        if(first!=rows)throw std::logic_error("full-attention batched segment rows");
+    }
+    // L0 history lanes: the agents sharing this forward's INT4 history pass.
+    // A folded exact line attends exactly (no INT4 history, no hot rows), so
+    // a fold round keeps the lone agent's layout (its hot candidates feed
+    // the next, unbatched round).
+    history_lanes_=1;
+    if(batch_)
+        for(int i=0;i<batch_->peer_count;++i)
+            if(!batch_->peers[static_cast<std::size_t>(i)].layer->l0_exact_only_)++history_lanes_;
+    attention_middle(AttentionMiddle{input_norm,qg,kp,vp,qn,kn,qr,kr,attn,gp,own_rows,position,stream,
+        profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix,starts,ends});
+    history_lanes_=1;
+    if(fork_peers)
+        for(int i=0;i<batch_->peer_count;++i)
+            cuda_check(cudaStreamWaitEvent(stream,batch_->join_events[static_cast<std::size_t>(i)],0),
+                "attention owner joins peer");
 
     prefetch_weights(4,weights_.gate.trellis);
     begin(7);
@@ -9829,7 +10653,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::o,weights_.o_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.o,weights_.o_metadata,
             attn,op,rows,position,model_layer_,stream,Exl3TargetSharedFamily::o});
-    if(!shared_o && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+    if(!shared_o && rows>=1 && rows<=fused_rows && !profile && !projection_timing_ &&
        !projection_observer_)
         linear_workspaces_[3]->arm_residual(input,post_resid);
     if(!shared_o)project(linear_workspaces_[3], weights_.o, weights_.o_metadata, attn, op,
@@ -9921,8 +10745,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
             !projection_timing_ && !projection_observer_ && !wide_prefill &&
             !preserve_m1_topology && rows==1 && linear_workspaces_[4] &&
             linear_workspaces_[5] &&
-            (weights_.gate_metadata.K==5 || weights_.gate_metadata.K==6 ||
-             weights_.gate_metadata.K==7) &&
+            weights_.gate_metadata.K>=4 && weights_.gate_metadata.K<=7 &&
             weights_.up_metadata.K==weights_.gate_metadata.K;
         if(paired_m1_gate_up) {
             linear_workspaces_[4]->forward_target_m1_gate_up_pair_for_test(
@@ -9930,7 +10753,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,stream);
             ++fast_same_weights_fp16kv_m1_gate_up_pair_submissions_;
         }
-        merged_gate_up=!paired_m1_gate_up && rows>=1 && rows<=8 && !can_share_target &&
+        merged_gate_up=!paired_m1_gate_up && rows>=1 && rows<=fused_rows && !can_share_target &&
             !oscar_ && !profile && !projection_timing_ && !projection_observer_ &&
             !wide_prefill && !small_m_fused_gate_up_transform_ &&
             linear_workspaces_[4]->forward_merged_gate_up_silu(*linear_workspaces_[5],
@@ -9938,12 +10761,18 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 mlp_in,gp,up,act,rows,stream,
                 target_down_executor_enabled_?nullptr:&weights_.down,
                 target_down_executor_enabled_?nullptr:linear_workspaces_[6]);
-        const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
-            !profile && !projection_timing_ &&
+        // Batched rounds of 3-4 agents: gate and up in one M32 launch.
+        const bool m32_gate_up=!paired_m1_gate_up && !merged_gate_up && !can_share_target &&
+            rows>16 && rows<=32 && !profile && !projection_timing_ && !projection_observer_ &&
+            !wide_prefill && linear_workspaces_[4]->forward_merged_pair_m32(*linear_workspaces_[5],
+                weights_.gate,weights_.gate_metadata,gp,weights_.up,weights_.up_metadata,up,
+                mlp_in,rows,stream);
+        const bool paired_gate_up=!paired_m1_gate_up && !merged_gate_up && !m32_gate_up &&
+            !can_share_target && !profile && !projection_timing_ &&
             !projection_observer_ && linear_workspaces_[4]->forward_target_prefill_gate_up_pair(
                 *linear_workspaces_[5],weights_.gate,weights_.gate_metadata,
                 weights_.up,weights_.up_metadata,mlp_in,gp,up,rows,stream);
-        const bool shared_gate=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
+        const bool shared_gate=paired_m1_gate_up || merged_gate_up || paired_gate_up || m32_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::gate,weights_.gate_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.gate,weights_.gate_metadata,
@@ -9952,7 +10781,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
                 Exl3TargetProjectionOperator::gate);
         launch(cudaGetLastError(), "launch EXL3 gate projection"); end(9);
         begin(10);
-        const bool shared_up=paired_m1_gate_up || merged_gate_up || paired_gate_up ||
+        const bool shared_up=paired_m1_gate_up || merged_gate_up || paired_gate_up || m32_gate_up ||
             (can_share_target && target_gateup_executor_enabled_ &&
             target_shared_admission(Exl3TargetSharedFamily::up,weights_.up_metadata).has_value() &&
             target_q_executor_(Exl3TargetQContinuation{weights_.up,weights_.up_metadata,
@@ -9988,7 +10817,7 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         target_shared_admission(Exl3TargetSharedFamily::down,weights_.down_metadata).has_value() &&
         target_q_executor_(Exl3TargetQContinuation{weights_.down,weights_.down_metadata,
             act,down,rows,position,model_layer_,stream,Exl3TargetSharedFamily::down});
-    if(!shared_down && rows>=1 && rows<=8 && !profile && !projection_timing_ &&
+    if(!shared_down && rows>=1 && rows<=fused_rows && !profile && !projection_timing_ &&
        !projection_observer_)
         linear_workspaces_[6]->arm_residual(post_resid,output);
     if(!shared_down)project(linear_workspaces_[6], weights_.down, weights_.down_metadata, act, down,
@@ -10028,10 +10857,81 @@ void Exl3FullAttentionLayer::forward(const std::uint16_t* input,
         mlp_in, gp, up, act, down, output};
     if (eligible_retained_prefix) {
         retained_prefix_available_ = true;
-        retained_prefix_rows_ = rows;
+        retained_prefix_rows_ = own_rows;
         retained_prefix_position_ = position;
         retained_prefix_stream_ = stream;
     }
 }
 
-} // namespace ninfer::exl3
+// A peer agent's rows of a batched forward: the owner's Q/K/V projections are
+// copied into this layer's own buffers, this layer's cache and positions run
+// the stateful core exactly as its own forward would, and the gated attention
+// output returns to the owner's O-projection input.
+void Exl3FullAttentionLayer::copy_l0_window_from(const Exl3FullAttentionLayer& source,
+    cudaStream_t stream,bool aging_state) {
+    if(!l0_.k_ring || !source.l0_.k_ring || l0_ring_rows_!=source.l0_ring_rows_)
+        throw std::invalid_argument("L0 exact line window copy needs equal L0 rings");
+    const std::size_t ring=static_cast<std::size_t>(l0_ring_rows_)*kKVHeads*kHeadDim*sizeof(std::uint16_t);
+    const std::size_t sink=static_cast<std::size_t>(l0_oscar::kSink)*kKVHeads*kHeadDim*sizeof(std::uint16_t);
+    cuda_check(cudaMemcpyAsync(l0_.k_ring,source.l0_.k_ring,ring,cudaMemcpyDeviceToDevice,stream),"L0 line ring");
+    cuda_check(cudaMemcpyAsync(l0_.v_ring,source.l0_.v_ring,ring,cudaMemcpyDeviceToDevice,stream),"L0 line ring");
+    cuda_check(cudaMemcpyAsync(l0_.k_sink,source.l0_.k_sink,sink,cudaMemcpyDeviceToDevice,stream),"L0 line sink");
+    cuda_check(cudaMemcpyAsync(l0_.v_sink,source.l0_.v_sink,sink,cudaMemcpyDeviceToDevice,stream),"L0 line sink");
+    if(aging_state)
+        cuda_check(cudaMemcpyAsync(l0_.state,source.l0_.state,2*sizeof(int),cudaMemcpyDeviceToDevice,stream),
+            "L0 line state");
+    invalidate_retained_prefix();
+}
+
+void Exl3FullAttentionLayer::run_peer_segment(const std::uint16_t* qg_source,
+    const std::uint16_t* kp_source,const std::uint16_t* vp_source,std::uint16_t* attn_destination,
+    int rows,int position,cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology,
+    int lanes) {
+    if(rows<1 || rows>max_rows_ || position<0)
+        throw std::invalid_argument("full-attention peer segment rows/position");
+    struct LanesScope { int& value; LanesScope(int& v,int lanes):value(v){value=lanes;} ~LanesScope(){value=1;} }
+        lanes_scope(history_lanes_,lanes);
+    require_tier_rows(rows);
+    retained_prefix_available_ = false;
+    retained_prefix_cleared_by_ = "peer segment";
+    retained_prefix_cleared_rows_ = rows;
+    bool eligible_retained_prefix = preserve_m1_topology && rows >= 2 && rows <= 8 &&
+        ((oscar_ != nullptr && oscar_->graph_class() == 0) ||
+         (oscar_ == nullptr && k_cache_ != nullptr && v_cache_ != nullptr)) &&
+        !capture_active_;
+    if (eligible_retained_prefix) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture_status),
+                   "query EXL3 full-attention peer retained-prefix capture");
+        eligible_retained_prefix = capture_status == cudaStreamCaptureStatusNone;
+    }
+    const auto n=static_cast<std::size_t>(rows);
+    // One copy launch each way (separate copy nodes add latency ahead of
+    // every peer core in the captured batched forward).
+    Exl3SegmentCopies in;
+    in.add(buffers_[1],qg_source,n*weights_.q_metadata.out_features*sizeof(std::uint16_t));
+    in.add(buffers_[2],kp_source,n*weights_.k_metadata.out_features*sizeof(std::uint16_t));
+    in.add(buffers_[3],vp_source,n*weights_.v_metadata.out_features*sizeof(std::uint16_t));
+    cuda_check(exl3_launch_segment_copies(in,stream),"full-attention peer inputs");
+    attention_middle(AttentionMiddle{buffers_[0],buffers_[1],buffers_[2],buffers_[3],buffers_[4],
+        buffers_[5],buffers_[6],buffers_[7],buffers_[8],buffers_[12],rows,position,stream,
+        false,preserve_m1_topology,false,eligible_retained_prefix,nullptr,nullptr});
+    Exl3SegmentCopies out;
+    out.add(attn_destination,buffers_[8],n*kQHeads*kHeadDim*sizeof(std::uint16_t));
+    cuda_check(exl3_launch_segment_copies(out,stream),"full-attention peer output");
+    if (eligible_retained_prefix) {
+        retained_prefix_available_ = true;
+        retained_prefix_rows_ = rows;
+        retained_prefix_position_ = position;
+        retained_prefix_stream_ = state_stream;
+    }
+}
+
+} // namespace voidinfer::exl3
+
+namespace voidinfer::exl3::l0_oscar {
+RotationView rotation_view() {
+    const auto& a = assets();
+    return {a.rk, a.rv, a.mu};
+}
+}  // namespace voidinfer::exl3::l0_oscar

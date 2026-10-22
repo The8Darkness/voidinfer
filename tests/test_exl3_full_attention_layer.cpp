@@ -23,17 +23,17 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::exl3::Exl3CudaLinearMetadata;
-using ninfer::exl3::Exl3CudaLinearWorkspace;
-using ninfer::exl3::Exl3CudaLinearWeights;
-using ninfer::exl3::Exl3FullAttentionLayer;
-using ninfer::exl3::Exl3FullAttentionLayerTrace;
-using ninfer::exl3::Exl3FullAttentionLayerTimings;
-using ninfer::exl3::Exl3FullAttentionLayerWeights;
-using ninfer::exl3::Exl3LayerBufferRetirement;
-using ninfer::exl3::IndexedSafetensors;
-using ninfer::exl3::SafetensorsHeader;
-using ninfer::exl3::TensorPayload;
+using voidinfer::exl3::Exl3CudaLinearMetadata;
+using voidinfer::exl3::Exl3CudaLinearWorkspace;
+using voidinfer::exl3::Exl3CudaLinearWeights;
+using voidinfer::exl3::Exl3FullAttentionLayer;
+using voidinfer::exl3::Exl3FullAttentionLayerTrace;
+using voidinfer::exl3::Exl3FullAttentionLayerTimings;
+using voidinfer::exl3::Exl3FullAttentionLayerWeights;
+using voidinfer::exl3::Exl3LayerBufferRetirement;
+using voidinfer::exl3::IndexedSafetensors;
+using voidinfer::exl3::SafetensorsHeader;
+using voidinfer::exl3::TensorPayload;
 
 constexpr int kHidden = 5120;
 constexpr int kQProjection = 12288;
@@ -80,7 +80,7 @@ std::unique_ptr<DeviceBuffer> upload(std::span<const std::byte> bytes, const cha
 TensorPayload load_indexed_tensor(const IndexedSafetensors& collection,
                                   const std::string& name) {
     for (const auto& shard : collection.shards) {
-        if (shard.header.find(name) != nullptr) return ninfer::exl3::read_tensor(shard.path, shard.header, name);
+        if (shard.header.find(name) != nullptr) return voidinfer::exl3::read_tensor(shard.path, shard.header, name);
     }
     throw std::runtime_error("indexed tensor is absent: " + name);
 }
@@ -268,8 +268,8 @@ void compare_trace(const Exl3FullAttentionLayerTrace& trace,
     for (const auto& stage : stages(trace, tag)) {
         const auto* info = fixture.find(stage.fixture);
         require(info != nullptr, std::string("fixture stage missing: ") + stage.fixture);
-        const auto expected = ninfer::exl3::read_tensor(
-            std::filesystem::path(env_or_empty("NINFER_EXL3_ORACLE_PATH")), fixture, stage.fixture);
+        const auto expected = voidinfer::exl3::read_tensor(
+            std::filesystem::path(env_or_empty("VOIDINFER_EXL3_ORACLE_PATH")), fixture, stage.fixture);
         const auto expected_values = tensor_as_f16(expected);
         std::vector<std::uint16_t> actual(expected_values.size());
         cuda_check(cudaMemcpy(actual.data(), stage.actual, actual.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
@@ -319,14 +319,14 @@ int main() {
             catch(const std::invalid_argument&){refused=true;}
             require(refused,"full-attention requirement accepted unsupported rows");
         }
-        const auto target_path = env_or_empty("NINFER_EXL3_TARGET_PATH");
-        const auto fixture_path = env_or_empty("NINFER_EXL3_ORACLE_PATH");
+        const auto target_path = env_or_empty("VOIDINFER_EXL3_TARGET_PATH");
+        const auto fixture_path = env_or_empty("VOIDINFER_EXL3_ORACLE_PATH");
         if (target_path.empty() || fixture_path.empty()) {
-            std::cerr << "E3A skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n";
+            std::cerr << "E3A skipped: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_ORACLE_PATH\n";
             return 77;
         }
-        const auto collection = ninfer::exl3::inspect_indexed_directory(target_path);
-        const auto fixture = ninfer::exl3::inspect_file(fixture_path);
+        const auto collection = voidinfer::exl3::inspect_indexed_directory(target_path);
+        const auto fixture = voidinfer::exl3::inspect_file(fixture_path);
         std::vector<std::unique_ptr<DeviceBuffer>> device;
         const std::string base = "model.language_model.layers.19.";
         auto q = make_linear(collection, base + "self_attn.q_proj", kHidden, kQProjection, device);
@@ -356,8 +356,8 @@ int main() {
         weights.k_norm = load_norm(base + "self_attn.k_norm.weight");
         weights.post_attention_norm = load_norm(base + "post_attention_layernorm.weight");
 
-        if(const auto* mode=std::getenv("NINFER_TEST_ATTENTION_COALESCED_PARITY");mode && std::string_view(mode)=="1") {
-            const auto tensor=ninfer::exl3::read_tensor(fixture_path,fixture,"prefill14_layer_output_input");
+        if(const auto* mode=std::getenv("VOIDINFER_TEST_ATTENTION_COALESCED_PARITY");mode && std::string_view(mode)=="1") {
+            const auto tensor=voidinfer::exl3::read_tensor(fixture_path,fixture,"prefill14_layer_output_input");
             const auto original=tensor_as_f16(tensor);
             std::vector<std::uint16_t> input(16u*kHidden);
             for(std::size_t i=0;i<input.size();++i)input[i]=original[i%original.size()];
@@ -368,7 +368,7 @@ int main() {
             cuda_check(cudaMemcpy(in.ptr,input.data(),input.size()*2,cudaMemcpyHostToDevice),"coalesced input upload");
             for(bool shared:{false,true}) {
                 DeviceBuffer control_scratch,candidate_scratch;
-                ninfer::exl3::Exl3CudaLayerScratchView a{},b{};
+                voidinfer::exl3::Exl3CudaLayerScratchView a{},b{};
                 if(shared) {
                     a.bytes=Exl3FullAttentionLayer::shared_scratch_bytes(16);
                     b.bytes=Exl3FullAttentionLayer::shared_scratch_bytes(16,true);
@@ -432,12 +432,12 @@ int main() {
             return 0; // Prepared parity mode excludes the historical timing loop.
         }
         Exl3FullAttentionLayer layer(weights, 14);
-        if(const auto* mode=std::getenv("NINFER_TEST_ATTENTION_PAGE_BINDING");mode && std::string_view(mode)=="1") {
+        if(const auto* mode=std::getenv("VOIDINFER_TEST_ATTENTION_PAGE_BINDING");mode && std::string_view(mode)=="1") {
             // Identity/geometry-only sentinels. No forward or device access uses them.
             std::uint16_t key=0,value=0;float scores=0;
             layer.set_kv_cache(&key,&value,128);layer.set_exact_attention_scores(&scores,14);
             require(layer.supports_segmented_exact_prefix(),"page binding profile NOT_EXERCISED");
-            ninfer::exl3::Exl3AttentionPageRanges original;
+            voidinfer::exl3::Exl3AttentionPageRanges original;
             original.append(&key,&value,0,64,64);
             layer.set_segmented_exact_pages(original,64);
             int rotary[3]{},other_rotary[3]{};
@@ -455,7 +455,7 @@ int main() {
             }
             for(int position:{-1,129})for(bool empty:{false,true}) {
                 bool rejected=false;
-                try{layer.set_segmented_exact_pages(empty?ninfer::exl3::Exl3AttentionPageRanges{}:original,position);}
+                try{layer.set_segmented_exact_pages(empty?voidinfer::exl3::Exl3AttentionPageRanges{}:original,position);}
                 catch(const std::invalid_argument&){rejected=true;}
                 const auto preserved=layer.segmented_pages_for_test();
                 require(rejected && preserved.count==1 && preserved.ranges[0].k==&key &&
@@ -466,7 +466,7 @@ int main() {
             require(layer.segmented_pages_for_test().count==0,"valid page binding reset failed after refusal");
             layer.set_exact_attention_scores(nullptr,0);layer.set_kv_cache(nullptr,nullptr,0);
             layer.set_mrope_positions(nullptr,0);
-            const auto fixture_input=tensor_as_f16(ninfer::exl3::read_tensor(
+            const auto fixture_input=tensor_as_f16(voidinfer::exl3::read_tensor(
                 fixture_path,fixture,"prefill14_layer_output_input"));
             Exl3FullAttentionLayer clean(weights,14);
             DeviceBuffer input,actual,expected;
@@ -490,7 +490,7 @@ int main() {
                 const auto& baseline=control_stages[index];const auto& recovered=recovered_stages[index];
                 require(baseline.actual && recovered.actual && baseline.fixture==recovered.fixture,
                     "binding recovery missing/misaligned intermediate");
-                const auto shape=tensor_as_f16(ninfer::exl3::read_tensor(fixture_path,fixture,baseline.fixture));
+                const auto shape=tensor_as_f16(voidinfer::exl3::read_tensor(fixture_path,fixture,baseline.fixture));
                 std::vector<std::uint16_t> a(shape.size()),b(shape.size());
                 cuda_check(cudaMemcpy(a.data(),baseline.actual,a.size()*2,cudaMemcpyDeviceToHost),"binding recovery stage control");
                 cuda_check(cudaMemcpy(b.data(),recovered.actual,b.size()*2,cudaMemcpyDeviceToHost),"binding recovery stage actual");
@@ -522,7 +522,7 @@ int main() {
         require(layer.workspace_bytes()==14ull*(49152ull*2+59392ull*5*4+117760ull*2),
             "independent full-attention actual allocation ledger");
         std::vector<Metrics> prefill_metrics;
-        const auto prefill_input = ninfer::exl3::read_tensor(fixture_path, fixture, "prefill14_layer_output_input");
+        const auto prefill_input = voidinfer::exl3::read_tensor(fixture_path, fixture, "prefill14_layer_output_input");
         const auto prefill_values = tensor_as_f16(prefill_input);
         DeviceBuffer input_device, output_device;
         cuda_check(cudaMalloc(&input_device.ptr, prefill_values.size() * sizeof(std::uint16_t)), "allocate E3A prefill input");
@@ -533,7 +533,7 @@ int main() {
         compare_trace(layer.trace(), fixture, "prefill14", prefill_metrics);
 
         std::vector<Metrics> m1_metrics;
-        const auto m1_input = ninfer::exl3::read_tensor(fixture_path, fixture, "m1_layer_output_input");
+        const auto m1_input = voidinfer::exl3::read_tensor(fixture_path, fixture, "m1_layer_output_input");
         const auto m1_values = tensor_as_f16(m1_input);
         cuda_check(cudaMemcpy(input_device.ptr, m1_values.data(), m1_values.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice), "upload E3A M=1 input");
         layer.forward(static_cast<const std::uint16_t*>(input_device.ptr), static_cast<std::uint16_t*>(output_device.ptr), 1, 0);

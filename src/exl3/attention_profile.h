@@ -6,7 +6,7 @@
 #include <limits>
 #include <string>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 enum class Exl3SegmentedAttentionRoute {inherited,scalar,q_shared,gqa_pair,query_pair};
 inline constexpr Exl3SegmentedAttentionRoute exl3_segmented_attention_route(
     bool supported,bool ordinary_fp16,int rows,int position,int offset,int capacity,
@@ -23,35 +23,35 @@ inline constexpr Exl3SegmentedAttentionRoute exl3_segmented_attention_route(
 // L0 OSCAR contexts keep only the sink and the recent window exact: verifier
 // segments cover at most this many keys past the history (l0_oscar.cuh).
 constexpr int kExl3L0ExactWindowKeys=2048;
-// L0 OSCAR (INT2 KV history in VRAM with exact hot rows, FP16 planes in mapped
-// host memory) is the default KV tier: NINFER_EXL3_L0_OSCAR unset or 1
+// L0 OSCAR (INT4 KV history in VRAM with exact hot rows, FP16 planes in mapped
+// host memory) is the default KV tier: VOIDINFER_EXL3_L0_OSCAR unset or 1
 // enables it, 0 selects ordinary FP16 device KV.
 inline bool exl3_l0_oscar_enabled() {
-    const char* value=std::getenv("NINFER_EXL3_L0_OSCAR");
+    const char* value=std::getenv("VOIDINFER_EXL3_L0_OSCAR");
     if(!value || !*value || std::strcmp(value,"1")==0) return true;
     if(std::strcmp(value,"0")==0) return false;
-    throw std::invalid_argument("NINFER_EXL3_L0_OSCAR must be 0 or 1");
+    throw std::invalid_argument("VOIDINFER_EXL3_L0_OSCAR must be 0 or 1");
 }
 // Exact recent window of L0 OSCAR contexts in committed rows
-// (NINFER_EXL3_L0_RECENT, 0..960 in steps of 64, default 960; the 2048-row device ring
+// (VOIDINFER_EXL3_L0_RECENT, 0..960 in steps of 64, default 960; the 2048-row device ring
 // also holds the 64-row alignment tail and a 1024-row prefill chunk). 0 keeps only
 // the 64-token sink and the current 64-row tail exact on the device; the rest
-// of the history is INT2 (pure OSCAR, e.g. under VeriCache verification).
+// of the history is INT4 (pure OSCAR, e.g. under VeriCache verification).
 
 inline int exl3_l0_recent_rows() {
     static const int value=[] {
-        const char* v=std::getenv("NINFER_EXL3_L0_RECENT");
+        const char* v=std::getenv("VOIDINFER_EXL3_L0_RECENT");
         if(!v || !*v) return 960;
         char* end=nullptr;
         const long rows=std::strtol(v,&end,10);
         if(*end || rows<0 || rows>960 || rows%64)
-            throw std::invalid_argument("NINFER_EXL3_L0_RECENT must be 0..960 in steps of 64");
+            throw std::invalid_argument("VOIDINFER_EXL3_L0_RECENT must be 0..960 in steps of 64");
         return static_cast<int>(rows);
     }();
     return value;
 }
 // Rotation assets of the loaded target (<model directory>/l0_oscar), used
-// unless NINFER_EXL3_L0_OSCAR_ROT names another directory.
+// unless VOIDINFER_EXL3_L0_OSCAR_ROT names another directory.
 inline std::string& exl3_l0_oscar_model_assets() {
     static std::string directory;
     return directory;

@@ -1,4 +1,4 @@
-function(ninfer_internal_includes target)
+function(voidinfer_internal_includes target)
   target_include_directories(${target} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
@@ -6,7 +6,7 @@ function(ninfer_internal_includes target)
     ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
 endfunction()
 
-function(ninfer_cuda_archive target)
+function(voidinfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -17,410 +17,173 @@ function(ninfer_cuda_archive target)
 endfunction()
 
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
-add_library(ninfer_core STATIC
+add_library(voidinfer_core STATIC
   core/arena.cu
   core/device.cu
   core/dtype.cpp
   core/host_worker_pool.cpp
-  core/gdn_replay_records.cpp
-  core/cyclic_kv_cache.cpp
   core/host_kv_arena.cpp
   core/paged_kv_cache.cpp
-  core/oscar_mixed_cache_layout.cpp
-  core/oscar_mixed_state_transitions.cpp
-  core/oscar_mixed_attention_reference.cpp
-  core/linear_attention_state.cpp
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp
-  runtime/engine/admission_policy.cpp
-  runtime/engine/context_cost.cpp
-  runtime/engine/context_cost_defaults.cpp
-  runtime/engine/kv_capacity.cpp
   runtime/engine/public_types.cpp)
-ninfer_internal_includes(ninfer_core)
-ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)
+voidinfer_internal_includes(voidinfer_core)
+voidinfer_cuda_archive(voidinfer_core)
+target_link_libraries(voidinfer_core PUBLIC ${VOIDINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)
 
-# Generic .ninfer framing, binding, and direct final materialization.
-add_library(ninfer_artifact STATIC
-  artifact/reader.cpp
-  artifact/storage_layouts.cpp
-  artifact/binder.cpp
-  artifact/materializer.cpp
-  artifact/typed_binding.cpp)
-ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
-
-# Read-only native safetensors framing inspection for the isolated EXL3 bring-up.
-# This library deliberately has no model registration, tensor materialization, or CUDA
-# EXL3 compute path; the qualified .ninfer route remains the production boundary.
-add_library(ninfer_exl3_format STATIC
+# Safetensors framing, dual-mirror reads, the host EXL3 reference linear and the engine profile. No CUDA.
+add_library(voidinfer_exl3_format STATIC
+  exl3/engine_profile.cpp
   exl3/safetensors.cpp
-  exl3/linear_reference.cpp
-  exl3/mtp_manifest.cpp)
-ninfer_internal_includes(ninfer_exl3_format)
+  exl3/linear_reference.cpp)
+voidinfer_internal_includes(voidinfer_exl3_format)
 
 # Isolated E2B native CUDA leaf. This target is intentionally separate from both the
 # qualified NVFP4/OSCAR route and the E2 CPU/reference implementation.
-add_library(ninfer_exl3_cuda STATIC
+add_library(voidinfer_exl3_cuda STATIC
   exl3/linear_cuda.cu
-  exl3/mtp_runner.cu
   exl3/prefill_attention_chain_graph.cu
   exl3/prefill_projection_chain_graph.cu
   exl3/target_projection_timing.cu
   exl3/full_attention_layer.cu)
-add_library(ninfer_exl3_oscar STATIC
+add_library(voidinfer_exl3_oscar STATIC
   exl3/oscar_runtime.cu)
-ninfer_internal_includes(ninfer_exl3_oscar)
-ninfer_cuda_archive(ninfer_exl3_oscar)
-target_link_libraries(ninfer_exl3_oscar PUBLIC ninfer_ops ${NINFER_CUDART_TARGET})
-ninfer_internal_includes(ninfer_exl3_cuda)
-ninfer_cuda_archive(ninfer_exl3_cuda)
-target_include_directories(ninfer_exl3_cuda PUBLIC
+voidinfer_internal_includes(voidinfer_exl3_oscar)
+voidinfer_cuda_archive(voidinfer_exl3_oscar)
+target_link_libraries(voidinfer_exl3_oscar PUBLIC voidinfer_ops ${VOIDINFER_CUDART_TARGET})
+voidinfer_internal_includes(voidinfer_exl3_cuda)
+voidinfer_cuda_archive(voidinfer_exl3_cuda)
+target_include_directories(voidinfer_exl3_cuda PUBLIC
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_exl3_cuda PUBLIC ninfer_exl3_oscar ${NINFER_CUDART_TARGET}
-  PRIVATE CUDA::cublas CUDA::cublasLt)
-
-# The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
-# producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
-# discard that contract, so this self-contained kernel is intentionally compiled in a
-# non-RDC archive and called through a host launcher from ninfer_ops.
-add_library(ninfer_nvfp4_tma STATIC
-  ops/linear/nvfp4/nvfp4_w4a4_tma.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
-ninfer_internal_includes(ninfer_nvfp4_tma)
-set_target_properties(ninfer_nvfp4_tma PROPERTIES
-  CUDA_SEPARABLE_COMPILATION OFF
-  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
+target_link_libraries(voidinfer_exl3_cuda PUBLIC voidinfer_exl3_oscar ${VOIDINFER_CUDART_TARGET}
+  PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cuda_driver)
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
-add_library(ninfer_ops STATIC
+add_library(voidinfer_ops STATIC
   ops/launcher/add_bias.cu
-  ops/launcher/argmax.cu
-  ops/launcher/cast.cu
-  ops/launcher/causal_conv1d.cu
-  ops/launcher/dflash2_dynamic_conv.cu
-  ops/launcher/dflash2_qkv_proj.cu
-  ops/launcher/dflash2_predecessor_ids.cu
-  ops/launcher/dflash2_selector_lattice.cu
-  ops/launcher/embed_gather.cu
-  ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
-  ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
-  ops/launcher/mtp_pack.cu
-  ops/launcher/mtp_round.cu
-  ops/launcher/speculative_round.cu
-  ops/launcher/position.cu
-  ops/launcher/prepare_ragged_prefix.cu
-  ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
   ops/launcher/rope.cu
-  ops/launcher/sampling.cu
-  ops/launcher/scalar.cu
-  ops/launcher/scatter.cu
-  ops/launcher/sigmoid_gate_mul.cu
-  ops/launcher/silu_and_mul.cu
   ops/launcher/vision_pos_embed.cu
-  # Softmax Attention and KV-cache state transitions.
-  ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
-  ops/softmax_attention/dense/causal_cache/small_t.cu
-  ops/softmax_attention/dense/causal_cache/small_t_fp8.cu
-  ops/softmax_attention/dense/causal_cache/nvfp4.cu
-  ops/softmax_attention/dense/causal_cache/prompt.cu
-  ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
   ops/softmax_attention/dense/packed/packed_softmax_attention.cpp
   ops/softmax_attention/dense/packed/launch.cu
-  ops/softmax_attention/dense/context/context_softmax_attention.cpp
-  ops/softmax_attention/dense/context/launch.cu
   ops/softmax_attention/oscar_mixed/launch.cu
   ops/softmax_attention/oscar_history/launch.cu
-  ops/softmax_attention/sliding_window/sliding_window_attention.cpp
-  ops/softmax_attention/sliding_window/launch.cu
-  ops/kv_cache/append/kv_cache_append.cpp
-  ops/kv_cache/append/launch.cu
   ops/kv_cache/oscar_int2_g128.cpp
   ops/kv_cache/oscar_conversion.cu
-  # Gated DeltaNet Linear Attention core.
-  ops/linear_attention/gated_delta_net/gated_delta_net.cpp
-  ops/linear_attention/gated_delta_net/replay.cpp
-  ops/linear_attention/gated_delta_net/recurrent.cu
-  ops/linear_attention/gated_delta_net/chunked/launch.cu
-  ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
-  ops/linear_attention/gated_delta_net/chunked/state_passing.cu
-  ops/linear_attention/gated_delta_net/chunked/output.cu
-  ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
-  ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
-  ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
-  ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
-  ops/attn_input_proj/fp8/fp8_attn_input_decode.cu
-  ops/attn_input_proj/fp8/fp8_attn_input_small_t.cu
-  ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
-  ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
-  ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
-  ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
-  ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
-  ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
-  ops/attn_input_proj/w8/w8_attn_input_decode.cu
-  ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu
-  ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
-  ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
-  ops/attn_input_proj/w8/w8_attn_input_plan.cpp
-  ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
-  ops/gdn_input_proj/fp8/fp8_gdn_input_small_t.cu
-  ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu
-  ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
-  ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
-  ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
-  ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
-  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
-  ops/gdn_input_proj/gdn_projected_conv.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu
-  ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
-  ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
-  ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
-  ops/linear/bf16/bf16_gemv.cu
-  ops/linear/bf16/bf16_gemm_mma.cu
-  ops/linear/bf16/bf16_small_t.cu
-  ops/linear/bf16/bf16_dispatch.cpp
-  ops/linear/fp8/fp8_format.cpp
-  ops/linear/fp8/fp8_gemv.cu
-  ops/linear/fp8/fp8_small_t.cu
-  ops/linear/fp8/fp8_a16_mma.cu
-  ops/linear/fp8/fp8_a16_gemm_mma.cu
-  ops/linear/fp8/fp8_a8.cu
-  ops/linear/fp8/fp8_dispatch.cpp
-  ops/linear/nvfp4/nvfp4_format.cpp
-  ops/linear/nvfp4/nvfp4_gemv.cu
-  ops/linear/nvfp4/nvfp4_small_t.cu
-  ops/linear/nvfp4/nvfp4_w4a4.cu
-  ops/linear/nvfp4/nvfp4_dispatch.cpp
-  ops/linear/q4/q4_small_t_mma.cu
-  ops/linear/q4/q4_rowsplit_gemm_mma.cu
-  ops/linear/q4/q4_rowsplit_gemm_simt.cu
-  ops/linear/q4/q4_rowsplit_gemv.cu
-  ops/linear/q4/q4_dispatch.cpp
-  ops/linear/q5/q5_dispatch.cpp
-  ops/linear/q5/q5_rowsplit_gemm_mma.cu
-  ops/linear/q5/q5_rowsplit_gemm_simt.cu
-  ops/linear/q5/q5_rowsplit_gemv.cu
-  ops/linear_add/bf16/bf16_linear_add_decode.cu
-  ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
-  ops/linear_add/bf16/bf16_linear_add_small_t.cu
-  ops/linear_add/bf16/bf16_linear_add_plan.cpp
-  ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
-  ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
-  ops/linear_add/fp8/fp8_linear_add_decode.cu
-  ops/linear_add/fp8/fp8_linear_add_small_t.cu
-  ops/linear_add/fp8/fp8_linear_add_a8.cu
-  ops/linear_add/fp8/fp8_linear_add_plan.cpp
-  ops/linear_add/q5/q5_linear_add_gemm_mma.cu
-  ops/linear_add/q5/q5_linear_add_gemm_simt.cu
-  ops/linear_add/q5/q5_linear_add_gemv.cu
-  ops/linear_add/q5/q5_linear_add_plan.cpp
-  ops/linear_add/w8/w8_linear_add_gemm_mma.cu
-  ops/linear_add/w8/w8_linear_add_gemm_simt.cu
-  ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
-  ops/linear_add/w8/w8_linear_add_plan.cpp
-  ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
-  ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
-  ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
-  ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
-  ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
-  ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
-  ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.cpp
-  ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
-  ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
-  ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
-  ops/linear_swiglu/w8/w8_linear_swiglu_plan.cpp
-  ops/linear/q6/q6_dispatch.cpp
-  ops/linear/q6/q6_rowsplit_gemm_mma.cu
-  ops/linear/q6/q6_rowsplit_gemm_simt.cu
-  ops/linear/w8/w8_rowsplit_gemm_mma.cu
-  ops/linear/w8/w8_rowsplit_gemm_simt.cu
-  ops/linear/w8/w8_rowsplit_gemm_decode.cu
-  ops/linear/w8/w8_small_t.cu
-  ops/linear/w8/w8_rowsplit_gemm_splitk.cu
-  ops/linear/w8/w8_dispatch.cpp
-  ops/linear_pair/w8/w8_pair_decode.cu
-  ops/linear_pair/w8/w8_pair_gemm_concat.cu
-  ops/linear_pair/w8/w8_pair_gemm_mma.cu
-  ops/linear_pair/w8/w8_pair_gemm_splitk.cu
-  ops/linear_pair/w8/w8_pair_plan.cpp
-  ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
-  ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
-  ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
-  ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
-  ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
-  ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
-  ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
-  ops/wrapper/argmax.cpp
-  ops/wrapper/cast.cpp
-  ops/wrapper/causal_conv1d_silu.cpp
-  ops/wrapper/dflash2_dynamic_conv.cpp
-  ops/wrapper/dflash2_qkv_proj.cpp
-  ops/wrapper/dflash2_predecessor_ids.cpp
-  ops/wrapper/dflash2_selector_lattice.cpp
-  ops/wrapper/embedding.cpp
-  ops/wrapper/gdn_gating.cpp
-  ops/wrapper/gdn_gating_proj.cpp
-  ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
-  ops/wrapper/attn_input_proj.cpp
-  ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
-  ops/wrapper/linear_add.cpp
-  ops/wrapper/linear_pair.cpp
-  ops/wrapper/linear_swiglu.cpp
-  ops/wrapper/mtp_pack.cpp
-  ops/wrapper/mtp_round.cpp
-  ops/wrapper/speculative_round.cpp
-  ops/wrapper/position.cpp
-  ops/wrapper/prepare_ragged_prefix.cpp
-  ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/rope.cpp
-  ops/wrapper/sampling.cpp
-  ops/wrapper/scalar.cpp
-  ops/wrapper/scatter.cpp
-  ops/wrapper/sigmoid_mul.cpp
-  ops/wrapper/silu_mul.cpp
-  ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_pos_embed.cpp)
-ninfer_internal_includes(ninfer_ops)
-ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
+voidinfer_internal_includes(voidinfer_ops)
+voidinfer_cuda_archive(voidinfer_ops)
+target_link_libraries(voidinfer_ops PUBLIC voidinfer_core)
 
 # Native EXL3 Qwen3.5 GDN layer milestone.  Kept separate from the qualified
 # full-attention leaf so this phase cannot alter the existing EXL3 surface.
-add_library(ninfer_exl3_gdn STATIC
+add_library(voidinfer_exl3_gdn STATIC
   exl3/gdn_layer.cu)
-ninfer_internal_includes(ninfer_exl3_gdn)
-ninfer_cuda_archive(ninfer_exl3_gdn)
-target_link_libraries(ninfer_exl3_gdn PUBLIC ninfer_exl3_cuda ninfer_ops)
+voidinfer_internal_includes(voidinfer_exl3_gdn)
+voidinfer_cuda_archive(voidinfer_exl3_gdn)
+target_link_libraries(voidinfer_exl3_gdn PUBLIC voidinfer_exl3_cuda voidinfer_ops)
 
 # E4A complete native Qwen3.5 text-model assembly.  This remains isolated from
 # the product engine and the qualified D4.8B/NVFP4 route.
-add_library(ninfer_exl3_text_model STATIC
+add_library(voidinfer_exl3_text_model STATIC
   exl3/text_model.cu)
-ninfer_internal_includes(ninfer_exl3_text_model)
-ninfer_cuda_archive(ninfer_exl3_text_model)
-target_include_directories(ninfer_exl3_text_model PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_exl3_text_model PUBLIC ninfer_exl3_gdn ninfer_exl3_format ninfer_ops)
+voidinfer_internal_includes(voidinfer_exl3_text_model)
+voidinfer_cuda_archive(voidinfer_exl3_text_model)
+target_include_directories(voidinfer_exl3_text_model PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(voidinfer_exl3_text_model PUBLIC voidinfer_exl3_gdn voidinfer_exl3_format voidinfer_ops)
 
-# Explicit V6 numerical bring-up; not linked into the serving Engine yet.
-add_library(ninfer_exl3_vision STATIC exl3/vision_model.cu)
-ninfer_internal_includes(ninfer_exl3_vision)
-ninfer_cuda_archive(ninfer_exl3_vision)
-target_include_directories(ninfer_exl3_vision PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_exl3_vision PUBLIC ninfer_exl3_cuda ninfer_exl3_format ninfer_core PRIVATE CUDA::cublas)
+# The BF16 Vision tower (weights streamed from pinned host memory).
+add_library(voidinfer_exl3_vision STATIC exl3/vision_dense.cu)
+voidinfer_internal_includes(voidinfer_exl3_vision)
+voidinfer_cuda_archive(voidinfer_exl3_vision)
+target_include_directories(voidinfer_exl3_vision PUBLIC ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(voidinfer_exl3_vision PUBLIC voidinfer_exl3_cuda voidinfer_exl3_format voidinfer_core voidinfer_ops PRIVATE CUDA::cublas)
 # E5A2 minimal native DFlash2 draft adapter. Separate 5-layer draft model bound to
 # the qualified EXL3 Qwen3.8-27B target taps/head. Correctness-first and isolated
 # from the product engine; not part of the E4C1 qualified target decode path.
 
 
-add_library(ninfer_exl3_dflash2 STATIC
+add_library(voidinfer_exl3_dflash2 STATIC
   exl3/dflash2_draft.cu)
-ninfer_internal_includes(ninfer_exl3_dflash2)
-ninfer_cuda_archive(ninfer_exl3_dflash2)
-target_link_libraries(ninfer_exl3_dflash2 PUBLIC ninfer_exl3_text_model ${NINFER_CUDART_TARGET})
+voidinfer_internal_includes(voidinfer_exl3_dflash2)
+voidinfer_cuda_archive(voidinfer_exl3_dflash2)
+target_link_libraries(voidinfer_exl3_dflash2 PUBLIC voidinfer_exl3_text_model ${VOIDINFER_CUDART_TARGET})
 
 
 # Product-independent text and media mechanisms.
-add_library(ninfer_text STATIC
+add_library(voidinfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
-ninfer_internal_includes(ninfer_text)
-target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
+voidinfer_internal_includes(voidinfer_text)
+target_compile_definitions(voidinfer_text PUBLIC UTF8PROC_STATIC)
 
-add_library(ninfer_media_decode STATIC
+add_library(voidinfer_media_decode STATIC
   media/decode/decode.cpp)
-ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
+voidinfer_internal_includes(voidinfer_media_decode)
+target_link_libraries(voidinfer_media_decode PRIVATE ${VOIDINFER_FFMPEG_TARGET})
 
-if(NINFER_BUILD_MEDIA_ACQUIRE)
+if(VOIDINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC
+  add_library(voidinfer_media_acquire STATIC
     product/media_acquire/acquire.cpp)
-  ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+  voidinfer_internal_includes(voidinfer_media_acquire)
+  target_link_libraries(voidinfer_media_acquire PRIVATE ${VOIDINFER_CURL_TARGET})
   if(WIN32)
-    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+    target_link_libraries(voidinfer_media_acquire PRIVATE ws2_32)
   endif()
 endif()
 
-if(NINFER_BUILD_PROMPT_INPUT)
+if(VOIDINFER_BUILD_PROMPT_INPUT)
   # Owning command-line message input shared by product entry points and target diagnostics.
-  add_library(ninfer_product_prompt_input STATIC
+  add_library(voidinfer_product_prompt_input STATIC
     product/prompt_input/prompt_input.cpp)
-  ninfer_internal_includes(ninfer_product_prompt_input)
-  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+  voidinfer_internal_includes(voidinfer_product_prompt_input)
+  target_link_libraries(voidinfer_product_prompt_input PRIVATE voidinfer_media_acquire)
 endif()
 
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  add_library(ninfer_product_load_progress STATIC
+if(VOIDINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(voidinfer_product_load_progress STATIC
     product/load_progress/load_progress.cpp)
-  ninfer_internal_includes(ninfer_product_load_progress)
+  voidinfer_internal_includes(voidinfer_product_load_progress)
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
-add_library(ninfer_engine STATIC
-  exl3/prepared_request.cpp
+add_library(voidinfer_engine STATIC
+
   exl3/exl3_frontend_resources.cpp
   exl3/exl3_engine_core.cpp
-  targets/registry.cpp
   runtime/contract/sampling.cpp
   runtime/engine/engine.cpp)
-ninfer_internal_includes(ninfer_engine)
-target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
+voidinfer_internal_includes(voidinfer_engine)
+target_include_directories(voidinfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
 add_subdirectory(targets/qwen3_6)
-add_subdirectory(targets/qwen3_6_27b)
-add_subdirectory(targets/qwen3_6_35b_a3b)
 
-target_link_libraries(ninfer_engine
+target_link_libraries(voidinfer_engine
   PRIVATE
-    ninfer_exl3_dflash2
-    ninfer_exl3_vision
-    ninfer_artifact
-    ninfer_core
-    ninfer_ops
-    ninfer_text
-    ninfer_media_decode)
-add_library(ninfer::engine ALIAS ninfer_engine)
+    voidinfer_exl3_dflash2
+    voidinfer_exl3_vision
+    voidinfer_core
+    voidinfer_ops
+    voidinfer_text
+    voidinfer_media_decode)
+add_library(voidinfer::engine ALIAS voidinfer_engine)
 
-if(NINFER_BUILD_SERVE)
+if(VOIDINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
-  add_library(ninfer_serve STATIC
+  add_library(voidinfer_serve STATIC
     serve/openai_schema.cpp
     serve/responses_schema.cpp
     serve/anthropic_schema.cpp
@@ -434,13 +197,13 @@ if(NINFER_BUILD_SERVE)
     serve/responses_http.cpp
     serve/serve_options.cpp
     serve/webui_update.cpp)
-  ninfer_internal_includes(ninfer_serve)
-  target_include_directories(ninfer_serve PRIVATE
+  voidinfer_internal_includes(voidinfer_serve)
+  target_include_directories(voidinfer_serve PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
-  target_link_libraries(ninfer_serve
-    PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
+  target_link_libraries(voidinfer_serve
+    PUBLIC voidinfer_engine Threads::Threads
+    PRIVATE voidinfer_media_acquire ${VOIDINFER_CUDART_TARGET})
   if(WIN32)
-    target_link_libraries(ninfer_serve PRIVATE winhttp)
+    target_link_libraries(voidinfer_serve PRIVATE winhttp)
   endif()
 endif()

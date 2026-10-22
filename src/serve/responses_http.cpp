@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -250,23 +250,20 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error,
-                                                                selected_exl3_round(service_->engine_options())));
+                                                                request.generation, error));
         write_error(res, error);
         return;
     } catch (const std::exception& exception) {
         const ApiError error = internal_error(exception);
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
-                                                                request.generation, error,
-                                                                selected_exl3_round(service_->engine_options())));
+                                                                request.generation, error));
         write_error(res, error);
         return;
     }
 
     const std::int64_t created = unix_time_now();
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_responses", request.generation, prepared,
-                                 selected_exl3_round(service_->engine_options()));
+        make_request_log_context(req_id, "openai_responses", request.generation, prepared);
     request.generation.messages.clear();
     log_request_start(log_context);
 
@@ -436,7 +433,7 @@ void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Re
     error.status  = 400;
     error.type    = "invalid_request_error";
     error.code    = "background_not_supported";
-    error.message = "only background responses can be cancelled; NInfer does not support "
+    error.message = "only background responses can be cancelled; VoidInfer does not support "
                     "background execution";
     write_error(res, error);
 }
@@ -451,4 +448,4 @@ void HttpServer::handle_response_compact(const httplib::Request&, httplib::Respo
     write_error(res, error);
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

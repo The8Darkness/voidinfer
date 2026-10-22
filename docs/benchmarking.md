@@ -7,6 +7,15 @@ configuration, actual dispatch counters, fixtures, output counts, cache state, c
 instrumentation, timing boundary, and exactness gates. Different binaries or workload contracts are
 not pooled as one median. Stage timings are reported separately from useful-output throughput.
 
+## Harness
+
+`bench/engine-compare/` is the measurement harness: `ours_env.ps1` names the model package and build,
+`ours_conc.ps1` / `ours_agents.ps1` / `ours_vision.ps1` drive `voidinfer-serve` over HTTP,
+`ours_bench.ps1` drives the Engine device harness for single requests, and `quality/` holds the KL
+and paired-NLL instruments. Results and the comparison protocol are in its README and in
+[the 2026-10-12 comparison](ninfer-comparison-2026-10-12.md). Concurrency runs vary by about ±8%; use
+milliseconds per round or interleaved A/B repeats for decisions.
+
 ## R608 definition
 
 R608 uses native same-weight ordinary FP16 device-KV DFlash2 at physical C1, a 4,096-token prefix,
@@ -17,7 +26,7 @@ of intermediate roots, and final lane destruction/synchronization. It does not c
 startup, HTTP/SSE transport, or client-first-visible TTFT.
 
 Useful throughput is exactly `384 * 1000 / grouped_wall_ms`. It is neither a per-run median nor a
-best sample. Keep `VOIDINFER_PARITY_DFLASH_TIMING=0`; `NINFER_DFLASH2_TIMING` synchronizes proposal
+best sample. Keep `VOIDINFER_PARITY_DFLASH_TIMING=0`; `VOIDINFER_DFLASH2_TIMING` synchronizes proposal
 phases and is only for attribution.
 
 ## Correctness dimensions

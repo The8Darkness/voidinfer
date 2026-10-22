@@ -1,18 +1,22 @@
 #pragma once
 #include "exl3/resource_inventory.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // The pinned Engine tap allocation menu. Used by both admission and allocation;
 // it describes these five private destinations, not context/draft workspaces.
 struct Exl3EngineTapRequirements {
     static constexpr unsigned layers=5,rows=16,columns=5120;
     static constexpr std::uint64_t plane_bytes=std::uint64_t(rows)*columns*sizeof(std::uint16_t);
+    // Per lane beside the tap planes: first output position of every vocabulary
+    // token (presence penalty, sampled_select.h).
+    static constexpr std::uint64_t occurrence_bytes=std::uint64_t(248320)*sizeof(std::int32_t);
+    static constexpr std::uint64_t lane_device_bytes=layers*plane_bytes+occurrence_bytes;
     static Exl3ResourceInventory::Requirement for_lanes(unsigned lanes,std::uint64_t owner_metadata_bytes=0) {
-        if(lanes!=1 && lanes!=2)
-            throw std::invalid_argument("Engine tap requirement supports physical C1/C2");
+        if(lanes<1 || lanes>8)
+            throw std::invalid_argument("Engine tap requirement supports C1..C8");
         Exl3ResourceInventory::Requirement result;
         result.configuration=lanes;
-        result.add(Exl3ResourceInventory::Domain::device,lanes,layers*plane_bytes);
+        result.add(Exl3ResourceInventory::Domain::device,lanes,lane_device_bytes);
         if(owner_metadata_bytes)result.add(Exl3ResourceInventory::Domain::host_metadata,lanes,owner_metadata_bytes);
         return result;
     }

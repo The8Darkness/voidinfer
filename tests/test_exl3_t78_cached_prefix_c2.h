@@ -16,7 +16,7 @@ std::array<std::uint16_t*, 5> t78_cached_prefix_c2_staging(
 
 T78CachedPrefixC2Attach t78_cached_prefix_c2_attach(
     TargetGraphC2VerifierLane& a, TargetGraphC2VerifierLane& b,
-    const std::array<std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest>, 2>& roots) {
+    const std::array<std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest>, 2>& roots) {
     const auto started = std::chrono::steady_clock::now();
     TargetGraphC2VerifierLane* lanes[2]{&a, &b};
     for (int index = 0; index < 2; ++index) {
@@ -64,9 +64,9 @@ void run_t78_cached_prefix_c2(
     const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t kPromptRows = 4096;
     constexpr std::size_t kPrefixRows = 3968;
     constexpr std::size_t kTailRows = 128;
@@ -79,8 +79,8 @@ void run_t78_cached_prefix_c2(
             "T78 output must be new");
     std::filesystem::create_directories(output);
 
-    const auto reserve_gib = std::stoull(env("NINFER_T78_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T78_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T78_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T78_CACHE_MIB"));
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
     const std::uint64_t cache_budget = cache_mib * (1ULL << 20);
     require(reserve_gib >= 4 && cache_mib >= 512,
@@ -98,13 +98,13 @@ void run_t78_cached_prefix_c2(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T78_NAMESPACE"), env("NINFER_T78_ARTIFACT_ID"),
-        env("NINFER_T78_TOKENIZER_ID"), env("NINFER_T78_CONFIGURATION_ID"),
-        env("NINFER_T78_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T78_NAMESPACE"), env("VOIDINFER_T78_ARTIFACT_ID"),
+        env("VOIDINFER_T78_TOKENIZER_ID"), env("VOIDINFER_T78_CONFIGURATION_ID"),
+        env("VOIDINFER_T78_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{4, 64, cache_budget, reserve}, identity);
-    ninfer::exl3::Exl3HostResidentSet residency(
+    voidinfer::exl3::Exl3HostResidentSet residency(
         memory.ullTotalPhys - reserve, reserve);
 
     std::vector<std::int64_t> common(code.begin(), code.begin() + kPrefixRows);
@@ -119,13 +119,13 @@ void run_t78_cached_prefix_c2(
             "T78 distinct tails");
 
     struct LockResult {
-        ninfer::exl3::Exl3HostResidentSet::Stats update;
+        voidinfer::exl3::Exl3HostResidentSet::Stats update;
         Exl3HostResidency observed;
     };
     const auto pin = [&](const std::array<std::shared_ptr<const Request>, 2>* active = nullptr) {
         auto roots = cache.roots();
         if (active) for (const auto& root : *active) roots.push_back(root);
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for (const auto& root : roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) { snapshot.add(data, bytes); },
@@ -275,7 +275,7 @@ void run_t78_cached_prefix_c2(
     // authoritative-host contexts above are gone; the graph lanes below own
     // OSCAR storage and receive the immutable exact state through the existing
     // restore_oscar_host_state bridge.
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "0");
     auto draft_b = Exl3Dflash2DraftModel::load(draft_path);
     TargetGraphC2VerifierLane lane_a(target, draft_a, prompts[0]);
     TargetGraphC2VerifierLane lane_b(target, *draft_b, prompts[1]);

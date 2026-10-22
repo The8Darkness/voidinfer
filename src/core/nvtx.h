@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::nvtx {
+namespace voidinfer::nvtx {
 
 enum class Category : std::uint32_t {
     Runtime = 1,
@@ -89,7 +89,7 @@ enum class Name : std::size_t {
 
 [[nodiscard]] inline nvtxDomainHandle_t domain() noexcept {
     static nvtxDomainHandle_t handle = [] {
-        nvtxDomainHandle_t out = nvtxDomainCreateA("ninfer");
+        nvtxDomainHandle_t out = nvtxDomainCreateA("voidinfer");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Runtime), "runtime");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Prefill), "prefill");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Decode), "decode");
@@ -182,4 +182,4 @@ private:
     nvtxDomainHandle_t domain_;
 };
 
-} // namespace ninfer::nvtx
+} // namespace voidinfer::nvtx

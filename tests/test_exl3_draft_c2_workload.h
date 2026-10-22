@@ -2,27 +2,27 @@
 
 void run_draft_c2_workload(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
     using Lane=Exl3Dflash2Execution;
     using Clock=std::chrono::steady_clock;
     using Json=nlohmann::ordered_json;
     const auto ms=[](auto start){return std::chrono::duration<double,std::milli>(Clock::now()-start).count();};
     const auto utc_ms=[](){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();};
-    const int prefix=std::stoi(env("NINFER_REAL_DFLASH_PREFIX")),outputs=std::stoi(env("NINFER_REAL_DFLASH_OUTPUTS")),pairs=std::stoi(env("NINFER_REAL_DFLASH_PAIRS"));
-    const bool extended_comparison=env("NINFER_TEST_EXTENDED_STREAM_COHORT")=="1";
-    const bool kernel_comparison=extended_comparison||env("NINFER_TEST_K6_STREAM_COHORT")=="1";
-    const bool device_comparison=env("NINFER_TEST_DEVICE_PREFIX_COHORT")=="1";
-    const bool long_requests=env("NINFER_TEST_HISTORY_LONG_COHORT")=="1";
-    const bool capacity_comparison=env("NINFER_TEST_DEVICE_PREFIX_16K_COHORT")=="1";
+    const int prefix=std::stoi(env("VOIDINFER_REAL_DFLASH_PREFIX")),outputs=std::stoi(env("VOIDINFER_REAL_DFLASH_OUTPUTS")),pairs=std::stoi(env("VOIDINFER_REAL_DFLASH_PAIRS"));
+    const bool extended_comparison=env("VOIDINFER_TEST_EXTENDED_STREAM_COHORT")=="1";
+    const bool kernel_comparison=extended_comparison||env("VOIDINFER_TEST_K6_STREAM_COHORT")=="1";
+    const bool device_comparison=env("VOIDINFER_TEST_DEVICE_PREFIX_COHORT")=="1";
+    const bool long_requests=env("VOIDINFER_TEST_HISTORY_LONG_COHORT")=="1";
+    const bool capacity_comparison=env("VOIDINFER_TEST_DEVICE_PREFIX_16K_COHORT")=="1";
     require(!capacity_comparison||(device_comparison&&long_requests),"16K device reserve requires long C1 comparison");
     require(!(device_comparison&&kernel_comparison),"separate K6 and device-prefix cohorts");
     require((long_requests?(device_comparison&&prefix==0):(prefix>=512&&prefix<=4096))&&outputs>=32&&outputs<=128&&pairs>=1&&pairs<=3,"C2 bounded extents");
-    const std::filesystem::path dir=env("NINFER_REAL_DFLASH_OUT");
+    const std::filesystem::path dir=env("VOIDINFER_REAL_DFLASH_OUT");
     require(!dir.empty()&&!std::filesystem::exists(dir),"preserve C2 workload receipt");std::filesystem::create_directories(dir);
-    _putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",device_comparison||extended_comparison?"1":"0");
-    _putenv_s("NINFER_EXL3_EXTENDED_STREAM_REDUCTION","0");
-    _putenv_s("NINFER_EXL3_HOST_KV_DEVICE_PREFIX","0");
+    _putenv_s("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",device_comparison||extended_comparison?"1":"0");
+    _putenv_s("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION","0");
+    _putenv_s("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX","0");
     if(device_comparison)run_device_prefix_metadata_gate(dir/"device-prefix-metadata.csv");
     if(capacity_comparison)run_device_prefix_16k_metadata_gate(dir/"device-prefix-16k-metadata.csv");
     if(extended_comparison)run_extended_stream_operator_gate(target,draft,code,prose,dir/"operators",prefix);
@@ -34,7 +34,7 @@ void run_draft_c2_workload(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     for(int t=0;t<5;++t){storage[t]=std::make_unique<DeviceBuffer>(16ULL*kHidden*2);staging[t]=static_cast<std::uint16_t*>(storage[t]->get());}
     struct Reference {Root initial;std::shared_ptr<const Exl3ExactHostState> final;int prefix=0;std::vector<std::int64_t> tokens;std::array<std::vector<std::uint16_t>,5> taps;};
     std::array<Reference,2> refs;Json prefix_costs=Json::array();
-    _putenv_s("NINFER_EXL3_PINNED_RECURRENT_EXPORT","0");
+    _putenv_s("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT","0");
     for(int i=0;i<2;++i){
         const auto& input=i?prose:code;require(input.size()>=prefix,"C2 fixture length");auto start=Clock::now();
         refs[i].prefix=long_requests?static_cast<int>(input.size()):prefix;
@@ -48,13 +48,13 @@ void run_draft_c2_workload(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     }
     std::ofstream(dir/"prefix-costs.json")<<prefix_costs.dump(2);
     gate("reference_owners_use_no_pinned_pool",Exl3RecurrentPinBudget::snapshot()[0]==0);
-    _putenv_s("NINFER_EXL3_PINNED_RECURRENT_EXPORT","1");
+    _putenv_s("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT","1");
     int device=0;cuda_check(cudaGetDevice(&device),"C2 workload device");
     auto run=[&](int physical,int requests,bool ring_audit,int pair,bool candidate=false,bool force_fallback=false){
-        _putenv_s("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",(device_comparison||extended_comparison||candidate)?"1":"0");
-        _putenv_s("NINFER_EXL3_EXTENDED_STREAM_REDUCTION",extended_comparison&&candidate?"1":"0");
-        _putenv_s("NINFER_EXL3_HOST_KV_DEVICE_PREFIX",(device_comparison&&(candidate||capacity_comparison))?"1":"0");
-        _putenv_s("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS",capacity_comparison&&candidate?"16384":"4096");
+        _putenv_s("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",(device_comparison||extended_comparison||candidate)?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION",extended_comparison&&candidate?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX",(device_comparison&&(candidate||capacity_comparison))?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS",capacity_comparison&&candidate?"16384":"4096");
         struct Stream {cudaStream_t value=nullptr;~Stream(){if(value)cudaStreamDestroy(value);}};
         struct Record {Json data;Root final;std::vector<int> partitions;};
         std::vector<Record> records(requests);std::array<Stream,2> streams;

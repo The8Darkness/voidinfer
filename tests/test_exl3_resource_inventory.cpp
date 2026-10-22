@@ -50,11 +50,11 @@
 #include "exl3/projection_graph_binding.h"
 #include "exl3/head_consumer_plan.h"
 #include <iostream>
-using Inventory=ninfer::exl3::Exl3ResourceInventory;
+using Inventory=voidinfer::exl3::Exl3ResourceInventory;
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 int main(){const char* phase="initial ownership/storage contracts";try{
     {
-        using namespace ninfer::exl3;
+        using namespace voidinfer::exl3;
         struct Payload {std::vector<int> values;explicit Payload(unsigned count):values(count,7){}};
         auto owner=make_bounded_shared<Payload>(8);
         std::weak_ptr<Payload> weak=owner;
@@ -74,7 +74,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     }
     {
         auto owner=std::make_shared<int>();
-        const auto attach=+[](const std::shared_ptr<const void>&,ninfer::exl3::RetainedCudaRegistrationLedger::Ticket) noexcept {return true;};
+        const auto attach=+[](const std::shared_ptr<const void>&,voidinfer::exl3::RetainedCudaRegistrationLedger::Ticket) noexcept {return true;};
         Inventory::Allocation allocation{owner,0,Inventory::Domain::cuda_registered_host,64,{},nullptr,nullptr,attach};
         Inventory inventory;inventory.add(allocation);inventory.add(allocation);
         require(inventory.first_lifetime_retirement()->registration_lifetime_retire==attach,
@@ -91,7 +91,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     }
     {
         struct Piece {std::shared_ptr<int> owner;std::size_t offset=0;};
-        using Storage=ninfer::exl3::Exl3ScatterPieceStorage<Piece,2>;
+        using Storage=voidinfer::exl3::Exl3ScatterPieceStorage<Piece,2>;
         static_assert(!std::is_copy_constructible_v<Storage> && !std::is_move_constructible_v<Storage>);
         Storage pieces;auto first=std::make_shared<int>(1),second=std::make_shared<int>(2);
         std::weak_ptr<int> first_weak=first,second_weak=second;
@@ -111,7 +111,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             "scatter slot reuse moved inline records");
         pieces.clear();pieces.clear();
         require(pieces.empty(),"repeated scatter clear changed empty state");
-        ninfer::exl3::Exl3ScatterPieceStorage<Piece,512> full_slot;
+        voidinfer::exl3::Exl3ScatterPieceStorage<Piece,512> full_slot;
         auto page=std::make_shared<int>(5);std::weak_ptr<int> page_weak=page;
         for(std::size_t row=0;row<512;++row)full_slot.push_back({page,row*2048});
         page.reset();
@@ -128,7 +128,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         full_slot.clear();require(page_weak.expired(),"full scatter slot clear leaked repeated page owner");
     }
     {
-        using Storage=ninfer::exl3::Exl3TransferDescriptorStorage<std::size_t>;
+        using Storage=voidinfer::exl3::Exl3TransferDescriptorStorage<std::size_t>;
         static_assert(!std::is_move_constructible_v<Storage> && !std::is_copy_constructible_v<Storage>);
         Storage values;
         values.reserve(0);
@@ -143,7 +143,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             address[0]==17 && address[1]==29,"saturated descriptor append mutated storage");
         refused=false;try{values.reserve(3);}catch(const std::logic_error&){refused=true;}
         require(refused && values.capacity()==2 && values.data()==address,"descriptor growth relocated storage");
-        using Use=ninfer::exl3::Exl3TransferDescriptorUse;
+        using Use=voidinfer::exl3::Exl3TransferDescriptorUse;
         static_assert(!std::is_copy_constructible_v<Use> && !std::is_move_constructible_v<Use>);
         Use use;unsigned fences=0;
         require(!use.retire_before_reuse([&]{++fences;}) && fences==0,
@@ -176,10 +176,10 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(refused && oversized.empty() && !oversized.data(),"oversized descriptor plan allocated");
     }
     {
-        using Plan=ninfer::exl3::Exl3HostKVTransferRequirements;
+        using Plan=voidinfer::exl3::Exl3HostKVTransferRequirements;
         {
-            using ninfer::exl3::exl3_host_kv_append_download_interval;
-            using ninfer::exl3::exl3_host_kv_append_download_page;
+            using voidinfer::exl3::exl3_host_kv_append_download_interval;
+            using voidinfer::exl3::exl3_host_kv_append_download_page;
             int page_end=-1;
             require(exl3_host_kv_append_download_page(64,64,80,256,65536,65536,page_end) && page_end==128,
                 "download page preflight refused represented partial tail");
@@ -232,15 +232,15 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             std::size_t writes=0;bool refused=false;
             const auto validate=[](int value){if(value<0)throw std::invalid_argument("late scatter descriptor");};
             const auto apply=[&](int value) noexcept {destination[writes++]=value;};
-            try{ninfer::exl3::exl3_host_kv_scatter_batch(pieces,validate,apply);}
+            try{voidinfer::exl3::exl3_host_kv_scatter_batch(pieces,validate,apply);}
             catch(const std::invalid_argument&){refused=true;}
             require(refused && writes==0 && destination==std::array<int,3>{7,7,7},
                 "late scatter refusal modified earlier destinations");
             pieces[2]=3;
-            ninfer::exl3::exl3_host_kv_scatter_batch(pieces,validate,apply);
+            voidinfer::exl3::exl3_host_kv_scatter_batch(pieces,validate,apply);
             require(writes==3 && destination==std::array<int,3>{1,2,3},"scatter retry changed copy order");
         }
-        using ninfer::exl3::exl3_host_kv_scatter_fits;
+        using voidinfer::exl3::exl3_host_kv_scatter_fits;
         require(exl3_host_kv_scatter_fits(128,64,64,0,64),"exact scatter tail refused");
         require(!exl3_host_kv_scatter_fits(128,65,64,0,64),"scatter destination tail overflow admitted");
         require(!exl3_host_kv_scatter_fits(128,64,64,1,64),"scatter staging tail overflow admitted");
@@ -292,7 +292,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(refused && inventory.totals()==Inventory::Totals{},"inventory accepted non-owning allocation backing");
     }
     {
-        using namespace ninfer::exl3;
+        using namespace voidinfer::exl3;
         {
             int position=16;
             std::size_t remaining=1041;
@@ -326,7 +326,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     {
         int collection_a=0,collection_b=0;
         const int descriptor=7;
-        ninfer::exl3::Exl3BorrowedDescriptor<int> borrowed(&collection_a,descriptor);
+        voidinfer::exl3::Exl3BorrowedDescriptor<int> borrowed(&collection_a,descriptor);
         const auto copy=borrowed;
         require(&borrowed.get(&collection_a)==&descriptor && &copy.get(&collection_a)==&descriptor,
             "borrowed descriptor duplicated retained metadata");
@@ -336,13 +336,13 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             require(refused,"foreign descriptor collection admitted");
         }
     }
-    for(int bits:{5,6,7,8})
-        require(ninfer::exl3::exl3_native_bits_from_tile_extent(std::uint64_t(bits)*16)==bits,
+    for(int bits:{4,5,6,7,8})
+        require(voidinfer::exl3::exl3_native_bits_from_tile_extent(std::uint64_t(bits)*16)==bits,
             "canonical trellis descriptor bits");
-    for(std::uint64_t extent:std::array<std::uint64_t,8>{0,64,79,81,129,144,
+    for(std::uint64_t extent:std::array<std::uint64_t,8>{0,48,79,81,129,144,
         ((std::uint64_t{1}<<32)+5)*16,std::numeric_limits<std::uint64_t>::max()}) {
         bool refused=false;
-        try{(void)ninfer::exl3::exl3_native_bits_from_tile_extent(extent);}
+        try{(void)voidinfer::exl3::exl3_native_bits_from_tile_extent(extent);}
         catch(const std::invalid_argument&){refused=true;}
         require(refused,"invalid or narrowing-overflow quant descriptor admitted");
     }
@@ -438,7 +438,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(Inventory::transition_union({}, {},pending.without_allocation(tracking),{})==Inventory::Totals{},
             "explicit final-use release retained pending transition charge");
     }
-    using Segment=ninfer::exl3::Exl3DraftPrivateSegment;
+    using Segment=voidinfer::exl3::Exl3DraftPrivateSegment;
     const std::array<std::int64_t,8> ids{42,99,99,99,99,99,99,99};
     const auto segment=Segment::make(3,7,512,8,520,ids);
     auto mutable_ids=ids;
@@ -502,7 +502,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         catch(const std::invalid_argument&){refused=true;}
         require(refused,"invalid private draft scope admitted");
     }
-    using Lifetime=ninfer::exl3::Exl3ActivationLifetime;
+    using Lifetime=voidinfer::exl3::Exl3ActivationLifetime;
     Lifetime activation;
     Lifetime::Witness old_activation;
     {
@@ -519,7 +519,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     Lifetime::Witness exceptional;
     try{Lifetime::Scope scope(activation);exceptional=scope.witness();throw 1;}catch(int){}
     require(!exceptional.current(),"exception retained immutable activation interval");
-    using Gather=ninfer::exl3::Exl3PackedGatherSignature;
+    using Gather=voidinfer::exl3::Exl3PackedGatherSignature;
     Lifetime first_activation,second_activation;
     auto gather_model=std::make_shared<int>(1);
     auto first_owner=std::make_shared<int>(2),second_owner=std::make_shared<int>(3);
@@ -636,7 +636,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(gathered.remember(canceled_pair,packed_storage.data(),16),"cancellation fixture signature");
     }
     require(!gathered.consume(canceled_pair,packed_storage.data(),16),"one canceled lane allowed gather reuse");
-    using Cost=ninfer::exl3::Exl3PackedCostPolicy;
+    using Cost=voidinfer::exl3::Exl3PackedCostPolicy;
     Cost missing;
     require(!Cost::calibrated,"supplied cost estimates claimed calibration");
     require(!missing.permits(0,5120,12288,6,3,5,0),"missing underfill table did not fall back");
@@ -666,12 +666,12 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     require(missing.wait_budget_us(0,5120,12288,6,3)==0,"missing estimate budgeted a wait");
     require(missing.wait_budget_us(0,5120,12288,6,8)==50,"full pair wait budget changed");
     const std::string multibyte="a\xc3\xa9\xf0\x9f\x8c\x89z";
-    using ninfer::exl3::output_result_slots_available;
+    using voidinfer::exl3::output_result_slots_available;
     {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Inventory inventory;
         Inventory::Allocation allocation{std::make_shared<int>(5),0,Inventory::Domain::host_metadata,4,{},
-            +[](const std::shared_ptr<const void>&,ninfer::exl3::RetainedDescriptorLedger::Ticket) noexcept {return false;}};
+            +[](const std::shared_ptr<const void>&,voidinfer::exl3::RetainedDescriptorLedger::Ticket) noexcept {return false;}};
         inventory.add(allocation);const auto before=inventory.totals();
         auto changed=allocation;changed.lifetime_retire=nullptr;
         bool rebound=false,removed=false,domain=false;
@@ -685,19 +685,19 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     }
     {
         struct Owner {
-            ninfer::exl3::EmbeddedSharedControl arena;
+            voidinfer::exl3::EmbeddedSharedControl arena;
             int value=37;
             int* retired;
             explicit Owner(int& count):retired(&count) {}
             ~Owner(){++*retired;}
         };
         int retired=0,destroyed=0;
-        auto backing=ninfer::exl3::make_bounded_shared<Owner>(retired);
+        auto backing=voidinfer::exl3::make_bounded_shared<Owner>(retired);
         std::weak_ptr<Owner> weak_backing=backing;
         std::weak_ptr<int> weak_request;
         {
             std::shared_ptr<int> request(&backing->value,[&](int*) noexcept {++destroyed;},
-                ninfer::exl3::EmbeddedControlAllocator<int>(backing,backing->arena));
+                voidinfer::exl3::EmbeddedControlAllocator<int>(backing,backing->arena));
             weak_request=request;
             bool reuse_refused=false;
             try{(void)backing->arena.allocate<unsigned char>(1);}catch(const std::bad_alloc&){reuse_refused=true;}
@@ -709,16 +709,16 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         weak_request.reset();
         require(retired==1 && weak_backing.expired(),"embedded control retirement retained backing payload");
         weak_backing.reset();
-        require(ninfer::exl3::bounded_shared_live_blocks_for_test<Owner>()==0,
+        require(voidinfer::exl3::bounded_shared_live_blocks_for_test<Owner>()==0,
             "embedded control retirement leaked bounded backing allocation");
-        backing=ninfer::exl3::make_bounded_shared<Owner>(retired);
+        backing=voidinfer::exl3::make_bounded_shared<Owner>(retired);
         bool refused=false;
         try{std::shared_ptr<int> failed(&backing->value,[&](int*) noexcept {++destroyed;},
-            ninfer::exl3::EmbeddedControlAllocator<int>(backing,backing->arena,true));}
+            voidinfer::exl3::EmbeddedControlAllocator<int>(backing,backing->arena,true));}
         catch(const std::bad_alloc&){refused=true;}
         require(refused && destroyed==2 && !backing->arena.used && retired==1,
             "embedded control injection consumed arena or mishandled payload cleanup");
-        backing.reset();require(retired==2 && ninfer::exl3::bounded_shared_live_blocks_for_test<Owner>()==0,
+        backing.reset();require(retired==2 && voidinfer::exl3::bounded_shared_live_blocks_for_test<Owner>()==0,
             "embedded control refusal retained backing owner");
     }
     {
@@ -732,43 +732,43 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         int destroyed=0;
         std::weak_ptr<Payload> weak;
         {
-            auto owner=ninfer::exl3::make_bounded_shared<Payload>(destroyed);
+            auto owner=voidinfer::exl3::make_bounded_shared<Payload>(destroyed);
             require(reinterpret_cast<std::uintptr_t>(owner.get())%alignof(Payload)==0 &&
-                ninfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==1 &&
-                ninfer::exl3::bounded_shared_allocation_bytes<Payload>()>=sizeof(Payload)+256,
+                voidinfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==1 &&
+                voidinfer::exl3::bounded_shared_allocation_bytes<Payload>()>=sizeof(Payload)+256,
                 "bounded owner lost payload alignment or control storage extent");
             weak=owner;
         }
-        require(destroyed==1 && weak.expired() && ninfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==1,
+        require(destroyed==1 && weak.expired() && voidinfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==1,
             "bounded shared owner freed control backing before last weak reference");
         weak.reset();
-        require(ninfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==0,
+        require(voidinfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==0,
             "bounded shared owner did not release last weak backing");
         bool payload_failed=false;
-        try{(void)ninfer::exl3::make_bounded_shared<Payload>(destroyed,true);}
+        try{(void)voidinfer::exl3::make_bounded_shared<Payload>(destroyed,true);}
         catch(const std::runtime_error& error){payload_failed=std::string_view(error.what())==
             "prepared bounded payload construction failure";}
-        require(payload_failed && destroyed==1 && ninfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==0,
+        require(payload_failed && destroyed==1 && voidinfer::exl3::bounded_shared_live_blocks_for_test<Payload>()==0,
             "bounded payload constructor failure leaked backing or destroyed incomplete payload");
         bool control_failed=false;
-        try{(void)ninfer::exl3::make_bounded_shared<Payload,1>(destroyed);}
+        try{(void)voidinfer::exl3::make_bounded_shared<Payload,1>(destroyed);}
         catch(const std::bad_alloc&){control_failed=true;}
-        require(control_failed && destroyed==2 && ninfer::exl3::bounded_shared_live_blocks_for_test<Payload,1>()==0,
+        require(control_failed && destroyed==2 && voidinfer::exl3::bounded_shared_live_blocks_for_test<Payload,1>()==0,
             "bounded control allocation refusal leaked or double-destroyed payload");
     }
     {
-        using Ledger=ninfer::exl3::RetainedDescriptorLedger;
+        using Ledger=voidinfer::exl3::RetainedDescriptorLedger;
         {
-            using PayloadLedger=ninfer::exl3::RetainedHostAllocationLedger;
+            using PayloadLedger=voidinfer::exl3::RetainedHostAllocationLedger;
             using Counter=PayloadLedger::State;
             Ledger metadata;
             std::optional<PayloadLedger::Ticket> payload;
             std::weak_ptr<Counter> weak;
-            const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<Counter>();
+            const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<Counter>();
             {
                 auto credit=metadata.acquire(bytes);
-                auto counter=ninfer::exl3::make_bounded_shared<Counter>();
-                require(ninfer::exl3::attach_bounded_retirement_credit<Counter>(counter,std::move(credit)),
+                auto counter=voidinfer::exl3::make_bounded_shared<Counter>();
+                require(voidinfer::exl3::attach_bounded_retirement_credit<Counter>(counter,std::move(credit)),
                     "reserved payload counter refused metadata attachment");
                 weak=counter;
                 PayloadLedger ledger(counter);
@@ -823,92 +823,92 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         survivor.reset();require(state.expired(),"last descriptor ticket retained ledger state");
     }
     {
-        using Range=ninfer::exl3::ResidentRange;
+        using Range=voidinfer::exl3::ResidentRange;
         const std::array<Range,3> ranges{{{0,32},{40,41},{64,81}}};
-        require(ninfer::exl3::resident_lock_chunk_count(ranges,16)==5 &&
-            ninfer::exl3::resident_lock_chunk_count({},16)==0,
+        require(voidinfer::exl3::resident_lock_chunk_count(ranges,16)==5 &&
+            voidinfer::exl3::resident_lock_chunk_count({},16)==0,
             "resident completed-lock count lost exact or partial chunks");
         const auto top=std::numeric_limits<std::uintptr_t>::max();
         const std::array<Range,1> maximal{{{0,top}}};
-        require(ninfer::exl3::resident_lock_chunk_count(maximal,top)==1,
+        require(voidinfer::exl3::resident_lock_chunk_count(maximal,top)==1,
             "resident lock chunk rounding overflowed maximum endpoint");
         bool zero_refused=false;
-        try{(void)ninfer::exl3::resident_lock_chunk_count(ranges,0);}
+        try{(void)voidinfer::exl3::resident_lock_chunk_count(ranges,0);}
         catch(const std::invalid_argument&){zero_refused=true;}
         const std::array<Range,1> empty_range{{{7,7}}};bool extent_refused=false;
-        try{(void)ninfer::exl3::resident_lock_chunk_count(empty_range,16);}
+        try{(void)voidinfer::exl3::resident_lock_chunk_count(empty_range,16);}
         catch(const std::invalid_argument&){extent_refused=true;}
         const std::array<Range,2> excess{{{0,top},{0,1}}};bool count_refused=false;
-        try{(void)ninfer::exl3::resident_lock_chunk_count(excess,1);}
+        try{(void)voidinfer::exl3::resident_lock_chunk_count(excess,1);}
         catch(const std::overflow_error&){count_refused=true;}
         require(zero_refused && extent_refused && count_refused,
             "resident completed-lock planning accepted invalid or overflowing demand");
     }
     {
-        using Range=ninfer::exl3::ResidentRange;
+        using Range=voidinfer::exl3::ResidentRange;
         const auto top=std::numeric_limits<std::uintptr_t>::max();
         const std::array<Range,2> source{{{10,50},{70,100}}};
         const std::array<Range,4> subtract{{{0,12},{20,30},{40,80},{90,top}}};
         const std::vector<Range> expected{{12,20},{30,40},{80,90}};
         std::vector<Range> combined;combined.reserve(source.size()+subtract.size());
         const auto* union_storage=combined.data();const auto union_capacity=combined.capacity();
-        ninfer::exl3::merge_sorted_resident_ranges(source,subtract,combined);
+        voidinfer::exl3::merge_sorted_resident_ranges(source,subtract,combined);
         require(combined==std::vector<Range>{{0,top}} && combined.data()==union_storage &&
             combined.capacity()==union_capacity,"linear resident union changed coverage or allocation");
         bool occupied_refused=false;
-        try{ninfer::exl3::merge_sorted_resident_ranges({},source,combined);}
+        try{voidinfer::exl3::merge_sorted_resident_ranges({},source,combined);}
         catch(const std::length_error&){occupied_refused=true;}
         require(occupied_refused && combined==std::vector<Range>{{0,top}},
             "linear resident union overwrote retained output");
         combined.clear();
-        ninfer::exl3::merge_sorted_resident_ranges({},source,combined);
+        voidinfer::exl3::merge_sorted_resident_ranges({},source,combined);
         require(combined==std::vector<Range>(source.begin(),source.end()),"linear resident empty union changed coverage");
         std::vector<Range> short_output;short_output.reserve(1);
         bool short_refused=false;
-        try{ninfer::exl3::merge_sorted_resident_ranges(source,subtract,short_output);}
+        try{voidinfer::exl3::merge_sorted_resident_ranges(source,subtract,short_output);}
         catch(const std::length_error&){short_refused=true;}
         require(short_refused && short_output.empty(),"linear resident union exceeded admitted output");
         const std::array<Range,2> separated{{{0,4},{110,120}}};
         const std::array<Range,2> seams{{{0,10},{50,70}}};
         for(bool reverse:{false,true}) {
             combined.clear();
-            ninfer::exl3::merge_sorted_resident_ranges(reverse?std::span<const Range>(source):std::span<const Range>(separated),
+            voidinfer::exl3::merge_sorted_resident_ranges(reverse?std::span<const Range>(source):std::span<const Range>(separated),
                 reverse?std::span<const Range>(separated):std::span<const Range>(source),combined);
             require(combined==std::vector<Range>{{0,4},{10,50},{70,100},{110,120}},
                 "linear resident union filled a disjoint gap or depended on input order");
             combined.clear();
-            ninfer::exl3::merge_sorted_resident_ranges(reverse?std::span<const Range>(source):std::span<const Range>(seams),
+            voidinfer::exl3::merge_sorted_resident_ranges(reverse?std::span<const Range>(source):std::span<const Range>(seams),
                 reverse?std::span<const Range>(seams):std::span<const Range>(source),combined);
             require(combined==std::vector<Range>{{0,100}},"linear resident union lost touching boundary");
         }
-        combined.clear();ninfer::exl3::merge_sorted_resident_ranges(source,source,combined);
+        combined.clear();voidinfer::exl3::merge_sorted_resident_ranges(source,source,combined);
         require(combined==std::vector<Range>(source.begin(),source.end()),"linear resident union duplicated identical input");
-        combined.clear();ninfer::exl3::merge_sorted_resident_ranges({}, {},combined);
+        combined.clear();voidinfer::exl3::merge_sorted_resident_ranges({}, {},combined);
         require(combined.empty() && combined.data()==union_storage && combined.capacity()==union_capacity,
             "empty linear resident union changed reusable allocation");
-        require(ninfer::exl3::resident_difference_precounted(source,subtract,3)==expected &&
-            ninfer::exl3::resident_difference_precounted(source,source,0).empty(),
+        require(voidinfer::exl3::resident_difference_precounted(source,subtract,3)==expected &&
+            voidinfer::exl3::resident_difference_precounted(source,source,0).empty(),
             "admitted difference count changed exact coverage");
         for(std::size_t count:{0U,2U,4U}) {
             bool refused=false;
-            try{(void)ninfer::exl3::resident_difference_precounted(source,subtract,count);}
+            try{(void)voidinfer::exl3::resident_difference_precounted(source,subtract,count);}
             catch(const std::length_error&){refused=true;}
             require(refused,"difference materialization accepted changed admitted count");
         }
-        require(ninfer::exl3::resident_difference_count(source,subtract)==expected.size() &&
-            ninfer::exl3::resident_difference(source,subtract)==expected,
+        require(voidinfer::exl3::resident_difference_count(source,subtract)==expected.size() &&
+            voidinfer::exl3::resident_difference(source,subtract)==expected,
             "resident difference lost split fragments or miscounted descriptor demand");
-        require(ninfer::exl3::resident_difference(subtract,source)==
+        require(voidinfer::exl3::resident_difference(subtract,source)==
             std::vector<Range>{{0,10},{50,70},{100,top}},
             "resident difference reversed coverage or overflowed maximum endpoint");
-        require(ninfer::exl3::resident_difference_count(source,source)==0 &&
-            ninfer::exl3::resident_difference(source,source).empty(),
+        require(voidinfer::exl3::resident_difference_count(source,source)==0 &&
+            voidinfer::exl3::resident_difference(source,source).empty(),
             "equal resident unions retained difference descriptors");
-        require(ninfer::exl3::resident_difference({},source).empty() &&
-            ninfer::exl3::resident_difference(source,{})==std::vector<Range>(source.begin(),source.end()),
+        require(voidinfer::exl3::resident_difference({},source).empty() &&
+            voidinfer::exl3::resident_difference(source,{})==std::vector<Range>(source.begin(),source.end()),
             "empty resident union subtraction changed source coverage");
         const std::array<Range,2> touching{{{0,10},{100,top}}};
-        require(ninfer::exl3::resident_difference(source,touching)==
+        require(voidinfer::exl3::resident_difference(source,touching)==
             std::vector<Range>(source.begin(),source.end()),
             "half-open touching resident ranges removed live bytes");
     }
@@ -918,25 +918,25 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         std::vector<Range> ranges{{90,100},{12,18},{10,20},{20,30},{10,20},{top-4,top},{80,95}};
         ranges.reserve(19);
         const auto* backing=ranges.data();const auto capacity=ranges.capacity();
-        ninfer::exl3::merge_resident_ranges_in_place(ranges);
+        voidinfer::exl3::merge_resident_ranges_in_place(ranges);
         require(ranges==std::vector<Range>{{10,30},{80,100},{top-4,top}} &&
             ranges.data()==backing && ranges.capacity()==capacity,
             "resident interval union changed coverage or allocated replacement backing");
-        ninfer::exl3::merge_resident_ranges_in_place(ranges);
+        voidinfer::exl3::merge_resident_ranges_in_place(ranges);
         require(ranges.size()==3 && ranges.data()==backing && ranges.capacity()==capacity,
             "resident union was not idempotent with stable backing");
-        ranges.clear();ninfer::exl3::merge_resident_ranges_in_place(ranges);
+        ranges.clear();voidinfer::exl3::merge_resident_ranges_in_place(ranges);
         require(ranges.empty() && ranges.data()==backing && ranges.capacity()==capacity,
             "empty resident union lost retained storage");
         ranges.emplace_back(1,top);
-        ninfer::exl3::merge_resident_ranges_in_place(ranges);
+        voidinfer::exl3::merge_resident_ranges_in_place(ranges);
         require(ranges==std::vector<Range>{{1,top}} && ranges.data()==backing,
             "resident union reuse overflowed or replaced backing");
     }
     {
-        using Queue=ninfer::exl3::ReservedRequestQueue<int>;
+        using Queue=voidinfer::exl3::ReservedRequestQueue<int>;
         Queue queue;require(queue.empty(),"unbound startup queue is not empty");
-        auto backing=ninfer::exl3::make_bounded_shared<Queue::Storage>();backing->reserve(2);
+        auto backing=voidinfer::exl3::make_bounded_shared<Queue::Storage>();backing->reserve(2);
         queue.bind(backing);const auto capacity=queue.capacity();
         require(capacity==2,"reserved queue fixture requires exact startup capacity");
         auto first=std::make_shared<int>(1),second=std::make_shared<int>(2);
@@ -959,7 +959,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         try{alias.bind(backing);}catch(const std::logic_error&){alias_refused=true;}
         require(alias_refused && alias.empty() && alias.capacity()==0,
             "inventory alias acquired a second mutable queue");
-        auto replacement=ninfer::exl3::make_bounded_shared<Queue::Storage>();replacement->reserve(1);
+        auto replacement=voidinfer::exl3::make_bounded_shared<Queue::Storage>();replacement->reserve(1);
         bool rebind_refused=false;
         try{queue.bind(replacement);}catch(const std::logic_error&){rebind_refused=true;}
         require(rebind_refused && queue.capacity()==capacity,
@@ -968,7 +968,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         queue.push_back(second);
         require(alias.size()==1 && queue.size()==1,
             "failed binding consumed replacement or damaged original queue");
-        auto retained=ninfer::exl3::make_bounded_shared<Queue::Storage>();retained->reserve(1);
+        auto retained=voidinfer::exl3::make_bounded_shared<Queue::Storage>();retained->reserve(1);
         std::weak_ptr<int> inventory_retained;
         {
             Queue temporary;temporary.bind(retained);
@@ -984,11 +984,11 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(inventory_retained.expired(),"retired inventory backing retained queued request");
     }
     {
-        ninfer::exl3::EngineRoundTokenStorage round;
+        voidinfer::exl3::EngineRoundTokenStorage round;
         {
             alignas(4096) std::array<std::byte,8192> bytes{};
             auto owner=std::make_shared<int>(1);
-            ninfer::exl3::ReservedHostPayloadUnion<2> pages;
+            voidinfer::exl3::ReservedHostPayloadUnion<2> pages;
             pages.add(owner,0,bytes.data(),16);pages.add(owner,0,bytes.data(),16);
             pages.add(owner,1,bytes.data()+32,16);
             require(pages.allocations()==2 && pages.page_bytes(4096)==4096,
@@ -1011,7 +1011,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             const std::array<std::pair<std::uintptr_t,std::uintptr_t>,2> overlap{{{begin,begin+16},{begin+8,begin+48}}};
             bool invalid=false;try{(void)pages.bytes_outside(overlap);}catch(const std::invalid_argument&){invalid=true;}
             require(invalid,"overlapping resident ranges discounted credit twice");
-            ninfer::exl3::ReservedHostPayloadTracker<1> tracker;
+            voidinfer::exl3::ReservedHostPayloadTracker<1> tracker;
             auto transient=std::make_shared<int>(2);
             tracker.track(transient,0,bytes.data()+4096,16);
             tracker.track(transient,0,bytes.data()+4096,16);
@@ -1029,13 +1029,13 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             tracker.track(owner,1,bytes.data(),16);
             require(tracker.snapshot().allocations()==1,"payload tracker could not reuse expired slot");
             {
-                using Ledger=ninfer::exl3::RetainedHostAllocationLedger;
+                using Ledger=voidinfer::exl3::RetainedHostAllocationLedger;
                 struct CreditedOwner {
                     Ledger::Ticket credit;
                     explicit CreditedOwner(Ledger::Ticket value):credit(std::move(value)) {}
                 };
                 Ledger ledger;
-                ninfer::exl3::ReservedHostPayloadTracker<2> credited;
+                voidinfer::exl3::ReservedHostPayloadTracker<2> credited;
                 auto first=std::make_shared<CreditedOwner>(ledger.acquire(16));
                 auto survivor=std::make_shared<CreditedOwner>(ledger.acquire(16));
                 credited.track(first,0,bytes.data(),16);
@@ -1076,19 +1076,19 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         }
         const std::array<std::size_t,5> capacities{1,2,3,4,5};
         const auto half=std::numeric_limits<std::size_t>::max()/sizeof(std::uint16_t);
-        require(!ninfer::exl3::pending_payload_extent(0,{half+1,0,0,0,0}),
+        require(!voidinfer::exl3::pending_payload_extent(0,{half+1,0,0,0,0}),
             "tap-only payload accepted overflowing plane capacity");
-        require(!ninfer::exl3::pending_payload_extent(0,{half,1,0,0,0}),
+        require(!voidinfer::exl3::pending_payload_extent(0,{half,1,0,0,0}),
             "tap-only payload accepted overflowing combined capacity");
-        require(ninfer::exl3::pending_payload_extent(0,capacities)==30,
+        require(voidinfer::exl3::pending_payload_extent(0,capacities)==30,
             "tap-only payload included token or wrapper charge");
-        require(ninfer::exl3::pending_payload_extent(8,capacities,11)==105,
+        require(voidinfer::exl3::pending_payload_extent(8,capacities,11)==105,
             "Pending capacity extent omitted wrapper or tap capacity");
-        require(!ninfer::exl3::pending_payload_extent(std::numeric_limits<std::size_t>::max(),capacities),
+        require(!voidinfer::exl3::pending_payload_extent(std::numeric_limits<std::size_t>::max(),capacities),
             "Pending token capacity overflow accepted");
-        require(!ninfer::exl3::pending_payload_extent(0,capacities,std::numeric_limits<std::size_t>::max()-1),
+        require(!voidinfer::exl3::pending_payload_extent(0,capacities,std::numeric_limits<std::size_t>::max()-1),
             "Pending cumulative tap extent overflow accepted");
-        const std::array<std::int64_t,8> full{0,1,2,3,4,5,6,std::numeric_limits<ninfer::TokenId>::max()};
+        const std::array<std::int64_t,8> full{0,1,2,3,4,5,6,std::numeric_limits<voidinfer::TokenId>::max()};
         auto tokens=round.assign(full);
         require(tokens.size()==8 && tokens.back()==full.back(),"fixed round lost complete token range");
         const auto* storage=tokens.data();
@@ -1108,7 +1108,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             "round overwrite left an earlier borrowed host view readable");
         bool refused=false;try{round.truncate(4);}catch(const std::invalid_argument&){refused=true;}
         require(refused && round.output().size()==3,"expanded decoder prefix mutated fixed round");
-        for(const auto bad:{std::int64_t{-1},std::int64_t{std::numeric_limits<ninfer::TokenId>::max()}+1}) {
+        for(const auto bad:{std::int64_t{-1},std::int64_t{std::numeric_limits<voidinfer::TokenId>::max()}+1}) {
             const std::array<std::int64_t,2> invalid{7,bad};refused=false;
             try{round.assign(invalid);}catch(const std::invalid_argument&){refused=true;}
             require(refused && round.output().size()==3 && round.output().front()==0,
@@ -1143,21 +1143,21 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             round.repair().back()==15,"invalid second block partially replaced retained round");
     }
     {
-        ninfer::StopPolicy stop;
-        require(ninfer::exl3::request_stop_storage_bytes(stop)==0,"empty stop policy charged dynamic storage");
+        voidinfer::StopPolicy stop;
+        require(voidinfer::exl3::request_stop_storage_bytes(stop)==0,"empty stop policy charged dynamic storage");
         stop.token_ids.reserve(17);stop.token_ids.push_back(1);
-        stop.strings.reserve(5);stop.strings.push_back({"x",ninfer::OutputChannel::Content,false});
+        stop.strings.reserve(5);stop.strings.push_back({"x",voidinfer::OutputChannel::Content,false});
         stop.strings.front().text.reserve(257);
-        const auto expected=stop.token_ids.capacity()*sizeof(ninfer::TokenId)+
-            stop.strings.capacity()*sizeof(ninfer::StopString)+stop.strings.front().text.capacity()+1;
-        require(ninfer::exl3::request_stop_storage_bytes(stop)==expected,
+        const auto expected=stop.token_ids.capacity()*sizeof(voidinfer::TokenId)+
+            stop.strings.capacity()*sizeof(voidinfer::StopString)+stop.strings.front().text.capacity()+1;
+        require(voidinfer::exl3::request_stop_storage_bytes(stop)==expected,
             "stop policy charge omitted unused vector or text capacity");
         auto moved=std::move(stop);
-        require(ninfer::exl3::request_stop_storage_bytes(moved)==expected,
+        require(voidinfer::exl3::request_stop_storage_bytes(moved)==expected,
             "stop policy ownership transfer changed retained charge");
         moved.strings.clear();moved.token_ids.clear();
-        require(ninfer::exl3::request_stop_storage_bytes(moved)==
-            moved.token_ids.capacity()*sizeof(ninfer::TokenId)+moved.strings.capacity()*sizeof(ninfer::StopString),
+        require(voidinfer::exl3::request_stop_storage_bytes(moved)==
+            moved.token_ids.capacity()*sizeof(voidinfer::TokenId)+moved.strings.capacity()*sizeof(voidinfer::StopString),
             "cleared stop policy lost retained vector charge or retained destroyed text charge");
     }
     {
@@ -1169,12 +1169,12 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         bool refused=false;
         try {
             auto owner=std::shared_ptr<Value>(new Value{&destroyed},
-                [](Value* value) noexcept {delete value;},ninfer::exl3::ResultControlAllocator<Value>(true));
+                [](Value* value) noexcept {delete value;},voidinfer::exl3::ResultControlAllocator<Value>(true));
         } catch(const std::bad_alloc&){refused=true;}
         require(refused && destroyed==1,"control-block failure did not destroy constructed value exactly once");
         {
             auto retry=std::shared_ptr<Value>(new Value{&destroyed},
-                [](Value* value) noexcept {delete value;},ninfer::exl3::ResultControlAllocator<Value>(false));
+                [](Value* value) noexcept {delete value;},voidinfer::exl3::ResultControlAllocator<Value>(false));
             require(destroyed==1,"control-block retry destroyed live value");
         }
         require(destroyed==2,"control-block retry failed final value destruction");
@@ -1185,7 +1185,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         !output_result_slots_available(9,8,16,0) && !output_result_slots_available(9,16,8,0),
         "output reservation allowed insufficient capacity or invalid used extent");
     const auto largest_size=std::numeric_limits<std::size_t>::max();
-    using ninfer::exl3::output_text_capacity_ceiling;
+    using voidinfer::exl3::output_text_capacity_ceiling;
     require(output_text_capacity_ceiling(0)==32 && output_text_capacity_ceiling(64)==160,
         "text admission capacity policy changed");
     const auto largest_text=(largest_size-32)/2;
@@ -1194,7 +1194,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     bool text_overflow=false;
     try{(void)output_text_capacity_ceiling(largest_text+1);}catch(const std::overflow_error&){text_overflow=true;}
     require(text_overflow,"text capacity ceiling overflow accepted");
-    using ninfer::exl3::output_result_capacity_accepted;
+    using voidinfer::exl3::output_result_capacity_accepted;
     require(output_result_capacity_accepted(8,8,64,160,64,160) &&
         output_result_capacity_accepted(8,8,64,160,160,64) &&
         output_result_capacity_accepted(0,0,3,38,15,15),
@@ -1212,11 +1212,11 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         "output reservation overflowed additive extent");
     const std::array<std::size_t,9> expected_prefix{0,1,1,3,3,3,3,7,8};
     for(std::size_t credit=0;credit<expected_prefix.size();++credit)
-        require(ninfer::exl3::output_delivery_prefix(multibyte,credit)==expected_prefix[credit],
+        require(voidinfer::exl3::output_delivery_prefix(multibyte,credit)==expected_prefix[credit],
             "delivery credit split UTF-8 code point");
-    const std::string large(ninfer::exl3::output_delivery_byte_limit+17,'x');
-    require(ninfer::exl3::output_delivery_prefix(large,ninfer::exl3::output_delivery_byte_limit)==
-        ninfer::exl3::output_delivery_byte_limit,"delivery materialization exceeded byte cap");
+    const std::string large(voidinfer::exl3::output_delivery_byte_limit+17,'x');
+    require(voidinfer::exl3::output_delivery_prefix(large,voidinfer::exl3::output_delivery_byte_limit)==
+        voidinfer::exl3::output_delivery_byte_limit,"delivery materialization exceeded byte cap");
     const auto offered=std::chrono::steady_clock::time_point{}+std::chrono::seconds(1);
     const auto claim_budget=std::chrono::microseconds(1);
     require(Cost::claim_before_deadline(offered,offered,claim_budget),"fresh bounded offer refused");
@@ -1254,11 +1254,11 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     auto duplicate=std::array{entries[0],entries[0]};bool duplicate_refused=false;
     try{Cost invalid(duplicate);}catch(const std::invalid_argument&){duplicate_refused=true;}
     require(duplicate_refused,"ambiguous cost estimates accepted");
-    using Page=ninfer::exl3::Exl3ExactKVPage;
-    using Extent=ninfer::exl3::Exl3ExactKVExtent;
+    using Page=voidinfer::exl3::Exl3ExactKVPage;
+    using Extent=voidinfer::exl3::Exl3ExactKVExtent;
     {
-        using History=ninfer::exl3::Exl3AttentionStageHistory;
-        using Accounting=ninfer::exl3::Exl3SharedControlAccounting;
+        using History=voidinfer::exl3::Exl3AttentionStageHistory;
+        using Accounting=voidinfer::exl3::Exl3SharedControlAccounting;
         const auto baseline=Accounting::live_bytes.load();
         std::weak_ptr<const History::Snapshot> weak;
         {
@@ -1275,7 +1275,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(Accounting::live_bytes.load()==baseline,"history last weak release retained control bytes");
     }
     {
-        ninfer::exl3::Exl3AttentionStageHistory history;
+        voidinfer::exl3::Exl3AttentionStageHistory history;
         auto source=std::make_shared<Page>();source->rows=1;
         source->k[0].resize(1024);source->v[0].resize(1024);
         std::weak_ptr<Page> lifetime=source;
@@ -1296,7 +1296,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         empty.reset();history.clear();
     }
     {
-        using Transfer=ninfer::exl3::Exl3KVTransferLease;
+        using Transfer=voidinfer::exl3::Exl3KVTransferLease;
         auto shared_page=std::make_shared<Page>();shared_page->rows=2;
         shared_page->k[0].resize(2*1024,0x3555);
         auto registration=std::make_shared<int>(1);
@@ -1348,7 +1348,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     require(stale_extent,"extent exposed stale transfer pointer");
     auto captured_rows=Extent::view(mutable_page,0,Extent::Plane::key,1);
     {
-        using Transfer=ninfer::exl3::Exl3KVTransferLease;
+        using Transfer=voidinfer::exl3::Exl3KVTransferLease;
         auto destination=std::make_shared<int>(7),registration=std::make_shared<int>(8);
         std::weak_ptr<int> output_lifetime=destination,registration_lifetime=registration;
         {
@@ -1409,16 +1409,16 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     }
     phase="attention/page/graph contracts";
     {
-        using Key=ninfer::exl3::Exl3DevicePageKey;
+        using Key=voidinfer::exl3::Exl3DevicePageKey;
         auto model=std::make_shared<int>(1);
-        auto published=std::make_shared<ninfer::exl3::Exl3ExactKVPage>();published->rows=64;
+        auto published=std::make_shared<voidinfer::exl3::Exl3ExactKVPage>();published->rows=64;
         for(int bank=0;bank<16;++bank){published->k[bank].resize(64*1024);published->v[bank].resize(64*1024);}
         Key original(model,published,{0,false},64),alias(model,published,{0,false},128);
         for(bool missing_model:{false,true}) {
             bool rejected=false;
             try{Key invalid(missing_model?std::shared_ptr<const void>(std::shared_ptr<const void>{},model.get()):model,
-                missing_model?published:std::shared_ptr<const ninfer::exl3::Exl3ExactKVPage>(
-                    std::shared_ptr<const ninfer::exl3::Exl3ExactKVPage>{},published.get()),{0,false},64);}
+                missing_model?published:std::shared_ptr<const voidinfer::exl3::Exl3ExactKVPage>(
+                    std::shared_ptr<const voidinfer::exl3::Exl3ExactKVPage>{},published.get()),{0,false},64);}
             catch(const std::invalid_argument&){rejected=true;}
             require(rejected,"device page key accepted nonowning model or source alias");
         }
@@ -1426,7 +1426,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         Key shifted(model,published,{1,false},64);
         auto other_model=std::make_shared<int>(1);
         Key foreign(other_model,published,{0,false},64);
-        auto copied_page=std::make_shared<ninfer::exl3::Exl3ExactKVPage>(*published);
+        auto copied_page=std::make_shared<voidinfer::exl3::Exl3ExactKVPage>(*published);
         Key collision(model,copied_page,{0,false},64);
         require(original.shortlist()==collision.shortlist() && !original.same(collision) &&
             !original.same(shifted) && !original.same(foreign),
@@ -1439,10 +1439,10 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         bool unpublished=false;try{Key invalid(model,published,{0,false},63);}
         catch(const std::invalid_argument&){unpublished=true;}
         require(media && unpublished,"device page accepted unsupported media or unpublished tail");
-        using Fill=ninfer::exl3::Exl3DevicePageFill;
+        using Fill=voidinfer::exl3::Exl3DevicePageFill;
         phase="device page bounded metadata credit";
         {
-            using namespace ninfer::exl3;
+            using namespace voidinfer::exl3;
             auto storage=std::make_shared<std::vector<std::uint16_t>>(Fill::elements);
             auto owner=make_bounded_shared<Fill>(original,storage,*storage);
             RetainedDescriptorLedger metadata;
@@ -1522,7 +1522,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         require(!device_owner.expired(),"immutable page handle lost storage owner");
         phase="device page reader identity";
         {
-            using Reader=ninfer::exl3::Exl3DevicePageReader;
+            using Reader=voidinfer::exl3::Exl3DevicePageReader;
             auto view=std::make_shared<Fill::View>(*visible);
             auto lane=std::make_shared<int>(17);std::weak_ptr<int> lane_owner=lane;
             Reader first,second;
@@ -1583,13 +1583,13 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             auto storage=std::make_shared<std::vector<std::uint16_t>>(Fill::elements);
             Fill sealing(original,storage,*storage);storage.reset();
             {
-                using Profile=ninfer::exl3::Exl3AttentionProfile;
+                using Profile=voidinfer::exl3::Exl3AttentionProfile;
                 {
-                    using Plan=ninfer::exl3::Exl3ExactDownLifetimePlan;
+                    using Plan=voidinfer::exl3::Exl3ExactDownLifetimePlan;
                     {
-                        using ninfer::exl3::exl3_require_paired_transform_extents;
+                        using voidinfer::exl3::exl3_require_paired_transform_extents;
                         {
-                            using ninfer::exl3::exl3_require_residual_norm_extents;
+                            using voidinfer::exl3::exl3_require_residual_norm_extents;
                             const std::array<std::uintptr_t,5> buffers{0x1000000,0x2000000,0x3000000,0x4000000,0x5000000};
                             for(int rows:{-1,0,1025,std::numeric_limits<int>::max()}) {
                                 bool refused=false;
@@ -1610,8 +1610,8 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                                 }
                             }
                         }
-                        using Admission=ninfer::exl3::Exl3PairedTransformAdmission;
-                        using ninfer::exl3::exl3_paired_transform_admission;
+                        using Admission=voidinfer::exl3::Exl3PairedTransformAdmission;
+                        using voidinfer::exl3::exl3_paired_transform_admission;
                         for(int rows:{1,8,15,16,256,1024}) {
                             require(exl3_paired_transform_admission(false,false,false,false,rows,true)==Admission::disabled,
                                 "wide rows bypassed disabled paired transform");
@@ -1630,7 +1630,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                         for(int rows:{0,-1})
                             require(exl3_paired_transform_admission(true,false,false,false,rows,true)==Admission::invalid_rows,
                                 "empty or negative paired work admitted");
-                        using ninfer::exl3::exl3_equal_transform_reuse_enabled;
+                        using voidinfer::exl3::exl3_equal_transform_reuse_enabled;
                         require(!exl3_equal_transform_reuse_enabled(nullptr) &&
                             !exl3_equal_transform_reuse_enabled("0") && exl3_equal_transform_reuse_enabled("1"),
                             "paired transform reuse option semantics");
@@ -1664,19 +1664,19 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                             require(refused,"paired transform invalid row indexing admitted");
                         }
                     }
-                    require(!ninfer::exl3::exl3_reconstruction_budget_fallback(nullptr) &&
-                        !ninfer::exl3::exl3_reconstruction_budget_fallback("0") &&
-                        ninfer::exl3::exl3_reconstruction_budget_fallback("1"),"reconstruction budget fallback option");
+                    require(!voidinfer::exl3::exl3_reconstruction_budget_fallback(nullptr) &&
+                        !voidinfer::exl3::exl3_reconstruction_budget_fallback("0") &&
+                        voidinfer::exl3::exl3_reconstruction_budget_fallback("1"),"reconstruction budget fallback option");
                     for(const char* bad:{"","2","true","01"}) {
                         bool refused=false;
-                        try{ninfer::exl3::exl3_reconstruction_budget_fallback(bad);}
+                        try{voidinfer::exl3::exl3_reconstruction_budget_fallback(bad);}
                         catch(const std::invalid_argument&){refused=true;}
                         require(refused,"malformed reconstruction fallback admitted");
                     }
                     {
                         auto model=std::make_shared<int>(7),other=std::make_shared<int>(7);
                         std::weak_ptr<int> weak=model;
-                        ninfer::exl3::Exl3ReconstructionStream binding;
+                        voidinfer::exl3::Exl3ReconstructionStream binding;
                         binding.bind_model(model,4096,true);
                         binding.require_identity(model,4096,true);
                         for(int mismatch=0;mismatch<4;++mismatch) {
@@ -1690,7 +1690,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                         model.reset();require(!weak.expired(),"reconstruction backing lost model owner");
                     }
                     {
-                        using Alloc=ninfer::exl3::Exl3ReconstructionControlAllocator<std::byte>;
+                        using Alloc=voidinfer::exl3::Exl3ReconstructionControlAllocator<std::byte>;
                         bool admitted=false;
                         Alloc allocator(&admitted);
                         bool oversized=false;
@@ -1713,8 +1713,8 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                         weak.reset(); // Control deallocation must not dereference freed Owner::admitted.
                     }
                         {
-                            ninfer::exl3::Exl3ProjectionGraphBinding binding;
-                            using Options=ninfer::exl3::Exl3ProjectionGraphOptions;
+                            voidinfer::exl3::Exl3ProjectionGraphBinding binding;
+                            using Options=voidinfer::exl3::Exl3ProjectionGraphOptions;
                             const auto absent=Options::from_values({nullptr,nullptr,nullptr});
                             require(absent.matches(absent),"absent graph options mismatch");
                             for(const auto changed:{Options::from_values({"1",nullptr,nullptr}),
@@ -1768,16 +1768,16 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                         }
                     for(int columns:{256,512,1024,5120}) {
                         for(int remaining:{16,17,23,31,32}) {
-                            const auto tail=ninfer::exl3::exl3_prefill_chunk_step(32,remaining,16,48,true);
-                            const auto canonical=ninfer::exl3::exl3_prefill_chunk_step(32,remaining,16,48);
+                            const auto tail=voidinfer::exl3::exl3_prefill_chunk_step(32,remaining,16,48,true);
+                            const auto canonical=voidinfer::exl3::exl3_prefill_chunk_step(32,remaining,16,48);
                             require(tail.rows==remaining && tail.next_position==16+remaining,
                                 "actual tail lost represented rows");
                             require(canonical.rows==(remaining==32?32:16),"tail option changed canonical default");
-                            const auto narrow=ninfer::exl3::exl3_prefill_chunk_step(16,remaining,16,48,true);
+                            const auto narrow=voidinfer::exl3::exl3_prefill_chunk_step(16,remaining,16,48,true);
                             require(narrow.rows==16,"tail widened configured row capacity");
                         }
-                        using Consumer=ninfer::exl3::Exl3HeadConsumer;
-                        using Head=ninfer::exl3::Exl3HeadConsumerPlan;
+                        using Consumer=voidinfer::exl3::Exl3HeadConsumer;
+                        using Head=voidinfer::exl3::Exl3HeadConsumerPlan;
                         require(Head::make(1,Consumer::verification,true).root_row==0,
                             "single-row head omission lost only row");
                         for(int bad:{0,-1}) {
@@ -1797,30 +1797,30 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                             require(refused,"unsafe head omission admitted");
                         }
                         const auto bytes=std::size_t(17408)*columns*2;
-                        require(ninfer::exl3::exl3_reconstruction_reservation_fits(bytes),
+                        require(voidinfer::exl3::exl3_reconstruction_reservation_fits(bytes),
                             "implemented reconstruction reservation rejected");
-                        require(!ninfer::exl3::exl3_reconstruction_reservation_fits(bytes-1) &&
-                            !ninfer::exl3::exl3_reconstruction_reservation_fits(bytes+1),
+                        require(!voidinfer::exl3::exl3_reconstruction_reservation_fits(bytes-1) &&
+                            !voidinfer::exl3::exl3_reconstruction_reservation_fits(bytes+1),
                             "unsupported reconstruction reservation selected");
-                        require(ninfer::exl3::exl3_down_slice_columns(bytes)==columns,
+                        require(voidinfer::exl3::exl3_down_slice_columns(bytes)==columns,
                             "reconstruction bounded slice capacity mismatch");
                         const auto plan=Plan::make(256,5,6,false,true,false,columns);
                         require(plan.buffers[1].bytes==bytes && plan.buffers[2].bytes==256ull*5120*5*4,
                             "slice altered parent accumulator topology");
                         bool refused=false;
-                        try{ninfer::exl3::exl3_down_slice_columns(bytes-1);}
+                        try{voidinfer::exl3::exl3_down_slice_columns(bytes-1);}
                         catch(const std::invalid_argument&){refused=true;}
                         require(refused,"short reconstruction slice admitted");
                     }
                     for(const char* invalid:{"","0","255","2048","0512","512 "}) {
                         bool refused=false;
-                        try{ninfer::exl3::exl3_reconstruction_slice_columns(invalid);}
+                        try{voidinfer::exl3::exl3_reconstruction_slice_columns(invalid);}
                         catch(const std::invalid_argument&){refused=true;}
                         require(refused,"invalid reconstruction slice option admitted");
                     }
                     for(bool invalid_owner:{false,true}) {
                         int queries=0,actions=0;
-                        const auto result=ninfer::exl3::exl3_retire_reconstruction_device(invalid_owner?-1:3,
+                        const auto result=voidinfer::exl3::exl3_retire_reconstruction_device(invalid_owner?-1:3,
                             [&](int* device) noexcept {++queries;*device=-1;return 0;},
                             [&](int) noexcept {++actions;return 0;},
                             [&]() noexcept {++actions;return 0;},[&]() noexcept {++actions;});
@@ -1830,7 +1830,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     for(int failure=0;failure<=4;++failure) {
                         int current=7,drains=0,releases=0,selections=0;
                         bool correct_release_device=false;
-                        const auto result=ninfer::exl3::exl3_retire_reconstruction_device(3,
+                        const auto result=voidinfer::exl3::exl3_retire_reconstruction_device(3,
                             [&](int* device) noexcept {*device=current;return failure==1?11:0;},
                             [&](int device) noexcept {
                                 ++selections;
@@ -1851,7 +1851,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     }
                     {
                         int releases=0,selections=0;
-                        const auto result=ninfer::exl3::exl3_retire_reconstruction_device(3,
+                        const auto result=voidinfer::exl3::exl3_retire_reconstruction_device(3,
                             [](int* device) noexcept {*device=3;return 0;},
                             [&](int) noexcept {++selections;return 0;},
                             []() noexcept {return 0;},[&]() noexcept {++releases;},true);
@@ -1859,7 +1859,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                             "reconstruction injected retirement bypassed retention");
                     }
                     for(std::uintptr_t first:{std::uintptr_t(0),std::uintptr_t(17)}) {
-                        ninfer::exl3::Exl3ReconstructionStream slab;
+                        voidinfer::exl3::Exl3ReconstructionStream slab;
                         slab.require_ordered(first);slab.require_ordered(first);
                         bool refused=false;
                         try{slab.require_ordered(first==0?17:0);}
@@ -1879,7 +1879,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                             require(failed,"reconstruction failed slab admitted reuse");
                         }
                     }
-                    using ninfer::exl3::exl3_reconstruction_k6_down_option;
+                    using voidinfer::exl3::exl3_reconstruction_k6_down_option;
                     for(bool slab:{false,true}) {
                         require(!exl3_reconstruction_k6_down_option(nullptr,slab) &&
                             !exl3_reconstruction_k6_down_option("0",slab),"K6 reconstruction default isolation");
@@ -1942,18 +1942,18 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     }
                 }
                 {
-                    using Step=ninfer::exl3::Exl3AttentionScratchStep;
-                    using Life=ninfer::exl3::Exl3AttentionScratchLifetime;
+                    using Step=voidinfer::exl3::Exl3AttentionScratchStep;
+                    using Life=voidinfer::exl3::Exl3AttentionScratchLifetime;
                     const Life input{Step::input_norm,Step::qkv_projection,8192};
                     const Life mlp{Step::residual_norm,Step::mlp_projection,8192};
-                    require(ninfer::exl3::exl3_attention_scratch_can_alias(input,mlp,true,false,false),
+                    require(voidinfer::exl3::exl3_attention_scratch_can_alias(input,mlp,true,false,false),
                         "disjoint input/MLP lifetimes refused");
-                    require(!ninfer::exl3::exl3_attention_scratch_can_alias(input,mlp,true,true,false) &&
-                        !ninfer::exl3::exl3_attention_scratch_can_alias(input,mlp,false,false,false) &&
-                        !ninfer::exl3::exl3_attention_scratch_can_alias(input,mlp,true,false,true),
+                    require(!voidinfer::exl3::exl3_attention_scratch_can_alias(input,mlp,true,true,false) &&
+                        !voidinfer::exl3::exl3_attention_scratch_can_alias(input,mlp,false,false,false) &&
+                        !voidinfer::exl3::exl3_attention_scratch_can_alias(input,mlp,true,false,true),
                         "diagnostic/cross-stream/failed-consumer lifetime admitted alias");
                     const Life overlapping{Step::qkv_projection,Step::attention,8192};
-                    require(!ninfer::exl3::exl3_attention_scratch_can_alias(input,overlapping,true,false,false),
+                    require(!voidinfer::exl3::exl3_attention_scratch_can_alias(input,overlapping,true,false,false),
                         "shared producer-consumer endpoint admitted alias");
                 }
                 {
@@ -1976,9 +1976,9 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                         !attention_reference::visible(3,3,-1,0),"reference admitted padded query");
                 }
                 {
-                    using Route=ninfer::exl3::Exl3SegmentedAttentionRoute;
-                    using ninfer::exl3::exl3_segmented_attention_route;
-                    using ninfer::exl3::exl3_direct_staged_attention_supported;
+                    using Route=voidinfer::exl3::Exl3SegmentedAttentionRoute;
+                    using voidinfer::exl3::exl3_segmented_attention_route;
+                    using voidinfer::exl3::exl3_direct_staged_attention_supported;
                     for(int rows:{1,8,16})for(int score_rows:{1,8,16})
                         require(exl3_direct_staged_attention_supported(true,rows,64,64+rows,score_rows),
                             "direct staged native row menu rejected exact-fit consumer");
@@ -2009,20 +2009,26 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                         exl3_segmented_attention_route(true,true,8,64,57,128,24,4,256,true,false,false)==Route::inherited,
                         "precision/profile/head/offset exclusion lost");
                 }
+                // L0 OSCAR (the default KV tier) keeps only the exact sink/ring window in scratch.
+                require(voidinfer::exl3::exl3_exact_attention_capacity(65536)==
+                        voidinfer::exl3::kExl3L0ExactWindowKeys+64,"L0 exact attention window");
                 for(int rows:{1,8,16})
-                    require(ninfer::exl3::exl3_exact_attention_score_bytes(rows,65536)==
-                        static_cast<std::size_t>(rows)*100*65536*4,"exact attention scratch extent");
+                    require(voidinfer::exl3::exl3_exact_attention_score_bytes(rows,65536)==
+                        static_cast<std::size_t>(rows)*100*(voidinfer::exl3::kExl3L0ExactWindowKeys+64)*4,
+                        "exact attention scratch extent");
                 for(int rows:{-1,0,17}) {
                     bool refused=false;
-                    try{ninfer::exl3::exl3_exact_attention_score_bytes(rows,64);}catch(const std::invalid_argument&){refused=true;}
+                    try{voidinfer::exl3::exl3_exact_attention_score_bytes(rows,64);}catch(const std::invalid_argument&){refused=true;}
                     require(refused,"unsupported score row menu admitted");
                 }
                 {
-                    using Route=ninfer::exl3::Exl3AttentionStageRoute;
+                    using Route=voidinfer::exl3::Exl3AttentionStageRoute;
                     Route route;route.enabled=route.owners=route.host_kv=route.copy_stream=true;
                     route.position=64;route.rows=16;route.context_capacity=80;route.pages=1;
                     require(route.eligible(),"exact-fit staging route refused");
-                    for(auto member:{&Route::private_prefix,&Route::shared_attention,&Route::shared_copy,
+                    auto prefix_root=route;prefix_root.private_prefix=true;
+                    require(prefix_root.eligible(),"private prefix-root staging route refused");
+                    for(auto member:{&Route::shared_attention,&Route::shared_copy,
                         &Route::media,&Route::wide,&Route::profiling,&Route::observer,&Route::capture,&Route::graph,&Route::oscar}) {
                         auto excluded=route;excluded.*member=true;
                         require(!excluded.eligible(),"unsupported staging route admitted");
@@ -2039,11 +2045,11 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     excluded.pages=0;require(!excluded.eligible(),"empty staging history admitted");
                 }
                 {
-                    using Extent=ninfer::exl3::Exl3ExactKVExtent;
-                    auto page=std::make_shared<ninfer::exl3::Exl3ExactKVPage>();
+                    using Extent=voidinfer::exl3::Exl3ExactKVExtent;
+                    auto page=std::make_shared<voidinfer::exl3::Exl3ExactKVPage>();
                     page->rows=1;page->k[0].resize(1024);page->v[0].resize(1024);
                     auto destination=std::make_shared<int>(0);
-                    ninfer::exl3::Exl3AttentionStage stages;
+                    voidinfer::exl3::Exl3AttentionStage stages;
                     const auto extent=Extent::view(page,0,Extent::Plane::key,1);
                     for(bool missing_acquisition:{false,true}) {
                         auto candidate=std::make_shared<int>(9);
@@ -2058,7 +2064,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     }
                     const auto first=stages.begin(0,extent,destination,1,1,101,102);
                     {
-                        ninfer::exl3::Exl3AttentionStage other;
+                        voidinfer::exl3::Exl3AttentionStage other;
                         const auto peer=other.begin(0,extent,destination,1,1,101,102);
                         require(peer.slot==first.slot && peer.generation==first.generation &&
                             peer.owner_identity!=first.owner_identity,
@@ -2143,19 +2149,19 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     page->k[0].swap(original_plane);
                 }
                 for(bool scores:{false,true}) {
-                    require(!ninfer::exl3::exl3_attention_query_pair_option(nullptr,scores) &&
-                        !ninfer::exl3::exl3_attention_query_pair_option("0",scores),
+                    require(!voidinfer::exl3::exl3_attention_query_pair_option(nullptr,scores) &&
+                        !voidinfer::exl3::exl3_attention_query_pair_option("0",scores),
                         "query-pair default or explicit opt-out changed");
                     for(const char* value:{"","2","-1","true","01","1 "," 1"}) {
                         bool refused=false;
-                        try{ninfer::exl3::exl3_attention_query_pair_option(value,scores);}
+                        try{voidinfer::exl3::exl3_attention_query_pair_option(value,scores);}
                         catch(const std::invalid_argument&){refused=true;}
                         require(refused,"query-pair accepted malformed option");
                     }
                 }
-                require(ninfer::exl3::exl3_attention_query_pair_option("1",true),"query-pair opt-in lost");
+                require(voidinfer::exl3::exl3_attention_query_pair_option("1",true),"query-pair opt-in lost");
                 bool missing_scores=false;
-                try{ninfer::exl3::exl3_attention_query_pair_option("1",false);}
+                try{voidinfer::exl3::exl3_attention_query_pair_option("1",false);}
                 catch(const std::invalid_argument&){missing_scores=true;}
                 require(missing_scores,"query-pair configured without parallel score storage");
                 Profile scalar;scalar.scores=true;
@@ -2180,7 +2186,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                 require(!paired.segmented(),"segmented profile admitted without score scratch");
             }
             for(int rows:{1,8,16}) {
-                ninfer::exl3::Exl3AttentionCausalRows mask{127,rows,127+rows};
+                voidinfer::exl3::Exl3AttentionCausalRows mask{127,rows,127+rows};
                 for(int query=0;query<rows;++query) {
                     require(mask.count(query)==128+query,"native verifier row causal endpoint");
                     for(int key=0;key<127+rows;++key)
@@ -2192,7 +2198,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             }
             {
                 std::uint16_t local=0,shared=0;
-                ninfer::exl3::Exl3AttentionInputView input{&local,&local,256};
+                voidinfer::exl3::Exl3AttentionInputView input{&local,&local,256};
                 input.shared.append(&shared,&shared,64,64,192);
                 input.require_geometry(192,8);
                 input.stride=512;bool stride=false;
@@ -2203,7 +2209,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                 auto local_owner=std::make_shared<int>(1),segment_owner=std::make_shared<int>(2);
                 std::weak_ptr<int> retained=segment_owner;
                 {
-                    ninfer::exl3::Exl3OwnedAttentionInputView owned(&local,&local,256,local_owner,local_owner);
+                    voidinfer::exl3::Exl3OwnedAttentionInputView owned(&local,&local,256,local_owner,local_owner);
                     bool missing=false;
                     try{owned.append({&shared,&shared,64,64},{},192);}catch(const std::invalid_argument&){missing=true;}
                     require(missing,"owned attention admitted missing segment owner");
@@ -2217,7 +2223,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     for(int fault=0;fault<4;++fault) {
                         auto rejected_owner=std::make_shared<int>(3);
                         std::weak_ptr<int> rejected_lifetime=rejected_owner;
-                        ninfer::exl3::Exl3AttentionPageRanges::Range range{&shared,&shared,128,64};
+                        voidinfer::exl3::Exl3AttentionPageRanges::Range range{&shared,&shared,128,64};
                         if(fault==0)range.first=127;
                         if(fault==1)range.rows=65;
                         if(fault==2)range.k=nullptr;
@@ -2236,22 +2242,22 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                 }
                 require(retained.expired(),"owned attention retained released input view");
                 bool missing_local=false;
-                try{ninfer::exl3::Exl3OwnedAttentionInputView invalid(&local,&local,256,local_owner,{});}
+                try{voidinfer::exl3::Exl3OwnedAttentionInputView invalid(&local,&local,256,local_owner,{});}
                 catch(const std::invalid_argument&){missing_local=true;}
                 require(missing_local,"owned attention accepted missing private V owner");
                 const std::shared_ptr<const void> borrowed_local(std::shared_ptr<const void>{},&local);
                 for(bool key:{false,true}) {
                     bool rejected=false;
-                    try{ninfer::exl3::Exl3OwnedAttentionInputView invalid(&local,&local,256,
+                    try{voidinfer::exl3::Exl3OwnedAttentionInputView invalid(&local,&local,256,
                         key?borrowed_local:local_owner,key?local_owner:borrowed_local);}
                     catch(const std::invalid_argument&){rejected=true;}
                     require(rejected,"owned attention accepted ownerless local alias");
                 }
-                ninfer::exl3::Exl3OwnedAttentionInputView local_only(&local,&local,256,local_owner,local_owner);
+                voidinfer::exl3::Exl3OwnedAttentionInputView local_only(&local,&local,256,local_owner,local_owner);
                 local_only.append_local_complement(192);
                 require(local_only.require_geometry(192,8).shared.count==0,"local-only view invented shared segments");
                 for(int fault=0;fault<3;++fault) {
-                    ninfer::exl3::Exl3OwnedAttentionInputView invalid(&local,&local,256,local_owner,local_owner);
+                    voidinfer::exl3::Exl3OwnedAttentionInputView invalid(&local,&local,256,local_owner,local_owner);
                     invalid.append({&shared,&shared,64,64},std::make_shared<int>(4),192);
                     if(fault==0)invalid.append_local(0,63,192); // gap before shared segment
                     if(fault==1) {
@@ -2265,7 +2271,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                     try{invalid.require_geometry(192,8);}catch(const std::invalid_argument&){incomplete=true;}
                     require(incomplete,"owned attention admitted incomplete chronological coverage");
                 }
-                ninfer::exl3::Exl3OwnedAttentionInputView reordered(&local,&local,256,local_owner,local_owner);
+                voidinfer::exl3::Exl3OwnedAttentionInputView reordered(&local,&local,256,local_owner,local_owner);
                 reordered.append({&shared,&shared,128,64},std::make_shared<int>(5),192);
                 reordered.append({&shared,&shared,0,64},std::make_shared<int>(6),192);
                 reordered.append_local_complement(192);
@@ -2274,7 +2280,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
             }
             {
                 int xyz[3]{},other[3]{};
-                ninfer::exl3::Exl3AttentionPositionContract position{xyz,7};
+                voidinfer::exl3::Exl3AttentionPositionContract position{xyz,7};
                 position.require_current(xyz,7);
                 bool offset=false,identity=false;
                 try{position.require_current(xyz,8);}catch(const std::invalid_argument&){offset=true;}
@@ -2282,51 +2288,51 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                 require(offset && identity,"segmented rotary binding accepted changed offset/source");
             }
             {
-                auto a=std::make_shared<ninfer::exl3::Exl3ExactKVPage>();a->rows=64;
-                auto b=std::make_shared<ninfer::exl3::Exl3ExactKVPage>();b->first=64;b->rows=16;
+                auto a=std::make_shared<voidinfer::exl3::Exl3ExactKVPage>();a->rows=64;
+                auto b=std::make_shared<voidinfer::exl3::Exl3ExactKVPage>();b->first=64;b->rows=16;
                 a->k[0].resize(64*1024);a->v[0].resize(64*1024);
                 b->k[0].resize(16*1024);b->v[0].resize(16*1024);
-                std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactKVPage>,2> pages{a,b};
-                ninfer::exl3::exl3_require_attention_history(pages,72,0);
+                std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactKVPage>,2> pages{a,b};
+                voidinfer::exl3::exl3_require_attention_history(pages,72,0);
                 for(int end:{65,71,79,80})
-                    ninfer::exl3::exl3_require_attention_history(pages,end,0);
+                    voidinfer::exl3::exl3_require_attention_history(pages,end,0);
                 for(int end:{0,1,63,64,81}) {
                     bool refused=false;
-                    try{ninfer::exl3::exl3_require_attention_history(pages,end,0);}
+                    try{voidinfer::exl3::exl3_require_attention_history(pages,end,0);}
                     catch(const std::invalid_argument&){refused=true;}
                     require(refused,"attention history accepted extra page or absent final row");
                 }
                 for(int end:{1,63,64})
-                    ninfer::exl3::exl3_require_attention_history(std::span(pages).first(1),end,0);
+                    voidinfer::exl3::exl3_require_attention_history(std::span(pages).first(1),end,0);
                 b->first=63;
                 bool overlap=false;
-                try{ninfer::exl3::exl3_require_attention_history(pages,72,0);}
+                try{voidinfer::exl3::exl3_require_attention_history(pages,72,0);}
                 catch(const std::invalid_argument&){overlap=true;}
                 require(overlap,"attention history accepted overlapping page boundary");
                 b->first=64;
                 bool missing=false,gap=false,reordered=false;
-                try{ninfer::exl3::exl3_require_attention_history(std::span(pages.data(),1),72,0);}
+                try{voidinfer::exl3::exl3_require_attention_history(std::span(pages.data(),1),72,0);}
                 catch(const std::invalid_argument&){missing=true;}
                 b->first=65;
-                try{ninfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){gap=true;}
+                try{voidinfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){gap=true;}
                 b->first=64;std::swap(pages[0],pages[1]);
-                try{ninfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){reordered=true;}
+                try{voidinfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){reordered=true;}
                 require(missing && gap && reordered,"attention history admitted missing/gapped/reordered prefix");
                 std::swap(pages[0],pages[1]);
                 b->v[0].resize(7*1024);
                 bool short_value=false;
-                try{ninfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){short_value=true;}
+                try{voidinfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){short_value=true;}
                 b->v[0].resize(16*1024);pages[1].reset();
                 bool null_page=false;
-                try{ninfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){null_page=true;}
+                try{voidinfer::exl3::exl3_require_attention_history(pages,72,0);}catch(const std::invalid_argument&){null_page=true;}
                 require(short_value && null_page,"attention history admitted short V plane or null segment");
-                ninfer::exl3::exl3_require_attention_history({},0,0);
+                voidinfer::exl3::exl3_require_attention_history({},0,0);
                 bool absent=false;
-                try{ninfer::exl3::exl3_require_attention_history({},1,0);}catch(const std::invalid_argument&){absent=true;}
+                try{voidinfer::exl3::exl3_require_attention_history({},1,0);}catch(const std::invalid_argument&){absent=true;}
                 require(absent,"nonempty attention accepted empty history");
             }
             {
-                ninfer::exl3::Exl3AttentionPageRanges ranges;
+                voidinfer::exl3::Exl3AttentionPageRanges ranges;
                 std::uint16_t token=0;
                 ranges.append(&token,&token,128,64,256);
                 ranges.append(&token,&token,0,64,256);
@@ -2347,7 +2353,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
                 sealing.plane_submitted(generation,bank,key_plane);
             require(sealing.finish(generation,0),"sealing fixture readiness");
             auto shared=sealing.ready_handle();
-            using Reader=ninfer::exl3::Exl3DevicePageReader;
+            using Reader=voidinfer::exl3::Exl3DevicePageReader;
             Reader first,second;
             first.bind(shared,original,shared->generation(),model);
             second.bind(shared,original,shared->generation(),model);
@@ -2401,8 +2407,8 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         phase="device page reader quarantine";
         const auto retained=Fill::quarantined_records();
         {
-            using Reader=ninfer::exl3::Exl3DevicePageReader;
-            using Transfer=ninfer::exl3::Exl3KVTransferLease;
+            using Reader=voidinfer::exl3::Exl3DevicePageReader;
+            using Transfer=voidinfer::exl3::Exl3KVTransferLease;
             const auto quarantined=Transfer::quarantined_records();
             std::weak_ptr<const void> failed_storage,failed_event,successful_event;
             {
@@ -2500,7 +2506,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     bool short_storage=false;try{Extent::view(short_plane,0,Extent::Plane::key,2);}catch(const std::invalid_argument&){short_storage=true;}
     require(short_storage,"extent read beyond represented storage");
     phase="borrowed linear workspace contract";
-    using Linear=ninfer::exl3::Exl3LinearWorkspaceRequirements;
+    using Linear=voidinfer::exl3::Exl3LinearWorkspaceRequirements;
     {
         const auto required=Linear::derive(128,128,1,true,true);
         alignas(16) std::array<std::byte,2816> storage{};
@@ -2539,7 +2545,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
         struct Owner {void* ptr;std::size_t bytes;std::shared_ptr<int> lifetime;};
         std::weak_ptr<int> retained;
         {
-            ninfer::exl3::Exl3FixedAllocationOwners<Owner,2> owners;
+            voidinfer::exl3::Exl3FixedAllocationOwners<Owner,2> owners;
             int storage=0;void* destination=nullptr;std::size_t total=0;unsigned calls=0;
             const auto factory=[&] {
                 ++calls;auto lifetime=std::make_shared<int>();retained=lifetime;
@@ -2632,9 +2638,9 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     catch(const std::overflow_error&){huge=true;}
     require(huge,"workspace accumulation overflow accepted");
     phase="resource availability and terminal inventory";
-    using Availability=ninfer::exl3::Exl3DeviceAvailability;
+    using Availability=voidinfer::exl3::Exl3DeviceAvailability;
     {
-        using ninfer::exl3::exl3_host_metadata_limit;
+        using voidinfer::exl3::exl3_host_metadata_limit;
         require(exl3_host_metadata_limit(nullptr)==std::numeric_limits<std::uint64_t>::max() &&
             exl3_host_metadata_limit("0")==0 && exl3_host_metadata_limit("4096")==4096 &&
             exl3_host_metadata_limit("18446744073709551615")==std::numeric_limits<std::uint64_t>::max(),
@@ -2661,8 +2667,8 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     bool failed=false;try{Availability::read([&]{return Availability{100,100,observed,1};});}
     catch(const std::runtime_error&){failed=true;}
     require(failed,"failed provider converted into free capacity");
-    using Taps=ninfer::exl3::Exl3EngineTapRequirements;
-    require(Taps::for_lanes(1).units[0]==5ULL*16*5120*2,"C1 allocator requirement drift");
+    using Taps=voidinfer::exl3::Exl3EngineTapRequirements;
+    require(Taps::for_lanes(1).units[0]==5ULL*16*5120*2+248320ULL*4,"C1 allocator requirement drift");
     require(Taps::for_lanes(2).units[0]==2*Taps::for_lanes(1).units[0],"C2 allocator requirement drift");
     const auto with_metadata=Taps::for_lanes(2,40);
     require(with_metadata.units[0]==Taps::for_lanes(2).units[0] &&
@@ -2671,7 +2677,7 @@ int main(){const char* phase="initial ownership/storage contracts";try{
     bool metadata_overflow=false;
     try{Taps::for_lanes(2,UINT64_MAX);}catch(const std::overflow_error&){metadata_overflow=true;}
     require(metadata_overflow,"tap owner metadata overflow accepted");
-    for(unsigned count:{0U,3U,16U}) {
+    for(unsigned count:{0U,9U,16U}) {
         bool refused=false;try{Taps::for_lanes(count);}catch(const std::invalid_argument&){refused=true;}
         require(refused,"unsupported tap allocation menu accepted");
     }

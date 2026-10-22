@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Dispatch-time projection options must match the captured arithmetic route.
 // Fixed storage avoids metadata allocation at graph admission. Oversized values
 // are unrepresentable and cannot authorize graph reuse (no truncated identity).
@@ -32,10 +32,10 @@ struct Exl3ProjectionGraphOptions {
         return result;
     }
     static Exl3ProjectionGraphOptions current() noexcept {
-        return from_values({std::getenv("NINFER_EXL3_GENERIC_SPLITS"),
-            std::getenv("NINFER_EXL3_LARGE_DOWN_SPLITS"),
-            std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY"),
-            std::getenv("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS")});
+        return from_values({std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS"),
+            std::getenv("VOIDINFER_EXL3_LARGE_DOWN_SPLITS"),
+            std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY"),
+            std::getenv("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS")});
     }
     bool matches(const Exl3ProjectionGraphOptions& other) const noexcept {
         return valid && other.valid && present==other.present && values==other.values;

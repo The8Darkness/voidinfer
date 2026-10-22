@@ -5,18 +5,18 @@ struct CrossRequestProjectionCapture {
     std::string wanted_operation;
     int layer=-1;
     std::string operation;
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     int rows=0;
     std::unique_ptr<DeviceBuffer> input;
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+        const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
         void* user) {
         static_cast<CrossRequestProjectionCapture*>(user)->observe(observation);
     }
 
-    void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if(input || x.rows!=128 || x.metadata.K!=6 ||
            (x.metadata.in_features==17408&&x.metadata.out_features==5120)) return;
         if(wanted_layer>=0 &&
@@ -36,12 +36,12 @@ struct CrossRequestProjectionCapture {
 
 void run_cross_request_projection_batch_t0(
     Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     require(target.max_context()==1024,
         "cross-request projection batch max context");
     require(source.size()>=640,
         "cross-request projection batch source extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
 
     std::array<std::unique_ptr<Exl3TextContext>,2> contexts;
     std::array<CrossRequestProjectionCapture,2> captures;
@@ -58,7 +58,7 @@ void run_cross_request_projection_batch_t0(
         }
         contexts[request]->set_target_projection_observer_for_test(
             CrossRequestProjectionCapture::callback,&captures[request],nullptr,
-            ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+            voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
         contexts[request]->append_prefill_wide(std::span<const std::int64_t>(
             source.data()+offset+16,128));
         contexts[request]->set_target_projection_observer_for_test(nullptr);
@@ -166,7 +166,7 @@ void run_cross_request_projection_batch_t0(
         "cross-request second input after");
     require(input_after==input_second,"cross-request second input mutated");
 
-    std::ofstream timing(env("NINFER_T51_TIMING_CSV"));
+    std::ofstream timing(env("VOIDINFER_T51_TIMING_CSV"));
     require(timing.good(),"cross-request projection timing output");
     timing<<"rep,order,separate_us,combined_us,gain_pct\n";
     cudaEvent_t begin=nullptr,end=nullptr;

@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 constexpr int kPrefillRows = 14;
 constexpr int kHidden = 5120;
 constexpr int kVocab = 248320;
@@ -129,10 +129,10 @@ std::vector<std::int64_t> greedy_sequence(Exl3TextContext& context, int steps) {
 
 int main() {
     try {
-        const auto target = env("NINFER_EXL3_TARGET_PATH");
-        const auto oracle_path = env("NINFER_EXL3_ORACLE_PATH");
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH");
+        const auto oracle_path = env("VOIDINFER_EXL3_ORACLE_PATH");
         if (target.empty() || oracle_path.empty()) {
-            std::cerr << "E4C1E skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n";
+            std::cerr << "E4C1E skipped: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_ORACLE_PATH\n";
             return 77;
         }
         const auto oracle = inspect_file(oracle_path);

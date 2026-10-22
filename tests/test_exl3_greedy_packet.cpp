@@ -1,7 +1,7 @@
 #include "exl3/greedy_packet.h"
 #include <iostream>
 #include <vector>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void need(bool ok) {if(!ok) throw std::runtime_error("packet assertion");}
 template<class F> void refuses(F f) {
     bool rejected=false;try {f();} catch(const std::runtime_error&) {rejected=true;}
@@ -13,17 +13,17 @@ template<class F> void refuses_invalid(F f) {
 }
 int main() {
     try {
-        const auto* saved_option=std::getenv("NINFER_EXL3_DEVICE_GREEDY");
+        const auto* saved_option=std::getenv("VOIDINFER_EXL3_DEVICE_GREEDY");
         const std::string saved=saved_option?saved_option:"";
-        _putenv_s("NINFER_EXL3_DEVICE_GREEDY","");
+        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","");
         need(exl3_device_greedy_enabled());
-        _putenv_s("NINFER_EXL3_DEVICE_GREEDY","0");
+        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","0");
         need(!exl3_device_greedy_enabled());
-        _putenv_s("NINFER_EXL3_DEVICE_GREEDY","1");
+        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","1");
         need(exl3_device_greedy_enabled());
-        _putenv_s("NINFER_EXL3_DEVICE_GREEDY","invalid");
+        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY","invalid");
         refuses_invalid([]{(void)exl3_device_greedy_enabled();});
-        _putenv_s("NINFER_EXL3_DEVICE_GREEDY",saved.c_str());
+        _putenv_s("VOIDINFER_EXL3_DEVICE_GREEDY",saved.c_str());
         for(unsigned rows:{1u,8u,16u}) {
             Exl3GreedyPacket packet;
             packet.rows=rows;packet.generation=19;packet.position=1024;

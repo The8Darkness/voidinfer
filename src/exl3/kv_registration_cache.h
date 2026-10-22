@@ -5,7 +5,7 @@
 #include <mutex>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Bounded weak lookup, not a pinned-storage pool. Registry inventory
 // retains successful physical owners until explicit idle retirement. Transfer
 // reader pins prevent eviction from unregistering an in-flight source.

@@ -1,4 +1,4 @@
-#include <ninfer/targets/qwen3_6/vision_control.h>
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::targets::qwen3_6 {
+namespace voidinfer::targets::qwen3_6 {
 namespace {
 
 constexpr std::int32_t kMerge        = 2;
@@ -202,4 +202,4 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
     return out;
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace voidinfer::targets::qwen3_6

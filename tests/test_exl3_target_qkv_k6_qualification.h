@@ -2,7 +2,7 @@
 #include "test_exl3_target_qkv_k6_oracle.h"
 
 struct TargetQkvK6Qualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_continuation_qkv;
     static constexpr int output = 10240;
     static constexpr std::size_t guard = 128, extent = 8u * output;
@@ -19,11 +19,11 @@ struct TargetQkvK6Qualification {
         f.write(reinterpret_cast<const char*>(data.data()),data.size()*sizeof(T));
         require(f.good(),"qkv raw evidence write");
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         if (std::string(x.operation)=="qkv" && x.metadata.K==6)
             static_cast<TargetQkvK6Qualification*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         require(x.rows==8 && x.metadata.K==6 && x.metadata.in_features==kHidden && x.metadata.out_features==output && std::string(x.operation)=="qkv","qkv capture extent");
         require(std::find(layers.begin(),layers.end(),x.layer)==layers.end(),"duplicate qkv capture");
         require(x.layer>=0 && x.layer<64 && x.layer%4!=3,"qkv GDN owner layer");
@@ -32,13 +32,13 @@ struct TargetQkvK6Qualification {
         std::vector<std::uint16_t> input(8u*kHidden);
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),"qkv input copy");
         require(std::all_of(input.begin(),input.end(),[](std::uint16_t v){return (v&0x7c00)!=0x7c00;}),"qkv finite represented inputs");
-        _putenv_s("NINFER_EXL3_TARGET_QKV_K6_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M","0");
         Exl3CudaLinearWorkspace baseline(kHidden,output,8,false,false,false,false,false,false,false,{}, {},true);
-        _putenv_s("NINFER_EXL3_TARGET_QKV_K6_SMALL_M","1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M","1");
         Exl3CudaLinearWorkspace candidate(kHidden,output,8,false,false,false,false,false,false,false,{}, {},true);
         Exl3CudaLinearWorkspace unowned(kHidden,output,8);
         Exl3CudaLinearWorkspace short_owner(kHidden,output,4,false,false,false,false,false,false,false,{}, {},true);
-        _putenv_s("NINFER_EXL3_TARGET_QKV_K6_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M","0");
         require(candidate.target_qkv_k6_small_m_candidate(x.metadata,8,admit) && !baseline.target_qkv_k6_small_m_candidate(x.metadata,8,admit),"qkv latched enable");
         require(!unowned.target_qkv_k6_small_m_candidate(x.metadata,8,admit) && !candidate.target_qkv_k6_small_m_candidate(x.metadata,8,Admission::ordinary) && !short_owner.target_qkv_k6_small_m_candidate(x.metadata,8,admit),"qkv ownership/capacity");
         for(int m=0;m<=17;++m)require(candidate.target_qkv_k6_small_m_candidate(x.metadata,m,admit)==(m>=2 && m<=8),"qkv width admission");
@@ -49,11 +49,11 @@ struct TargetQkvK6Qualification {
             require(!candidate.target_qkv_k6_small_m_candidate(md,8,admit),"qkv metadata admission");
         }
         if(layers.size()==1)for(const char* disabled:{"","0","2","true","01"}) {
-            _putenv_s("NINFER_EXL3_TARGET_QKV_K6_SMALL_M",disabled);
+            _putenv_s("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M",disabled);
             Exl3CudaLinearWorkspace off(kHidden,output,8,false,false,false,false,false,false,false,{}, {},true);
             require(!off.target_qkv_k6_small_m_candidate(x.metadata,8,admit),"qkv exact flag1 required");
         }
-        _putenv_s("NINFER_EXL3_TARGET_QKV_K6_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M","0");
         require(std::string(candidate.dispatch_name(x.metadata,8,admit))=="target_qkv_k6_small_m_mma_split" && std::string(candidate.dispatch_name(x.metadata,1,admit))=="generic_mma_split","qkv dispatch");
         DeviceBuffer a((extent+2*guard)*2),b((extent+2*guard)*2);
         auto* pa=static_cast<std::uint16_t*>(a.get())+guard;
@@ -107,8 +107,8 @@ struct TargetQkvK6Qualification {
 };
 
 void run_target_qkv_k6_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& draft) {
-    require(env("NINFER_EXL3_TARGET_QKV_K6_SMALL_M")=="0","qkv capture requires construction flag0");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=512,"qkv prompt extent");
+    require(env("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M")=="0","qkv capture requires construction flag0");
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=512,"qkv prompt extent");
     std::vector<std::int64_t> prompt(ids.begin(),ids.begin()+512);
     TapStage stage;
     for(int tap=0;tap<kTapCount;++tap){
@@ -125,10 +125,10 @@ void run_target_qkv_k6_qualification(Exl3TextModel& target, Exl3Dflash2DraftMode
     const auto proposals=draft.propose_cached(block,512,ctx->target_embedding(),ctx->target_lm_head_weights(),ctx->target_lm_head_metadata(),kMaskToken);
     require(proposals.size()==7,"qkv real proposals");
     block.assign(1,pending);block.insert(block.end(),proposals.begin(),proposals.end());
-    TargetQkvK6Qualification check(env("NINFER_E5A4_OUT"));
+    TargetQkvK6Qualification check(env("VOIDINFER_E5A4_OUT"));
     std::ofstream request(check.directory/"request.txt");request << "pending=" << pending << " proposals=";for(auto token:proposals)request << token << ',';request << '\n';request.flush();require(request.good(),"qkv request witness write");
     ctx->prepare_transaction();ctx->prepare_continuation(8);const auto ring=draft.ring_digest();
-    ctx->set_target_projection_observer_for_test(TargetQkvK6Qualification::callback,&check,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+    ctx->set_target_projection_observer_for_test(TargetQkvK6Qualification::callback,&check,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->begin_transaction();ctx->continue_rows(block);ctx->set_target_projection_observer_for_test(nullptr,nullptr);ctx->rollback_transaction();
     cuda_check(cudaDeviceSynchronize(),"qkv sweep ready");
     require(check.layers.size()==44 && ctx->position()==512 && ctx->device_position_host()==511 && sample_target(*ctx)==pending && !ctx->transaction_active(),"qkv full layer coverage/rollback");

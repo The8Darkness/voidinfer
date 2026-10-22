@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class SafetensorsError : public std::runtime_error {
 public:
@@ -117,4 +117,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

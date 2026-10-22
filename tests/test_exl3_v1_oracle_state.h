@@ -2,22 +2,22 @@
 #include "test_exl3_v1_oracle_io.h"
 
 void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& draft) {
-    const auto directory=std::filesystem::path(env("NINFER_E5A4_OUT"));
+    const auto directory=std::filesystem::path(env("VOIDINFER_E5A4_OUT"));
     require(!directory.empty() && !std::filesystem::exists(directory),"chunk qualification output must be new");
     std::filesystem::create_directories(directory);
     V1Oracle oracle(directory);
     std::ofstream out(directory/"boundaries.csv");
     out << "position,rows,taps_exact,full_state_checked,continuation_bytes\n";
-    require(env("NINFER_EXL3_WIDE_PREFILL")=="1","wide state needs flag1");
-    auto source=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
-    const int total=env_int("NINFER_E5A4_CONTEXTS",512);
+    require(env("VOIDINFER_EXL3_WIDE_PREFILL")=="1","wide state needs flag1");
+    auto source=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
+    const int total=env_int("VOIDINFER_E5A4_CONTEXTS",512);
     require((total==512 || total==4160) && target.max_context()>=total+16,"chunk qualification extent");
     std::vector<std::int64_t> ids(total+16);
     for(std::size_t i=0;i<ids.size();++i) ids[i]=source[i%source.size()];
     {
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
         auto disabled=target.create_context(true);
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","1");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","1");
         require(disabled->try_enable_oscar_from_environment(),"disabled wide context OSCAR");
         disabled->prefill(std::span<const std::int64_t>(ids.data(),16));
         const auto before=prefix_retention_snapshot(*disabled);
@@ -29,36 +29,36 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
     // The serial reference needs no expanded64 scratch. Its M1 arithmetic is
     // unchanged; keep the qualified32 allocation to avoid two wide contexts
     // exhausting VRAM during the long serial oracle phase.
-    const auto wide64_setting=env("NINFER_EXL3_PREFILL_WIDE64");
-    _putenv_s("NINFER_EXL3_PREFILL_WIDE64","0");
-    const auto shared_layer_setting=env("NINFER_EXL3_SHARED_LAYER_SCRATCH");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-    const auto direct_async_a_setting=env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A","0");
-    const auto direct_partials_setting=env("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_PARTIALS","0");
-    const auto staged_shape4_setting=env("NINFER_EXL3_PREFILL_STAGED_SHAPE4");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_SHAPE4","0");
+    const auto wide64_setting=env("VOIDINFER_EXL3_PREFILL_WIDE64");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE64","0");
+    const auto shared_layer_setting=env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+    const auto direct_async_a_setting=env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A","0");
+    const auto direct_partials_setting=env("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS","0");
+    const auto staged_shape4_setting=env("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4","0");
     auto reference=std::make_unique<V1Reference>(target,oracle);
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_SHAPE4",staged_shape4_setting.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_PARTIALS",direct_partials_setting.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A",direct_async_a_setting.c_str());
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH",shared_layer_setting.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_WIDE64",wide64_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4",staged_shape4_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",direct_partials_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A",direct_async_a_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH",shared_layer_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE64",wide64_setting.c_str());
     auto candidate=target.create_context(true);
-    const auto query_parallel_setting=env("NINFER_OSCAR_PREFILL_QUERY_PARALLEL");
-    _putenv_s("NINFER_OSCAR_PREFILL_QUERY_PARALLEL","0");
-    const auto parallel_merge_setting=env("NINFER_OSCAR_PREFILL_PARALLEL_MERGE");
-    const auto parallel_scores_setting=env("NINFER_OSCAR_PREFILL_PARALLEL_SCORES");
-    _putenv_s("NINFER_OSCAR_PREFILL_PARALLEL_SCORES","0");
-    const auto coalesced_setting=env("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS");
-    _putenv_s("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS","0");
-    _putenv_s("NINFER_OSCAR_PREFILL_PARALLEL_MERGE","0");
+    const auto query_parallel_setting=env("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL");
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL","0");
+    const auto parallel_merge_setting=env("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE");
+    const auto parallel_scores_setting=env("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES");
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES","0");
+    const auto coalesced_setting=env("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS");
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS","0");
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE","0");
     require(reference->try_enable_oscar_from_environment(),"reference OSCAR required");
-    _putenv_s("NINFER_OSCAR_PREFILL_PARALLEL_MERGE",parallel_merge_setting.c_str());
-    _putenv_s("NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS",coalesced_setting.c_str());
-    _putenv_s("NINFER_OSCAR_PREFILL_PARALLEL_SCORES",parallel_scores_setting.c_str());
-    _putenv_s("NINFER_OSCAR_PREFILL_QUERY_PARALLEL",query_parallel_setting.c_str());
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE",parallel_merge_setting.c_str());
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS",coalesced_setting.c_str());
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES",parallel_scores_setting.c_str());
+    _putenv_s("VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL",query_parallel_setting.c_str());
     require(candidate->try_enable_oscar_from_environment(),"candidate OSCAR required");
     const auto reject=[&](auto&& operation) {
         bool failed=false;try{operation();}catch(const std::exception&){failed=true;}
@@ -80,7 +80,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
     {
         const auto before=prefix_retention_snapshot(*candidate);
         reject([&]{candidate->append_prefill_wide({});});
-        std::vector<std::int64_t> oversized((env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16)+1,0);
+        std::vector<std::int64_t> oversized((env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16)+1,0);
         reject([&]{candidate->append_prefill_wide(oversized);});
         reject([&]{candidate->append_prefill(std::span<const std::int64_t>(ids.data(),9));});
         std::int64_t bad=-1;
@@ -106,7 +106,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
         reference_taps[t].reserve(static_cast<std::size_t>(total)*kHidden);
     }
     draft.reset();commit_current_rows(*candidate,draft,stage,16,0);
-    if (env("NINFER_DFLASH2_PREFILL_BATCH")=="1") {
+    if (env("VOIDINFER_DFLASH2_PREFILL_BATCH")=="1") {
         const auto digest=draft.ring_digest();
         const auto base=draft.ring_base_abs();const auto size=draft.ring_count();
         const auto taps=const_cast<const std::uint16_t**>(stage.bulk_ptrs.data());
@@ -122,7 +122,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
         require(draft.ring_digest()==digest && draft.ring_base_abs()==base &&
                 draft.ring_count()==size,"draft prefill rejection mutated ring");
     }
-    const int width=env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
+    const int width=env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
     int next_width=1,boundaries=0,last_state_cut=16;
     // All128 operator widths are checked separately. Exercise every16-row
     // boundary and tail transition here without doubling the serial context.
@@ -160,7 +160,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
         oracle.equal(candidate->embedding_bits_host_for_test(),embeddings,"chunk embedding");
         oracle.equal(target_continue_device_bits(candidate->logits_device(),kVocab,"chunk logits"),
                 target_continue_device_bits(reference->logits_device(),kVocab,"serial logits"),"chunk final-row logits");
-        if(env("NINFER_EXL3_SHARED_LAYER_SCRATCH")=="1") {
+        if(env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH")=="1") {
             for(int layer=3;layer<64;layer+=4) {
                 const auto actual=candidate->full_attention_qkv_host(layer);
                 const auto expected=reference->full_attention_qkv_host(layer);
@@ -260,7 +260,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
     std::ofstream result(directory/"result.txt");
     result << "PASS total=" << total << " max_width=" << width << " boundaries=" << boundaries
            << " all_taps_embeddings_logits=exact native_state=exact ring_digest=exact target_only=exact next8=exact extra_workspace=0"
-           << " qkv_last_row=" << (env("NINFER_EXL3_SHARED_LAYER_SCRATCH")=="1" ? "exact" : "not_requested") << "\n";
+           << " qkv_last_row=" << (env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH")=="1" ? "exact" : "not_requested") << "\n";
     require(result.good(),"chunk result write");
     // Enumerate the actual loaded DLLs after model loading; the wrapper matches
     // this exact set against its frozen runtime inventory before publication.

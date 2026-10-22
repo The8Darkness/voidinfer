@@ -5,7 +5,7 @@
 #include <memory>
 #include <stdexcept>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 namespace {
 void need(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 template<class F> bool refuses(F&& call){try{call();}catch(...){return true;}return false;}
@@ -13,7 +13,7 @@ struct Storage {std::array<std::byte,16> marker{};};
 }
 
 int main() {
-    ninfer::runtime::ResolvedSamplingParameters values;
+    voidinfer::runtime::ResolvedSamplingParameters values;
     auto policy=Exl3SamplingPolicy::normalize(values,248320);
     const auto current=Exl3DraftDistributionAvailability::current_dflash2();
     const auto greedy=Exl3SamplingWorkspacePlan::derive(policy,current,8,4096);

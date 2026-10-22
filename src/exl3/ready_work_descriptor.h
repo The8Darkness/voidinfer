@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3ReadyNumericalStage : std::uint8_t {
     HostPreparation,
@@ -328,7 +328,7 @@ private:
 // leave the mutex for numerical work.
 class Exl3ReadyWorkSnapshotAuthority {
 public:
-    static constexpr std::size_t maximum_lanes=2;
+    static constexpr std::size_t maximum_lanes=8;
     struct Ticket {
         Ticket(const Ticket&)=delete;
         Ticket& operator=(const Ticket&)=delete;
@@ -450,4 +450,4 @@ private:
     const Exl3ReadyCopyDemand copy_demand_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

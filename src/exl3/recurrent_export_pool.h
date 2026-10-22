@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/host_memory_available.h"
 #include "exl3/reconstruction_control_allocator.h"
 #include "exl3/resource_inventory.h"
 #include <cuda_runtime.h>
@@ -9,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Recoverable only when the partially constructed slab retired successfully.
 // Carry the original provider status through Engine's nested cleanup exception.
 class Exl3RecurrentEventCreationFailure : public std::runtime_error {
@@ -44,12 +46,29 @@ struct Exl3RecurrentSlabLayout {
 // Shared by all physical contexts and retained immutable roots in this process.
 // Registration is an additional DMA property, never a substitute for VirtualLock.
 struct Exl3RecurrentPinBudget {
-    static constexpr std::uint64_t cap=1ULL<<30,reserve=8ULL<<30;
+    // Process cap on registered recurrent slabs (144 MB each at 6bpw): 1/24 of
+    // physical memory within 1..4 GiB (VOIDINFER_EXL3_RECURRENT_PIN_CAP_MIB
+    // overrides). Each request's two roots hold one each; past the cap they
+    // export to pageable slabs that the resident set VirtualLocks on the
+    // request path (eight lanes exhausted the former fixed 1 GiB).
+    static std::uint64_t cap() {
+        static const std::uint64_t value=[] {
+            if(const char* text=std::getenv("VOIDINFER_EXL3_RECURRENT_PIN_CAP_MIB"))
+                return static_cast<std::uint64_t>(std::strtoull(text,nullptr,10))<<20;
+            MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
+            const std::uint64_t total=GlobalMemoryStatusEx(&m)?m.ullTotalPhys:0;
+            return std::clamp<std::uint64_t>(total/24,1ULL<<30,4ULL<<30);
+        }();
+        return value;
+    }
+    static constexpr std::uint64_t reserve=kExl3HostReserveBytes;
     inline static std::mutex mutex;
     inline static std::uint64_t live=0,peak=0,quarantined=0;
     static bool claim(std::size_t bytes){
-        std::lock_guard<std::mutex> lock(mutex);MEMORYSTATUSEX m{};m.dwLength=sizeof(m);
-        if(bytes>cap-live || !GlobalMemoryStatusEx(&m) || m.ullAvailPhys<reserve+bytes)return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto limit=cap();
+        const auto available=exl3_available_host_bytes();
+        if(bytes>limit || live>limit-bytes || !available || *available<reserve+bytes)return false;
         live+=bytes;peak=std::max(peak,live);return true;
     }
     static void release(std::size_t bytes){std::lock_guard<std::mutex> lock(mutex);live-=bytes;}
@@ -242,7 +261,10 @@ public:
     using GrowthAdmission=std::function<std::shared_ptr<Exl3RecurrentSlab>(const Exl3RecurrentSlabLayout&,const GrowthFactory&)>;
     using BorrowAdmission=std::function<std::shared_ptr<Exl3RecurrentSlab>(const std::shared_ptr<Exl3RecurrentSlab>&)>;
 private:
-    std::array<std::shared_ptr<Exl3RecurrentSlab>,3> slots_{};
+    // Six registered slabs: each retained root borrows one, and a root without
+    // one exports to a pageable slab the resident set must VirtualLock on its
+    // admission (~144 MB, 15-50 ms of first-token time).
+    std::array<std::shared_ptr<Exl3RecurrentSlab>,6> slots_{};
     std::size_t slot_count_=0;
     GrowthAdmission admission_;
     BorrowAdmission borrow_admission_;

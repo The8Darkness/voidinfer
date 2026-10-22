@@ -7,53 +7,53 @@
 // bytes, convolution, KV, embeddings, taps, logits and state metadata.
 void run_reconstructed_exact_route(Exl3TextModel& target,
                                    const std::vector<std::int64_t>& source) {
-    using State = ninfer::exl3::Exl3ExactHostState;
-    const auto reuse_mode=env("NINFER_TEST_EQUAL_TRANSFORM_CONTEXT");
+    using State = voidinfer::exl3::Exl3ExactHostState;
+    const auto reuse_mode=env("VOIDINFER_TEST_EQUAL_TRANSFORM_CONTEXT");
     require(reuse_mode.empty() || reuse_mode=="1","equal transform context option");
     const bool reuse_context=reuse_mode=="1";
-    const auto fused_mode=env("NINFER_TEST_FUSED_GATE_UP_CONTEXT");
+    const auto fused_mode=env("VOIDINFER_TEST_FUSED_GATE_UP_CONTEXT");
     require(fused_mode.empty() || (fused_mode=="1" && reuse_context),
         "fused gate/up context requires equal-transform composed context mode");
     const bool fused_context=fused_mode=="1";
-    const auto residual_mode=env("NINFER_TEST_FUSED_RESIDUAL_CONTEXT");
+    const auto residual_mode=env("VOIDINFER_TEST_FUSED_RESIDUAL_CONTEXT");
     require(residual_mode.empty() || (residual_mode=="1" && reuse_context),
         "residual context requires composed equal-transform context mode");
     const bool residual_context=residual_mode=="1";
     struct RestoreTransformOptions {
         std::string dual,reuse,timing,fused,residual;
         ~RestoreTransformOptions() {
-            _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM",dual.c_str());
-            _putenv_s("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS",reuse.c_str());
-            _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING",timing.c_str());
-            _putenv_s("NINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM",fused.c_str());
-            _putenv_s("NINFER_EXL3_GDN_FUSED_RESIDUAL_NORM",residual.c_str());
+            _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM",dual.c_str());
+            _putenv_s("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS",reuse.c_str());
+            _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING",timing.c_str());
+            _putenv_s("VOIDINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM",fused.c_str());
+            _putenv_s("VOIDINFER_EXL3_GDN_FUSED_RESIDUAL_NORM",residual.c_str());
         }
-    } restore_transform_options{env("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM"),
-        env("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS"),env("NINFER_EXL3_TARGET_PROJECTION_TIMING"),
-        env("NINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM"),env("NINFER_EXL3_GDN_FUSED_RESIDUAL_NORM")};
+    } restore_transform_options{env("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM"),
+        env("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS"),env("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING"),
+        env("VOIDINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM"),env("VOIDINFER_EXL3_GDN_FUSED_RESIDUAL_NORM")};
     if(reuse_context) {
-        for(const char* key:{"NINFER_TEST_RECON_CLEANUP_FAILURE",
-            "NINFER_TEST_RECON_STARTUP_RESERVATION","NINFER_TEST_RECON_RETIRE_FAILURE"})
+        for(const char* key:{"VOIDINFER_TEST_RECON_CLEANUP_FAILURE",
+            "VOIDINFER_TEST_RECON_STARTUP_RESERVATION","VOIDINFER_TEST_RECON_RETIRE_FAILURE"})
             require(env(key).empty(),"transform context comparison requires fault modes unset");
     }
-    const auto family=env("NINFER_TEST_RECON_EXACT_FAMILY");
+    const auto family=env("VOIDINFER_TEST_RECON_EXACT_FAMILY");
     require(family.empty() || family=="k7" || family=="k6_down" || family=="k6_gate_up",
         "exact route family");
     const bool include_k6_down=family=="k6_down";
     const bool include_k6_gate_up=family=="k6_gate_up";
     const bool include_k6=include_k6_down || include_k6_gate_up;
-    const int slice_columns=ninfer::exl3::exl3_reconstruction_slice_columns(
-        std::getenv("NINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
+    const int slice_columns=voidinfer::exl3::exl3_reconstruction_slice_columns(
+        std::getenv("VOIDINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
     const std::size_t expected_slab_bytes=17408ull*slice_columns*2;
     if(include_k6) {
-        const auto async_all=env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
+        const auto async_all=env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
         require(async_all=="0" || async_all=="1","K6 route requires explicit async/direct selection");
     }
     using Clock = std::chrono::steady_clock;
     const auto milliseconds = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b-a).count();
     };
-    const std::filesystem::path directory = env("NINFER_RECON_EXACT_ROUTE_OUT");
+    const std::filesystem::path directory = env("VOIDINFER_RECON_EXACT_ROUTE_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory), "exact route new output directory");
     std::filesystem::create_directories(directory);
     std::ofstream checks(directory / "correctness.csv"), timings(directory / "pairs.csv");
@@ -61,41 +61,41 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
     checks << "phase,step,pass,logit_values,tap_values,exports,calls,rows,workspace_bytes,persistent_bytes,paired_transform_submissions,fused_gate_up_submissions,fused_residual_norm_submissions\n";
     timings << "pair,order,arm,construction_ms,prefill_ms,seed_ms,ttft_ms,decode_ms,export_ms,teardown_ms,wall_ms,exports,calls,rows,workspace_bytes,persistent_bytes,tokens_exact,state_exact,accounting_pass\n";
     require(target.max_context()==4352 && source.size()>=4096, "exact route fixture extent");
-    for (const char* key : {"NINFER_EXL3_WIDE_PREFILL", "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-            "NINFER_EXL3_PREFILL_WIDE1024", "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-            "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
+    for (const char* key : {"VOIDINFER_EXL3_WIDE_PREFILL", "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+            "VOIDINFER_EXL3_PREFILL_WIDE1024", "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+            "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
         require(env(key)=="1", std::string("exact route direct flag ")+key);
     const auto configure = [include_k6_down,include_k6_gate_up,slice_columns,reuse_context,
                             fused_context,residual_context](bool candidate) {
-        if(residual_context)_putenv_s("NINFER_EXL3_GDN_FUSED_RESIDUAL_NORM",candidate?"1":"0");
-        if(fused_context)_putenv_s("NINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM",candidate?"1":"0");
+        if(residual_context)_putenv_s("VOIDINFER_EXL3_GDN_FUSED_RESIDUAL_NORM",candidate?"1":"0");
+        if(fused_context)_putenv_s("VOIDINFER_EXL3_GDN_FUSED_GATE_UP_TRANSFORM",candidate?"1":"0");
         if(reuse_context) {
-            _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING","0");
-            _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM",candidate?"1":"0");
-            _putenv_s("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS",candidate?"1":"0");
+            _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING","0");
+            _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM",candidate?"1":"0");
+            _putenv_s("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS",candidate?"1":"0");
         }
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
-        _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",candidate?"1":"0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN",
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
+        _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",candidate?"1":"0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN",
             candidate && include_k6_down?"1":"0");
-        _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_GATE_UP",
+        _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_GATE_UP",
             candidate && include_k6_gate_up?"1":"0");
-        _putenv_s("NINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS",std::to_string(candidate?slice_columns:5120).c_str());
+        _putenv_s("VOIDINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS",std::to_string(candidate?slice_columns:5120).c_str());
     };
-    if(const auto mode=env("NINFER_TEST_PREFILL_ROW_TAIL_CONTEXT");!mode.empty()) {
+    if(const auto mode=env("VOIDINFER_TEST_PREFILL_ROW_TAIL_CONTEXT");!mode.empty()) {
         require(mode=="1","prefill row-tail context option");
         configure(false);
         std::ofstream receipt(directory/"row_tail_context.csv");
         receipt << "rows,state_equal,position_equal,classification\n";
         for(int rows:{17,23,31}) {
             std::shared_ptr<const State> reference;
-            std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> reference_request;
+            std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> reference_request;
             {
                 auto control=target.create_context(true);control->prepare_continuation(8);
-                auto request=ninfer::exl3::Exl3VeriCacheRequest::initialize(*control,
+                auto request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(*control,
                     std::span<const std::int64_t>(source.data(),16+rows),32);
                 reference=request->state();
                 reference_request=request;
@@ -140,7 +140,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
             }
             auto request_context=target.create_context(true);request_context->prepare_continuation(8);
             std::vector<int> boundaries;
-            const auto actual_request=ninfer::exl3::Exl3VeriCacheRequest::initialize(*request_context,
+            const auto actual_request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(*request_context,
                 std::span<const std::int64_t>(source.data(),16+rows),32,
                 [&](int position){boundaries.push_back(position);},true);
             require(boundaries==std::vector<int>({16,16+rows}),
@@ -177,7 +177,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         }
         for(const auto shape:{std::pair{8,17},std::pair{8,31},std::pair{16,17},
             std::pair{16,31},std::pair{32,16},std::pair{32,32},std::pair{32,33}}) {
-            std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> baseline;
+            std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> baseline;
             std::vector<int> baseline_positions;
             for(bool enabled:{false,true}) {
                 auto context=target.create_context(true);context->prepare_continuation(8);
@@ -185,7 +185,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
                 const auto total=16+shape.second;
                 std::vector<std::int64_t> guarded(source.begin(),source.begin()+total);
                 guarded.resize(total+32,enabled?-1:248320);
-                const auto request=ninfer::exl3::Exl3VeriCacheRequest::initialize(*context,
+                const auto request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(*context,
                     std::span<const std::int64_t>(guarded.data(),total),shape.first,
                     [&](int position){positions.push_back(position);},enabled);
                 require(std::all_of(guarded.begin()+total,guarded.end(),
@@ -199,7 +199,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         }
         return;
     }
-    if(const auto mode=env("NINFER_TEST_HEAD_CONSUMER_CONTEXT");!mode.empty()) {
+    if(const auto mode=env("VOIDINFER_TEST_HEAD_CONSUMER_CONTEXT");!mode.empty()) {
         require(mode=="1","head consumer context option");
         configure(false);
         for(int rows:{2,7,8}) {
@@ -236,23 +236,23 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         }
         return; // This fixture never enters the historical timing loop.
     }
-    if(const auto mode=env("NINFER_TEST_PREFILL_PARTITION_CONTEXT");!mode.empty()) {
+    if(const auto mode=env("VOIDINFER_TEST_PREFILL_PARTITION_CONTEXT");!mode.empty()) {
         require(mode=="1","prefill partition context option");
         configure(false);
         std::ofstream partitions(directory/"prefill_partitions.csv");
         partitions << "tokens,classification,state_equal,positions_equal,logits_equal,taps_equal\n";
         require(partitions.good(),"partition receipt creation");
         for(int total:{17,49,143,144,1039,1040,1041}) {
-            const bool identical=ninfer::exl3::exl3_prefill_partition_relation(128,1024,total-16)==
-                ninfer::exl3::Exl3PrefillPartitionRelation::identical;
-            std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> control;
+            const bool identical=voidinfer::exl3::exl3_prefill_partition_relation(128,1024,total-16)==
+                voidinfer::exl3::Exl3PrefillPartitionRelation::identical;
+            std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> control;
             std::vector<int> expected_positions;
             std::vector<std::uint16_t> expected_logits;
             std::array<std::vector<std::uint16_t>,5> expected_taps;
             for(int width:{128,1024}) {
                 auto context=target.create_context(true);context->prepare_continuation(8);
                 std::vector<int> positions;
-                auto request=ninfer::exl3::Exl3VeriCacheRequest::initialize(*context,
+                auto request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(*context,
                     std::span<const std::int64_t>(source.data(),total),width,
                     [&](int position){positions.push_back(position);});
                 std::vector<std::uint16_t> logits(kVocab);
@@ -277,7 +277,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         }
         return;
     }
-    if(const auto mode=env("NINFER_TEST_RECON_CLEANUP_FAILURE");!mode.empty()) {
+    if(const auto mode=env("VOIDINFER_TEST_RECON_CLEANUP_FAILURE");!mode.empty()) {
         require(mode=="1","reconstruction cleanup fixture option");
         configure(true);
         const auto before=Exl3TextContext::reconstruction_quarantined_allocations();
@@ -293,7 +293,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         require(refused,"failed reconstruction cleanup admitted context reload");
         return;
     }
-    if(const auto mode=env("NINFER_TEST_RECON_STARTUP_RESERVATION");!mode.empty()) {
+    if(const auto mode=env("VOIDINFER_TEST_RECON_STARTUP_RESERVATION");!mode.empty()) {
         require(mode=="1","reconstruction startup fixture option");
         configure(true);
         auto a=target.create_context(true,true,true),b=target.create_context(true,true,true);
@@ -303,11 +303,11 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         try{a->prefill(std::span<const std::int64_t>(source.data(),1));}
         catch(const std::exception& error){deferred_refused=std::string(error.what()).find("reservation not installed")!=std::string::npos;}
         require(deferred_refused,"uninstalled reconstruction context executed prefill");
-        using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Cache cache({2,64,1ULL<<30,1ULL<<30},{"recon-startup","fixture-model","fixture-tokenizer","C2","text"});
-        if(const auto fallback=env("NINFER_TEST_RECON_BUDGET_FALLBACK");!fallback.empty()) {
+        if(const auto fallback=env("VOIDINFER_TEST_RECON_BUDGET_FALLBACK");!fallback.empty()) {
             require(fallback=="1","reconstruction fallback fixture option");
             Coordinator exhausted(cache,{2,2,1ULL<<30,1ULL<<30});
             auto no_slabs=Inventory::unlimited();
@@ -358,7 +358,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         require(missing_refused && a->reconstructed_exact_stats().workspace_bytes==0 &&
             b->reconstructed_exact_stats().workspace_bytes==0 && a->persistent_bytes()==a_bytes &&
             b->persistent_bytes()==b_bytes,"missing peer changed reconstruction ownership");
-        if(const auto cleanup=env("NINFER_TEST_RECON_STARTUP_CLEANUP_FAILURE");!cleanup.empty()) {
+        if(const auto cleanup=env("VOIDINFER_TEST_RECON_STARTUP_CLEANUP_FAILURE");!cleanup.empty()) {
             require(cleanup=="1","reconstruction rollback cleanup fixture option");
             const auto before=Exl3TextContext::reconstruction_quarantined_allocations();
             auto expected_witness=Exl3TextContext::retirement_quarantine_witness();
@@ -455,7 +455,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         bool compare=false,matched=false;
         std::vector<std::uint16_t> residual,normalized;
     } residual_intermediate;
-    const auto residual_observer=+[](const ninfer::exl3::Exl3LayerObservation& x,void* user) {
+    const auto residual_observer=+[](const voidinfer::exl3::Exl3LayerObservation& x,void* user) {
         auto& held=*static_cast<ResidualIntermediate*>(user);
         if(x.rows<16 || !x.gdn.post_attention_residual || !x.gdn.mlp_input)return;
         if(held.layer>=0 && (x.layer!=held.layer || x.position!=held.position || x.rows!=held.rows))return;
@@ -478,7 +478,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         auto ctx=target.create_context(true);ctx->prepare_continuation(8);
         if(residual_context)ctx->set_layer_observer_for_test(residual_observer,&residual_intermediate);
         ctx->set_target_projection_observer_for_test(
-            [](const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+            [](const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
                 auto& o=*static_cast<Observed*>(user);
                 if((x.rows!=256 && x.rows!=512 && x.rows!=1024) || x.metadata.mcg ||
                    !x.metadata.mul1 || x.metadata.has_bias || !x.operation)return;
@@ -491,7 +491,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
                 if(!down && !gate_up)return;
                 ++o.calls;o.rows+=x.rows;
                 if(x.metadata.K==6){++o.k6_calls;o.k6_rows+=x.rows;}
-            },&observed,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+            },&observed,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
         t69b_ingest(*ctx,prompt);ctx->set_target_projection_observer_for_test(nullptr);
         if(residual_context) {
             ctx->set_layer_observer_for_test(nullptr);
@@ -526,9 +526,9 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         diagnostic->prepare_continuation(8);
         std::uint64_t observations=0;
         diagnostic->set_target_projection_observer_for_test(
-            [](const ninfer::exl3::Exl3TargetProjectionObservation&,void* user) {
+            [](const voidinfer::exl3::Exl3TargetProjectionObservation&,void* user) {
                 ++*static_cast<std::uint64_t*>(user);
-            },&observations,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+            },&observations,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
         const auto submissions_before=diagnostic->paired_transform_submissions();
         const auto residual_before=diagnostic->fused_residual_norm_submissions();
         const auto fused_before=diagnostic->fused_gate_up_submissions();
@@ -549,9 +549,9 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
         // observer and must record actual paired submissions. No hit-rate claim.
     }
     if(reuse_context) {
-        _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING","1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING","1");
         auto diagnostic=target.create_context(true);
-        _putenv_s("NINFER_EXL3_TARGET_PROJECTION_TIMING","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING","0");
         require(diagnostic->target_projection_timing_enabled(),"transform timing option not latched");
         diagnostic->prepare_continuation(8);
         diagnostic->prepare_target_projection_timing();
@@ -677,7 +677,7 @@ void run_reconstructed_exact_route(Exl3TextModel& target,
     }
     if(reuse_context)return;
     if(include_k6) {
-        const auto failure=env("NINFER_TEST_RECON_RETIRE_FAILURE");
+        const auto failure=env("VOIDINFER_TEST_RECON_RETIRE_FAILURE");
         require(failure.empty() || failure=="0" || failure=="1","reconstruction retirement fixture option");
         if(failure=="1") {
             const auto before=Exl3TextContext::reconstruction_quarantined_contexts();

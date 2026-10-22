@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Request-local tentative sampling window. Each prospective output owns a q
 // proposal draw and an acceptance draw; the first rejection additionally owns
@@ -128,4 +128,4 @@ private:
     bool sealed_=false,publication_claimed_=false;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 struct StreamingRequest {
@@ -79,8 +79,8 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const voidinfer::RuntimeStats& previous,
+                                        const voidinfer::RuntimeStats& current,
                                         double interval_seconds) {
     return ThroughputReport{
         .interval_seconds = interval_seconds,
@@ -89,7 +89,6 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
         .committed_decode_tokens =
             current.committed_decode_tokens - previous.committed_decode_tokens,
         .decode_rounds     = current.decode_rounds - previous.decode_rounds,
-        .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
         .previous          = previous,
         .current           = current,
     };
@@ -98,71 +97,10 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
 bool report_has_activity(const ThroughputReport& report) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
            report.decode_rounds != 0 || report.current.running_requests != 0 ||
-           report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||
-           report.current.capture_pending_requests != 0 ||
-           report.current.terminal_pending_requests != 0 ||
-           report.current.active_captures_completed != report.previous.active_captures_completed ||
-           report.current.active_captures_aborted != report.previous.active_captures_aborted ||
+           report.current.waiting_requests != 0 ||
            report.current.root_selections != report.previous.root_selections ||
-           report.current.private_endpoint_selections !=
-               report.previous.private_endpoint_selections ||
-           report.current.private_turn_closure_selections !=
-               report.previous.private_turn_closure_selections ||
-           report.current.private_response_replay_selections !=
-               report.previous.private_response_replay_selections ||
-           report.current.private_long_anchor_selections !=
-               report.previous.private_long_anchor_selections ||
            report.current.shared_stable_prefix_selections !=
-               report.previous.shared_stable_prefix_selections ||
-           report.current.state_moves != report.previous.state_moves ||
-           report.current.state_forks != report.previous.state_forks ||
-           report.current.state_restores != report.previous.state_restores ||
-           report.current.state_d2h_count != report.previous.state_d2h_count ||
-           report.current.state_h2d_count != report.previous.state_h2d_count ||
-           report.current.state_d2d_count != report.previous.state_d2d_count ||
-           report.current.main_kv_d2h_pages != report.previous.main_kv_d2h_pages ||
-           report.current.main_kv_h2d_pages != report.previous.main_kv_h2d_pages ||
-           report.current.main_kv_d2d_pages != report.previous.main_kv_d2d_pages ||
-           report.current.backend_kv_d2h_pages != report.previous.backend_kv_d2h_pages ||
-           report.current.backend_kv_h2d_pages != report.previous.backend_kv_h2d_pages ||
-           report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
-           report.current.pressure_spill_pages != report.previous.pressure_spill_pages ||
-           report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
-           report.current.pressure_private_owners_degraded !=
-               report.previous.pressure_private_owners_degraded ||
-           report.current.pressure_private_owners_evicted !=
-               report.previous.pressure_private_owners_evicted ||
-           report.current.pressure_shared_owners_degraded !=
-               report.previous.pressure_shared_owners_degraded ||
-           report.current.pressure_shared_owners_evicted !=
-               report.previous.pressure_shared_owners_evicted ||
-           report.current.pressure_checkpoints_dropped !=
-               report.previous.pressure_checkpoints_dropped ||
-           report.current.pressure_searches != report.previous.pressure_searches ||
-           report.current.pressure_search_budget_exhaustions !=
-               report.previous.pressure_search_budget_exhaustions ||
-           report.current.pressure_maximal_fallback_selections !=
-               report.previous.pressure_maximal_fallback_selections ||
-           report.current.historical_fork_hits != report.previous.historical_fork_hits ||
-           report.current.device_state_occupied_slots !=
-               report.previous.device_state_occupied_slots ||
-           report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
-           report.current.device_main_kv_occupied_pages !=
-               report.previous.device_main_kv_occupied_pages ||
-           report.current.device_backend_kv_occupied_pages !=
-               report.previous.device_backend_kv_occupied_pages ||
-           report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
-           report.current.shared_active_references != report.previous.shared_active_references ||
-           report.current.host_work.engine_boundary_ns !=
-               report.previous.host_work.engine_boundary_ns ||
-           report.current.host_work.program_submit_ns !=
-               report.previous.host_work.program_submit_ns ||
-           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
-           report.current.host_work.engine_commit_output_ns !=
-               report.previous.host_work.engine_commit_output_ns ||
-           report.current.host_work.engine_maintenance_ns !=
-               report.previous.host_work.engine_maintenance_ns ||
-           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
+               report.previous.shared_stable_prefix_selections;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {
@@ -198,7 +136,7 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      request_jsonl_(options_.request_log_jsonl) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -246,8 +184,8 @@ bool HttpServer::webui_spa_path(const std::string& path) const {
     if (path.size() < 2 || path[0] != '/') { return false; }
     if (path == "/") { return false; }
     if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return false; }
-    // llama.cpp server endpoints the webui probes but ninfer does not implement, plus
-    // ninfer's own status endpoints: keep them at their natural 404/405 so the UI
+    // llama.cpp server endpoints the webui probes but voidinfer does not implement, plus
+    // voidinfer's own status endpoints: keep them at their natural 404/405 so the UI
     // degrades exactly as it did against a real llama-server, rather than getting the
     // SPA shell back for an API call.
     if (path == "/props" || path == "/health" || path == "/slots" || path == "/tools" ||
@@ -303,7 +241,7 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    voidinfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
 
@@ -313,7 +251,7 @@ void HttpServer::run_stats_reporter() {
             if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
+        const voidinfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -322,7 +260,7 @@ void HttpServer::run_stats_reporter() {
         previous_time = now;
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
+    const voidinfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -522,7 +460,7 @@ void HttpServer::register_routes() {
 
 // llama.cpp webui dialect: /props is the client's server introspection endpoint
 // (role detection, context size, default params, thinking-capability probe, api
-// key validation). NInfer has no llama.cpp server behind it, so serve a faithful
+// key validation). VoidInfer has no llama.cpp server behind it, so serve a faithful
 // stub derived from the process configuration. Only process-level overrides are
 // reported as parameter values; everything else stays at neutral zeros so client
 // side defaults never swallow a user-set request parameter.
@@ -587,7 +525,7 @@ nlohmann::json make_props_stub(const ServeOptions& options, const std::string& m
         {"id", 0},
         {"id_task", 0},
         {"n_ctx", static_cast<int>(options.max_context)},
-        {"speculative", options.speculative.backend != SpeculativeBackend::None},
+        {"speculative", true},
         {"is_processing", false},
         {"params", params},
         {"prompt", ""},
@@ -599,21 +537,21 @@ nlohmann::json make_props_stub(const ServeOptions& options, const std::string& m
           {"stopping_word", ""}}},
     };
     props["total_slots"] = 1;
-    props["model_path"] = options.artifact_path;
+    props["model_path"] = options.model.target_directory.string();
     props["role"] = "model";
-    props["modalities"] = {{"vision", options.enable_vision}, {"audio", false}, {"video", false}};
+    props["modalities"] = {{"vision", options.vision_enabled()}, {"audio", false}, {"video", options.vision_enabled()}};
     // Capability marker only: clients that probe the chat template (e.g. the
     // webui's thinking-support heuristic) need `enable_thinking` to appear; the
-    // real template is embedded in the loaded artifact.
+    // real template is the model directory's chat_template.jinja.
     props["chat_template"] =
-        "{# ninfer-serve: capability marker; the real chat template is embedded in "
-        "the loaded artifact #}\n"
+        "{# voidinfer-serve: capability marker; the real chat template is the "
+        "model chat_template.jinja #}\n"
         "{%- if enable_thinking is defined %}\n"
         "  {%- set thinking = enable_thinking %}\n"
         "{% endif %}";
     props["bos_token"] = "";
     props["eos_token"] = "";
-    props["build_info"] = "ninfer-serve";
+    props["build_info"] = "voidinfer-serve";
     return props;
 }
 
@@ -678,8 +616,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
-                                                                request, e.error(),
-                                                                selected_exl3_round(service_->engine_options())));
+                                                                request, e.error()));
         write_error(res, e.error());
         return;
     } catch (const std::exception& e) {
@@ -688,8 +625,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         error.type    = "internal_error";
         error.message = e.what();
         log_request_rejected(
-            make_request_rejection_log_context(req_id, "openai_chat_completions", request, error,
-                                               selected_exl3_round(service_->engine_options())));
+            make_request_rejection_log_context(req_id, "openai_chat_completions", request, error));
         write_error(res, error);
         return;
     }
@@ -699,8 +635,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::string model    = request.model;
 
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "openai_chat_completions", request, prepared,
-                                 selected_exl3_round(service_->engine_options()));
+        make_request_log_context(req_id, "openai_chat_completions", request, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -894,8 +829,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(
-            make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error(),
-                                               selected_exl3_round(service_->engine_options())));
+            make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
         write_messages_error(res, e.error());
         return;
     } catch (const std::exception& e) {
@@ -904,8 +838,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         error.type    = "internal_error";
         error.message = e.what();
         log_request_rejected(
-            make_request_rejection_log_context(req_id, "anthropic_messages", request, error,
-                                               selected_exl3_round(service_->engine_options())));
+            make_request_rejection_log_context(req_id, "anthropic_messages", request, error));
         write_messages_error(res, error);
         return;
     }
@@ -915,8 +848,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const int input_tokens  = prepared.prompt_tokens;
 
     const RequestLogContext log_context =
-        make_request_log_context(req_id, "anthropic_messages", request, prepared,
-                                 selected_exl3_round(service_->engine_options()));
+        make_request_log_context(req_id, "anthropic_messages", request, prepared);
     log_request_start(log_context);
 
     if (!request.stream) {
@@ -1077,7 +1009,7 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
+    const voidinfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.engine_options(),
@@ -1106,4 +1038,4 @@ bool HttpServer::listen() {
 
 void HttpServer::stop() { server_.stop(); }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

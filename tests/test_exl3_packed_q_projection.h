@@ -9,10 +9,10 @@
 
 struct PackedQCapture {
     int layer=-1;
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::shared_ptr<DeviceBuffer> input;
-    static void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         auto& self=*static_cast<PackedQCapture*>(user);
         if(self.input || std::string(x.operation)!="q" || x.rows!=8 || x.metadata.K!=6) return;
         self.input=std::make_shared<DeviceBuffer>(8ULL*5120*2);
@@ -22,11 +22,11 @@ struct PackedQCapture {
     }
 };
 void run_packed_q_projection(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using namespace ninfer::exl3;
-    if(env("NINFER_TEST_PACKED_DOWN")=="1")run_packed_down_projection(target,source);
-    if(env("NINFER_TEST_PACKED_HEAD")=="1")run_packed_head_projection(target,source);
-    if(env("NINFER_TEST_PACKED_KVO")=="1")run_packed_kvo_projection(target,source);
-    if(env("NINFER_TEST_PACKED_GATEUP")=="1")run_packed_gateup_projection(target,source);
+    using namespace voidinfer::exl3;
+    if(env("VOIDINFER_TEST_PACKED_DOWN")=="1")run_packed_down_projection(target,source);
+    if(env("VOIDINFER_TEST_PACKED_HEAD")=="1")run_packed_head_projection(target,source);
+    if(env("VOIDINFER_TEST_PACKED_KVO")=="1")run_packed_kvo_projection(target,source);
+    if(env("VOIDINFER_TEST_PACKED_GATEUP")=="1")run_packed_gateup_projection(target,source);
     // Independent expected routes, including the private draft O/down families.
     // This checks capability selection only; held arithmetic and Engine coverage
     // remain separate requirements and cannot be inferred from this table.

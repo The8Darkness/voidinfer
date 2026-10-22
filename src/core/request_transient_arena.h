@@ -1,12 +1,12 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 
 #include <cstddef>
 #include <memory>
 #include <span>
 
-namespace ninfer {
+namespace voidinfer {
 
 struct DeviceContext;
 
@@ -46,4 +46,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

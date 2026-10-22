@@ -1,8 +1,8 @@
 #pragma once
 
 struct ProjectionRouteRecord {
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     int layer = -1;
     std::string operation;
     std::vector<std::uint16_t> guarded_input;
@@ -16,9 +16,9 @@ struct ProjectionRouteWorkspace {
     std::unique_ptr<Exl3CudaLinearWorkspace> workspace;
 };
 
-ninfer::exl3::Exl3CudaLinearAdmission projection_route_serial_admission(
+voidinfer::exl3::Exl3CudaLinearAdmission projection_route_serial_admission(
     const std::string& operation) {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     if (operation == "gate" || operation == "up")
         return Admission::target_continuation_gate_up;
     if (operation == "down") return Admission::target_continuation_down;
@@ -51,8 +51,8 @@ Exl3CudaLinearWorkspace& projection_route_workspace(
     entry.operation = record.operation;
     entry.workspace = std::make_unique<Exl3CudaLinearWorkspace>(
         entry.in_features, entry.out_features, 32, false, gate_up, down,
-        output, z, true, false, ninfer::exl3::Exl3CudaAccumulationView{},
-        ninfer::exl3::Exl3CudaTransformView{}, qkv, kv, q);
+        output, z, true, false, voidinfer::exl3::Exl3CudaAccumulationView{},
+        voidinfer::exl3::Exl3CudaTransformView{}, qkv, kv, q);
     workspaces.push_back(std::move(entry));
     return *workspaces.back().workspace;
 }
@@ -87,7 +87,7 @@ std::vector<TargetK6CapturedProjection> capture_projection_route_context(
     captured.reserve(400);
     context->set_target_projection_observer_for_test(
         capture_target_k6_projection, &captured, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     struct ResetObserver {
         Exl3TextContext* context = nullptr;
         ~ResetObserver() {
@@ -208,11 +208,11 @@ void launch_projection_route_record(
                               input + static_cast<std::size_t>(context) * input_stride,
                               output + static_cast<std::size_t>(context) * output_stride,
                               16, nullptr,
-                              ninfer::exl3::Exl3CudaLinearAdmission::target_initial16);
+                              voidinfer::exl3::Exl3CudaLinearAdmission::target_initial16);
     } else {
         workspace.forward(record.weights, record.metadata, input, output,
                           contexts * 8, nullptr,
-                          ninfer::exl3::Exl3CudaLinearAdmission::target_wide_prefill);
+                          voidinfer::exl3::Exl3CudaLinearAdmission::target_wide_prefill);
     }
 }
 
@@ -225,12 +225,12 @@ std::string projection_route_candidate_dispatch(
         calls = contexts / 2;
         return workspace.dispatch_name(
             record.metadata, 16,
-            ninfer::exl3::Exl3CudaLinearAdmission::target_initial16);
+            voidinfer::exl3::Exl3CudaLinearAdmission::target_initial16);
     }
     calls = 1;
     return workspace.dispatch_name(
         record.metadata, contexts * 8,
-        ninfer::exl3::Exl3CudaLinearAdmission::target_wide_prefill);
+        voidinfer::exl3::Exl3CudaLinearAdmission::target_wide_prefill);
 }
 
 double time_projection_route_sequence(
@@ -260,7 +260,7 @@ void run_projection_route_matrix_screen(
     constexpr std::uint16_t output_canary = 0x5a5au;
     require(target.max_context() >= 520 && source.size() >= 2055,
             "projection route matrix requires maxctx520 and 2055 source tokens");
-    require(env("NINFER_EXL3_TARGET_INITIAL16_ORDERED") == "1",
+    require(env("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED") == "1",
             "projection route matrix requires explicit initial16 ordered admission");
     require(!output_directory.empty() && !std::filesystem::exists(output_directory) &&
                 std::filesystem::create_directories(output_directory),

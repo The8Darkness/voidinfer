@@ -6,7 +6,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // One serialized physical batch owns the descriptor tables until a successful
 // host-side fence. This record allocates nothing and does not own CUDA handles.
 class Exl3TransferDescriptorUse {

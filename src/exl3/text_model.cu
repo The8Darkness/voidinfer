@@ -1,6 +1,15 @@
+#include "exl3/host_memory_ledger.h"
+#include "exl3/l0_history_mark.h"
+#include "core/capture_guard.h"
+#include "core/poll_wait.h"
+#include "exl3/growable_device_region.h"
+#include "exl3/lane_kv_source.h"
+#include "exl3/segment_copy.cuh"
+#include "exl3/packed_device_alloc.h"
 #include "exl3/pdl_small.cuh"
 #include "exl3/block_tree_sum.cuh"
 #include "exl3/text_model.h"
+#include "exl3/batched_verify_coordinator.h"
 #include "exl3/fixed_allocation_owners.h"
 #include "exl3/host_kv_transfer_requirements.h"
 #include "exl3/exact_page_extension_plan.h"
@@ -13,6 +22,7 @@
 #include "exl3/reconstruction_control_allocator.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/greedy_packet.cuh"
+#include "exl3/sampled_select.cuh"
 #include "exl3/transfer_descriptor_storage.h"
 #include "exl3/scatter_piece_storage.h"
 #include "exl3/device_prefix_cache.h"
@@ -49,6 +59,7 @@
 #include <cstring>
 #include <fstream>
 #include <exception>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -57,7 +68,89 @@
 #include <utility>
 #include <unordered_set>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
+// Set by the Engine before it builds a single lane that gets an exact
+// VeriCache line: the line shares the prompt-scale workspaces with the
+// drafting context it verifies (never both in a prompt pass at once).
+static std::atomic<bool> exact_line_workspace_sharing{false};
+void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept {
+    exact_line_workspace_sharing.store(enabled);
+}
+static std::atomic<bool> exact_line_compact_gdn{false};
+void exl3_set_exact_line_compact_gdn(bool enabled) noexcept {
+    exact_line_compact_gdn.store(enabled);
+}
+static bool exl3_exact_line_shares_prompt_workspace() {
+    return exact_line_workspace_sharing.load();
+}
+cudaError_t exl3_h2d_async(void* device,const void* host,std::size_t bytes,cudaStream_t stream) {
+    constexpr std::size_t kSlotBytes=std::size_t{256}<<10;
+    constexpr int kSlots=32;
+    if(!bytes)return cudaSuccess;
+    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+    if(!exl3_kernel_copies_enabled() || bytes>kSlotBytes ||
+       cudaStreamIsCapturing(stream,&capture)!=cudaSuccess || capture!=cudaStreamCaptureStatusNone)
+        return cudaMemcpyAsync(device,host,bytes,cudaMemcpyHostToDevice,stream);
+    cudaPointerAttributes attributes{};
+    if(cudaPointerGetAttributes(&attributes,host)==cudaSuccess && attributes.type==cudaMemoryTypeHost &&
+       attributes.devicePointer)
+        return exl3_copy_async(device,attributes.devicePointer,bytes,stream);
+    (void)cudaGetLastError();
+    struct Ring {
+        unsigned char* host=nullptr; unsigned char* device=nullptr;
+        std::array<cudaEvent_t,kSlots> done{}; std::array<bool,kSlots> used{}; int next=0;
+        std::mutex mutex;
+    };
+    static Ring ring;
+    const std::lock_guard lock(ring.mutex);
+    if(!ring.host) {
+        if(const auto error=cudaHostAlloc(reinterpret_cast<void**>(&ring.host),kSlots*kSlotBytes,cudaHostAllocMapped);
+           error!=cudaSuccess)return error;
+        if(const auto error=cudaHostGetDevicePointer(reinterpret_cast<void**>(&ring.device),ring.host,0);
+           error!=cudaSuccess)return error;
+        for(auto& event:ring.done)
+            if(const auto error=cudaEventCreateWithFlags(&event,cudaEventDisableTiming);error!=cudaSuccess)return error;
+    }
+    const int slot=ring.next;
+    ring.next=(ring.next+1)%kSlots;
+    if(ring.used[slot])
+        if(const auto error=voidinfer::cuda_poll_event(ring.done[slot]);error!=cudaSuccess)return error;
+    std::memcpy(ring.host+slot*kSlotBytes,host,bytes);
+    if(const auto error=exl3_copy_async(device,ring.device+slot*kSlotBytes,bytes,stream);error!=cudaSuccess)
+        return error;
+    ring.used[slot]=true;
+    return cudaEventRecord(ring.done[slot],stream);
+}
+cudaError_t exl3_d2h_async(void* host,const void* device,std::size_t bytes,cudaStream_t stream) {
+    constexpr std::size_t kKernelReadbackMax=std::size_t{1}<<20;
+    if(!bytes)return cudaSuccess;
+    if(!exl3_kernel_copies_enabled() || bytes>kKernelReadbackMax)
+        return cudaMemcpyAsync(host,device,bytes,cudaMemcpyDefault,stream);
+    cudaPointerAttributes attributes{};
+    if(cudaPointerGetAttributes(&attributes,host)==cudaSuccess && attributes.type==cudaMemoryTypeHost &&
+       attributes.devicePointer)
+        return exl3_copy_async(attributes.devicePointer,device,bytes,stream);
+    (void)cudaGetLastError();
+    struct Bounce {
+        void* host=nullptr; void* device=nullptr; std::size_t bytes=0;
+        ~Bounce() {if(host)cudaFreeHost(host);}
+    };
+    thread_local Bounce bounce;
+    if(bounce.bytes<bytes) {
+        if(bounce.host){cudaFreeHost(bounce.host);bounce.host=nullptr;bounce.bytes=0;}
+        if(const auto error=cudaHostAlloc(&bounce.host,kKernelReadbackMax,cudaHostAllocMapped);error!=cudaSuccess)
+            return error;
+        if(const auto error=cudaHostGetDevicePointer(&bounce.device,bounce.host,0);error!=cudaSuccess)
+            return error;
+        bounce.bytes=kKernelReadbackMax;
+    }
+    if(const auto error=exl3_copy_async(bounce.device,device,bytes,stream);error!=cudaSuccess)return error;
+    if(const auto error=voidinfer::cuda_poll_stream(stream);error!=cudaSuccess)return error;
+    if(const auto error=cudaStreamSynchronize(stream);error!=cudaSuccess)return error;
+    std::memcpy(host,bounce.host,bytes);
+    return cudaSuccess;
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -76,7 +169,7 @@ constexpr std::array<int, 5> kTapLayers = {5, 19, 33, 47, 61};
 std::atomic<std::uint64_t> next_exact_residency_id{1};
 
 bool fast_device_kv_transaction_enabled() {
-    const char* value=std::getenv("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
+    const char* value=std::getenv("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION");
     if(value && std::strcmp(value,"0")!=0 && std::strcmp(value,"1")!=0)
         throw std::invalid_argument("fast device-KV transaction must be 0 or 1");
     return value && std::strcmp(value,"1")==0;
@@ -119,7 +212,8 @@ struct ExactPageExtension {
 ExactPageExtension extend_exact_pages(
     const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& prefix,int old_position,int new_position,
     bool reuse_unique_tail=false,Exl3HostKVStats* stats=nullptr,unsigned fault_for_test=0,
-    const Exl3TextContext::SnapshotMetadataReservation& reserve_metadata={},int row_words=1024) {
+    const Exl3TextContext::SnapshotMetadataReservation& reserve_metadata={},int row_words=1024,
+    bool prepare_payload=true) {
     require(fault_for_test<=2,"exact page extension fault index");
     const auto started=stats?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(stats) ++stats->page_extension_calls;
@@ -174,7 +268,11 @@ ExactPageExtension extend_exact_pages(
                 if(stats) stats->page_clone_bytes+=payload_bytes;
                 const auto clone_started=stats?std::chrono::steady_clock::now():
                     std::chrono::steady_clock::time_point{};
-                *page=*prefix[index];
+                if(prefix[index]->source_id.load()) {
+                    // A lane-backed page may be filled or re-homed concurrently.
+                    std::shared_lock payload(exl3_page_payload_mutex());
+                    *page=*prefix[index];
+                } else *page=*prefix[index];
                 if(stats) stats->page_clone_cpu_ns+=static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now()-clone_started).count());
@@ -182,6 +280,9 @@ ExactPageExtension extend_exact_pages(
         } else page=create_page();
         if(page!=deferred_tail) {
           page->first=first;page->rows=rows;
+          // !prepare_payload: the exporter allocates and fills every fresh
+          // bank itself (parallel host copies, no zero fill).
+          if(prepare_payload)
           for(int bank=0;bank<16;++bank) {
             page->k[bank].reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*row_words);
             page->v[bank].reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*row_words);
@@ -241,9 +342,40 @@ struct DeviceAllocation {
     bool device_query_failure_for_test=false;
     bool device_mismatch_for_test=false;
     bool shared_control_admitted=false;
-    // L0 OSCAR: the FP16 K/V planes live in mapped pinned host memory (the L2
-    // FP16 tier); the GPU reads only the exact windows through UVA.
+    // L0 OSCAR: the FP16 K/V planes live in pinned host memory (the L2 FP16
+    // tier) addressed by the GPU; they own no device bytes.
     bool host_mapped=false;
+    // L0 OSCAR K/V planes: host memory behind a fixed GPU address range,
+    // backed as the context grows (ensure_host_bytes) instead of pinning
+    // max_context rows per lane up front. The CPU reaches it by copies only.
+    // The range (`window`, what kernels and graphs address) mirrors the
+    // chunks of the bound plane set's region (`host_region`), which a lane
+    // swaps by remapping (swap_backing).
+    std::shared_ptr<Exl3GrowableDeviceRegion> host_region;
+    std::unique_ptr<Exl3RegionWindow> window;
+    // Binds `next` (same capacity) behind the window; returns the previous
+    // backing. No in-flight work may reference the window.
+    std::shared_ptr<Exl3GrowableDeviceRegion> swap_backing(std::shared_ptr<Exl3GrowableDeviceRegion> next) {
+        if(!host_region || !window || !next || next->capacity_bytes()>window->capacity_bytes())
+            throw std::logic_error("plane backing swap extent");
+        host_region->detach_window();
+        next->attach_window(window->base());
+        std::swap(host_region,next);
+        return next;
+    }
+    bool cpu_visible() const noexcept {return !host_region;}
+    void ensure_host_bytes(std::size_t used) {
+        if(host_region)host_region->ensure(std::min(used,bytes));
+    }
+    void shrink_host_bytes(std::size_t used) {
+        if(host_region)host_region->shrink(std::min(used,bytes));
+    }
+    // Host bytes ensure_host_bytes(used) would newly back.
+    std::uint64_t host_growth_bytes(std::size_t used) const {
+        if(!host_region)return 0;
+        const std::size_t target=std::min(used,bytes);
+        return target>host_region->mapped_bytes()?target-host_region->mapped_bytes():0;
+    }
     Exl3SharedControlCredit* shared_control_credit=nullptr;
     static constexpr std::size_t shared_control_bytes=Exl3ReconstructionControlAllocator<std::byte>::capacity;
     void* ptr = nullptr;
@@ -296,6 +428,15 @@ struct DeviceAllocation {
     }
     void release() noexcept {
         if(!ptr)return;
+        if(host_region) {
+            // The backing may outlive the planes (a plane set with deferred pages).
+            host_region->detach_window();
+            host_region.reset();
+            window.reset();
+            if(retirement)retirement->device_credit.reset();
+            ptr=nullptr;
+            return;
+        }
         int current=-1;auto error=cleanup_failure_for_test?cudaErrorUnknown:
             (device_query_failure_for_test?cudaErrorInitializationError:cudaGetDevice(&current));
         if(error==cudaSuccess && (device_mismatch_for_test || current!=device))error=cudaErrorInvalidDevice;
@@ -357,13 +498,59 @@ struct DeviceAllocation {
         prepare_device();
         if(l0_host_kv_plane(label)) {
             host_mapped=true;
-            cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
-        } else cuda_check(cudaMalloc(&ptr, bytes), label);
+            if(growable_host_planes(label,bytes)) {
+                window=std::make_unique<Exl3RegionWindow>(bytes);
+                host_region=std::make_shared<Exl3GrowableDeviceRegion>();
+                host_region->reserve(bytes,true);
+                host_region->attach_window(window->base());
+                ptr=reinterpret_cast<void*>(window->base());
+            } else
+                cuda_check(cudaHostAlloc(&ptr,bytes,cudaHostAllocMapped|cudaHostAllocPortable),label);
+        } else {
+            cuda_check(exl3_packed_malloc(&ptr, bytes), label);
+            static const bool trace=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
+            if(trace && bytes>=(256u<<10))
+                std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB %s%c",bytes/1048576.0,label?label:"?",10);
+        }
+    }
+    // Long-context E4A K/V planes (max_context above 32K) grow with the
+    // context; shorter ones stay pinned at construction, which keeps exports
+    // as plain CPU copies (growable planes export through GPU DMA, ~2% of C4
+    // throughput at 4K). VOIDINFER_EXL3_L0_GROWABLE_PLANES=0|1 forces either.
+    static bool growable_host_planes(const char* label,std::size_t bytes) {
+        static const int forced=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_GROWABLE_PLANES");
+            return value ? (std::strcmp(value,"0")!=0 ? 1 : 0) : -1;
+        }();
+        constexpr std::size_t kPinnedPlaneBytes=32768ull*kKVHeads*kHeadDim*sizeof(std::uint16_t);
+        const bool growable=forced>=0 ? forced==1 : bytes>kPinnedPlaneBytes;
+        return growable && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
+                                     std::strcmp(label,"allocate E4A V cache")==0);
     }
     static bool l0_host_kv_plane(const char* label) {
         const bool l0=Exl3NativeContextExtent::l0_oscar_enabled();
-        return l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
-                               std::strcmp(label,"allocate E4A V cache")==0);
+        if(l0 && label && (std::strcmp(label,"allocate E4A K cache")==0 ||
+                           std::strcmp(label,"allocate E4A V cache")==0))return true;
+        // Concurrent lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1) keep the
+        // VeriCache verified root (GDN state at the verified frontier) in
+        // mapped host memory: it is written once per verified block and read
+        // only on a correction, so ~154 MiB per lane leave the device for a
+        // few-millisecond PCIe copy per verify. VOIDINFER_EXL3_HOST_VERIFIED_ROOT=0
+        // keeps it on the device.
+        static const bool host_root=[] {
+            const char* shared=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            const char* value=std::getenv("VOIDINFER_EXL3_HOST_VERIFIED_ROOT");
+            if(value)return std::strcmp(value,"0")!=0;
+            return shared && std::strcmp(shared,"1")==0;
+        }();
+        // The round transaction's tap/embedding checkpoint (rows of the
+        // previous forward, at most a prefill chunk) follows it: one small
+        // PCIe copy per round instead of ~62 MiB of device memory per lane.
+        return host_root && label &&
+            (std::strcmp(label,"allocate verified root recurrent state")==0 ||
+             std::strcmp(label,"allocate verified root convolution state")==0 ||
+             std::strcmp(label,"allocate P2 target taps checkpoint")==0 ||
+             std::strcmp(label,"allocate P2 target embedding checkpoint")==0);
     }
     ~DeviceAllocation() {release();}
     DeviceAllocation(const DeviceAllocation&) = delete;
@@ -559,6 +746,9 @@ __global__ void final_rms_norm_kernel(const std::uint16_t* input,
                                       std::uint16_t* output) {
     // 512 threads: the same per-thread x*x order and the same pairwise tree
     // (block_tree_sum_exact), with the ten loads per thread issued together.
+    // blockIdx.x selects a row of contiguous [rows][kHidden] input/output.
+    input += static_cast<std::size_t>(blockIdx.x) * kHidden;
+    output += static_cast<std::size_t>(blockIdx.x) * kHidden;
     __shared__ float partial[512];
     const int lane = static_cast<int>(threadIdx.x);
     constexpr int kPer = kHidden / 512;
@@ -735,6 +925,53 @@ struct Exl3GreedyPacketTransfer {
     }
 };
 
+// Prompt-scale layer views (accumulation, transform, layer scratch, GDN wide
+// slab) shared by the contexts of concurrent Engine lanes. Only exclusive
+// prompt/verifier passes use them; every context keeps a private small tier
+// for verifier and decode rows (Exl3SmallTierViews).
+struct Exl3SharedPromptPool {
+    std::array<void*,6> data{};
+    std::array<std::size_t,6> bytes{};
+    Exl3SharedPromptPool() = default;
+    Exl3SharedPromptPool(const Exl3SharedPromptPool&) = delete;
+    Exl3SharedPromptPool& operator=(const Exl3SharedPromptPool&) = delete;
+    ~Exl3SharedPromptPool() { for(auto* pointer:data)if(pointer)(void)cudaFree(pointer); }
+};
+
+// Rows of one batched multi-agent forward and of every context's private
+// small tier (VOIDINFER_EXL3_BATCH_ROWS, set by the Engine): 32 for groups of
+// up to four lanes (8 verifier rows each), 64 for up to eight.
+static int exl3_batch_rows() noexcept {
+    static const int rows=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_BATCH_ROWS");
+        return value && std::atoi(value)==64 ? 64 : 32;
+    }();
+    return rows;
+}
+
+// Concurrent lanes: the prompt-scale tap and embedding-trace planes (five
+// taps + embedding). One context's rows at a time: a pass claims the pool
+// (Exl3TextContext::Impl::enter_tap_pool) and its later reads stay valid until
+// another context claims it. `done` follows the owner's last use on the
+// device, so the next claimant's stream waits for it.
+struct Exl3SharedTapPool {
+    std::array<void*,6> data{};
+    std::size_t bytes=0;
+    std::mutex mutex;
+    const void* owner=nullptr;
+    bool owner_in_pass=false;
+    std::uint64_t claims=0;
+    cudaEvent_t done=nullptr;
+    bool done_recorded=false;
+    Exl3SharedTapPool() = default;
+    Exl3SharedTapPool(const Exl3SharedTapPool&) = delete;
+    Exl3SharedTapPool& operator=(const Exl3SharedTapPool&) = delete;
+    ~Exl3SharedTapPool() {
+        for(auto* pointer:data)if(pointer)(void)cudaFree(pointer);
+        if(done)(void)cudaEventDestroy(done);
+    }
+};
+
 struct Exl3TextModel::Impl {
     // Lifetime-stable process identity for exact host images; prevents address
     // reuse from making an old model's checkpoint compatible with a new model.
@@ -759,8 +996,61 @@ struct Exl3TextModel::Impl {
     Exl3CudaLinearWeights lm_head{};
     Exl3CudaLinearMetadata lm_head_metadata{};
     const std::uint16_t* embedding = nullptr;
+    // VOIDINFER_EXL3_HOST_EMBEDDING (default 1): the BF16 token embedding
+    // (2.5 GB) lives in mapped pinned host memory; lookups read a few rows
+    // per step over PCIe, and the device memory serves more Engine lanes.
+    struct HostEmbedding {
+        void* host = nullptr;
+        HostEmbedding() = default;
+        HostEmbedding(const HostEmbedding&) = delete;
+        HostEmbedding& operator=(const HostEmbedding&) = delete;
+        ~HostEmbedding() { if (host) (void)cudaFreeHost(host); }
+    };
+    std::unique_ptr<HostEmbedding> host_embedding;
     const std::uint16_t* final_norm = nullptr;
     std::size_t model_bytes = 0;
+    // Prompt-scale FP16 reconstruct + GEMM workspace shared by the contexts of
+    // concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): only
+    // prompt ingestion and VeriCache verifier passes use it, and the Engine
+    // runs those one lane at a time.
+    mutable std::mutex shared_numeric_mutex;
+    mutable std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric_workspace;
+    mutable std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
+    // Prompt-only FA2/WMMA32 attention partials shared by concurrent lanes.
+    mutable std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
+    mutable std::shared_ptr<Exl3SharedPromptPool> shared_hidden;
+    mutable std::shared_ptr<Exl3SharedTapPool> shared_taps;
+    // Batched-round heads (norm rows, logits, 16- and 32-row H6 workspaces):
+    // only a forward's leader uses one, from its final norm until the copies
+    // into every member's continuation; at most two run at once (the halves
+    // of a split eight-lane group). `done` follows a slot's last use.
+    struct BatchedHeadSlot {
+        std::unique_ptr<DeviceAllocation> norm,logits;
+        std::unique_ptr<Exl3CudaLinearWorkspace> workspace16,workspace32;
+        cudaEvent_t done=nullptr;
+        bool busy=false,recorded=false;
+        ~BatchedHeadSlot(){if(done)(void)cudaEventDestroy(done);}
+    };
+    mutable std::mutex batched_head_mutex;
+    mutable std::vector<std::unique_ptr<BatchedHeadSlot>> batched_head_slots;
+    // Eight-lane Engines (64 batch rows): one wider small-tier view set that
+    // every lane context's batched-round owner selects for its 33..64-row
+    // forwards (only a group of five or more lanes reaches them, so one runs
+    // at a time); each context keeps a 32-row private tier. `mutex` orders the
+    // host enqueues of successive owners, `done` follows the last use.
+    struct SharedBatchTier {
+        void* storage=nullptr;
+        Exl3SmallTierViews views;
+        cudaEvent_t done=nullptr;
+        bool recorded=false;
+        std::mutex mutex;
+        ~SharedBatchTier() {
+            if(done)(void)cudaEventDestroy(done);
+            if(storage)(void)cudaFree(storage);
+        }
+    };
+    mutable std::mutex shared_batch_tier_mutex;
+    mutable std::shared_ptr<SharedBatchTier> shared_batch_tier;
 
     TensorPayload load_tensor(const IndexedSafetensors& input, const std::string& name) {
         const auto start = std::chrono::steady_clock::now();
@@ -930,10 +1220,10 @@ struct Exl3TextModel::Impl {
         require(full_count == 16, "canonical EXL3 full-attention layer count mismatch");
 
         collection = inspect_indexed_directory(directory);
-        const char* mirror_override = std::getenv("NINFER_EXL3_DUAL_READ_MANIFEST");
-        const char* dual_mode = std::getenv("NINFER_EXL3_DUAL_LOAD");
+        const char* mirror_override = std::getenv("VOIDINFER_EXL3_DUAL_READ_MANIFEST");
+        const char* dual_mode = std::getenv("VOIDINFER_EXL3_DUAL_LOAD");
         require(!dual_mode || !*dual_mode || std::strcmp(dual_mode, "0") == 0 ||
-                std::strcmp(dual_mode, "1") == 0, "NINFER_EXL3_DUAL_LOAD must be0 or1");
+                std::strcmp(dual_mode, "1") == 0, "VOIDINFER_EXL3_DUAL_LOAD must be0 or1");
         const bool disabled = load_options.disable_dual_artifact_loading ||
                               (dual_mode && std::strcmp(dual_mode, "0") == 0);
         std::filesystem::path mirror;
@@ -944,7 +1234,7 @@ struct Exl3TextModel::Impl {
             require(!(dual_mode && std::strcmp(dual_mode, "1") == 0) || !mirror.empty(),
                     "forced dual loading requires a verified mirror manifest");
         }
-        const char* audit = std::getenv("NINFER_EXL3_DUAL_READ_AUDIT");
+        const char* audit = std::getenv("VOIDINFER_EXL3_DUAL_READ_AUDIT");
         audit_parallel = audit && std::strcmp(audit, "1") == 0;
         require(!audit_parallel || !mirror.empty(), "parallel audit requires a verified mirror manifest");
         if (!mirror.empty()) {
@@ -956,8 +1246,28 @@ struct Exl3TextModel::Impl {
                 std::chrono::steady_clock::now() - start).count();
             load_stats.parallel_staged = true;
         }
-        embedding = static_cast<const std::uint16_t*>(load_raw_tensor(
-            "model.language_model.embed_tokens.weight", "embedding", "BF16"));
+        static const bool host_embedding_enabled = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_HOST_EMBEDDING");
+            require(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0,
+                    "VOIDINFER_EXL3_HOST_EMBEDDING must be 0 or 1");
+            return !value || std::strcmp(value, "1") == 0;
+        }();
+        if (host_embedding_enabled) {
+            const auto tensor = load_tensor(collection, "model.language_model.embed_tokens.weight");
+            require(tensor.info.dtype == "BF16", "embedding raw tensor metadata mismatch");
+            host_embedding = std::make_unique<HostEmbedding>();
+            cuda_check(cudaHostAlloc(&host_embedding->host, tensor.bytes().size(),
+                                     cudaHostAllocMapped | cudaHostAllocWriteCombined),
+                       "allocate mapped host embedding");
+            std::memcpy(host_embedding->host, tensor.bytes().data(), tensor.bytes().size());
+            void* device = nullptr;
+            cuda_check(cudaHostGetDevicePointer(&device, host_embedding->host, 0),
+                       "map host embedding");
+            embedding = static_cast<const std::uint16_t*>(device);
+        } else {
+            embedding = static_cast<const std::uint16_t*>(load_raw_tensor(
+                "model.language_model.embed_tokens.weight", "embedding", "BF16"));
+        }
         final_norm = load_norm("model.language_model.norm.weight", kHidden);
 
         for (int i = 0; i < kLayers; ++i) {
@@ -1017,6 +1327,24 @@ struct Exl3TextModel::Impl {
     }
 };
 
+// VeriCache root: GDN recurrent/convolution checkpoint (device, or mapped host
+// memory with concurrent lanes: l0_host_kv_plane) and frontier metadata.
+struct Exl3TextContext::VerifiedRoot {
+    std::unique_ptr<DeviceAllocation> recurrent, conv;
+    std::array<Exl3GdnLayerCheckpoint, kLayers> checkpoints{};
+    int position = -1, last_rows = 0, tap_rows = 0, embedding_rows = 0;
+};
+struct Exl3ExactLineSlot::State {
+    std::unique_ptr<Exl3TextContext::VerifiedRoot> root;
+};
+Exl3ExactLineSlot::Exl3ExactLineSlot() : state_(std::make_unique<State>()) {}
+Exl3ExactLineSlot::~Exl3ExactLineSlot() = default;
+Exl3ExactLineSlot::Exl3ExactLineSlot(Exl3ExactLineSlot&&) noexcept = default;
+Exl3ExactLineSlot& Exl3ExactLineSlot::operator=(Exl3ExactLineSlot&&) noexcept = default;
+int Exl3ExactLineSlot::position() const noexcept {
+    return state_ && state_->root ? state_->root->position : -1;
+}
+
 struct Exl3TextContext::Impl {
     Exl3GamingOptions gaming = Exl3GamingOptions::from_environment();
     GoptSubmissions gaming_submissions{};
@@ -1036,6 +1364,8 @@ struct Exl3TextContext::Impl {
         std::size_t bytes = 0;
         int position = 0;
         int tap_rows = 0;
+        // First saved tap row (shared tap pool: older rows were no longer held).
+        int tap_first = 0;
         int embedding_rows = 0;
         int last_rows = 0;
         cudaStream_t stream = nullptr;
@@ -1046,6 +1376,12 @@ struct Exl3TextContext::Impl {
         int attempted_rows = 0;
         int continuation_graph_rows = 0;
         bool continuation_graph_attempt = false;
+        // GDN live checkpoint (gdn_live): an attempt forward left the live
+        // recurrent state at the root and its retained-prefix repair is owed;
+        // or a state-writing forward first saved the root to host memory.
+        bool live_pending = false;
+        bool live_host_saved = false;
+        void* live_host_root = nullptr;
         DecodeGraphDefinition checkpoint_graph_definition;
         DecodeGraphExecutable checkpoint_graph_executable;
         cudaStream_t checkpoint_graph_stream = nullptr;
@@ -1171,6 +1507,17 @@ struct Exl3TextContext::Impl {
         ordinary_full_layer_graphs{};
     bool ordinary_full_layer_graphs_enabled=false;
     bool ordinary_full_layer_graph_extended_replay=false;
+    // Batched multi-agent continuation: one captured 16-row layer stack per
+    // (peer, row shape), replayed by continue_rows_batched.
+    struct BatchedGraph {
+        std::vector<const void*> peers;
+        std::vector<int> peer_rows;
+        int own_rows=0;
+        std::uint16_t* stack_output=nullptr;
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+    };
+    std::vector<std::unique_ptr<BatchedGraph>> batched_graphs;
     // Continuation (verifier) rows 2..8 replay captured full-layer graphs too;
     // the retained-prefix capability is re-armed on the host after replay.
     bool ordinary_full_layer_multirow_graphs_enabled=false;
@@ -1189,17 +1536,27 @@ struct Exl3TextContext::Impl {
     // state joins it first (join_repair / drain_repair).
     cudaStream_t repair_stream=nullptr;
     cudaEvent_t repair_fork=nullptr;
+    // Concurrent Engine lanes replay the repair in order on the target stream
+    // (set_gdn_repair_overlap(false)): the overlapped side-stream repair
+    // corrupts recurrent state there (root cause open).
+    bool gdn_repair_overlap=true;
     cudaEvent_t repair_join=nullptr;
     bool repair_pending=false;
     // L0 OSCAR: re-entry of append_prefill_layer_major for one bounded block.
     bool l0_layer_major_block=false;
     std::vector<int> verifier_sibling_offsets;
     // Sibling promotion descriptor tables, one per (source, destination, rows).
+    // Promotion copy tables per (source, destination, rows). A slot's device
+    // table is allocated once and rewritten in stream order on the lane's
+    // stream (host entries kept with the slot): a legacy-stream upload is not
+    // ordered before the promotion kernel on a non-blocking lane stream.
     struct SiblingCopyTable {
         int source=-1,destination=-1,rows=0,count=0;
+        std::vector<Exl3SiblingRowCopy> host;
         std::unique_ptr<DeviceAllocation> device;
     };
-    std::array<SiblingCopyTable,8> sibling_copy_tables{};
+    std::array<SiblingCopyTable,64> sibling_copy_tables{};
+    std::size_t sibling_copy_next=0;
     // Overlapped device-transaction checkpoint: the checkpoint graph runs on
     // its own stream (after the transaction stream's prior work and any
     // pending repair) while the caller drafts; the same joins order every
@@ -1263,8 +1620,244 @@ struct Exl3TextContext::Impl {
     // Proven by successful ordinary restore/export, invalidated by reset.
     // Retain only immutable KV pages, never an ancestor's full recurrent image.
     int exact_prefix_position = 0;
-    // Rows below this are stale in L0 OSCAR host planes after a sparse restore.
-    int l0_planes_valid_from = 0;
+    // Lane-backed export pages (lane_kv_source.h): exported exact states keep
+    // their KV rows in these L0 planes until the rows are about to change.
+    std::shared_ptr<Exl3LaneKvSource> kv_source;
+    // The lane source over this context's L0 host planes (null otherwise).
+    // Growable planes form a plane set the source owns (lane_kv_source.h):
+    // its regions, addressed at their own ranges by the source and mirrored
+    // into this context's plane windows while bound.
+    struct PlaneSet {
+        std::array<std::shared_ptr<Exl3GrowableDeviceRegion>,kLayers> k,v;
+    };
+    std::shared_ptr<Exl3LaneKvSource> make_plane_source(const std::shared_ptr<PlaneSet>& set) {
+        Exl3LaneKvSource::Planes planes;
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                planes.k[planes.banks]=set->k[layer]->data<const std::uint16_t>();
+                planes.v[planes.banks]=set->v[layer]->data<const std::uint16_t>();
+                ++planes.banks;
+            }
+        planes.cpu_visible=false;
+        auto source=Exl3LaneKvSource::create(planes);
+        source->set_backing(set,[set](int rows) {
+            const std::size_t used=static_cast<std::size_t>(std::max(rows,0))*kPlaneRowBytes;
+            std::uint64_t released=0;
+            for(int layer=0;layer<kLayers;++layer)
+                for(const auto& region:{set->k[layer],set->v[layer]})if(region) {
+                    const auto before=region->mapped_bytes();
+                    region->shrink(used);
+                    released+=before-region->mapped_bytes();
+                }
+            return released;
+        });
+        return source;
+    }
+    bool plane_sets_enabled() const {
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer] && (!cache_k[layer] || !cache_v[layer] ||
+               !cache_k[layer]->window || !cache_v[layer]->window))return false;
+        return true;
+    }
+    void ensure_kv_source() {
+        if(kv_source || exact_line || !Exl3NativeContextExtent::l0_oscar_enabled() || host_kv.enabled)return;
+        Exl3LaneKvSource::Planes planes;
+        bool cpu_visible=true;
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                if(!cache_k[layer] || !cache_v[layer] || !cache_k[layer]->host_mapped ||
+                   !cache_v[layer]->host_mapped || planes.banks>=16)return;
+                planes.k[planes.banks]=static_cast<const std::uint16_t*>(cache_k[layer]->ptr);
+                planes.v[planes.banks]=static_cast<const std::uint16_t*>(cache_v[layer]->ptr);
+                cpu_visible=cpu_visible && cache_k[layer]->cpu_visible() && cache_v[layer]->cpu_visible();
+                ++planes.banks;
+            }
+        if(!planes.banks)return;
+        if(plane_sets_enabled()) {
+            auto set=std::make_shared<PlaneSet>();
+            for(int layer=0;layer<kLayers;++layer)
+                if(full_layers[layer]) {set->k[layer]=cache_k[layer]->host_region;set->v[layer]=cache_v[layer]->host_region;}
+            kv_source=make_plane_source(set);
+            (void)kv_source->try_bind(this);
+            prepare_next_plane_set();
+            top_up_plane_pool();
+            return;
+        }
+        planes.cpu_visible=cpu_visible;
+        kv_source=Exl3LaneKvSource::create(planes);
+    }
+    // Binds `next` (already claimed for this context): its regions go behind
+    // the plane windows; the previous set keeps its pages and becomes idle.
+    void bind_plane_set(std::shared_ptr<Exl3LaneKvSource> next) {
+        static const bool trace=std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE")!=nullptr;
+        const auto t0=std::chrono::steady_clock::now();
+        auto set=std::static_pointer_cast<PlaneSet>(next->backing());
+        // ~0.4 ms per window unmap on the driver (serialized: worker threads
+        // do not help).
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer]) {
+                (void)cache_k[layer]->swap_backing(set->k[layer]);
+                (void)cache_v[layer]->swap_backing(set->v[layer]);
+            }
+        const auto t1=std::chrono::steady_clock::now();
+        if(kv_source)kv_source->unbind(this);
+        // The outgoing set and every other idle set keep only the rows their
+        // deferred pages name.
+        Exl3LaneKvSource::release_idle_unreferenced_rows();
+        if(trace)std::fprintf(stderr,"PLANE_SET_BIND swap_ms=%.2f unbind_ms=%.2f\n",
+            std::chrono::duration<double,std::milli>(t1-t0).count(),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t1).count());
+        kv_source=std::move(next);
+        ++plane_set_binds;
+    }
+    // A new empty plane set for a fresh conversation.
+    // An empty plane set: one reserved host region per plane (address range
+    // only; chunks are backed as rows arrive).
+    using PlaneBytes=std::array<std::size_t,kLayers>;   // 0: no full-attention layer
+    PlaneBytes plane_bytes() const {
+        PlaneBytes bytes{};
+        for(int layer=0;layer<kLayers;++layer)if(full_layers[layer])bytes[layer]=cache_k[layer]->bytes;
+        return bytes;
+    }
+    static std::shared_ptr<PlaneSet> reserve_plane_set(const PlaneBytes& bytes) {
+        auto set=std::make_shared<PlaneSet>();
+        for(int layer=0;layer<kLayers;++layer)
+            if(bytes[layer]) {
+                for(auto* side:{&set->k[layer],&set->v[layer]}) {
+                    *side=std::make_shared<Exl3GrowableDeviceRegion>();
+                    (*side)->reserve(bytes[layer],true);
+                }
+            }
+        return set;
+    }
+    // The 32 address reservations of a plane set take ~20 ms on the driver;
+    // the next fresh conversation's set is reserved off the request path
+    // (VOIDINFER_EXL3_PREPARE_PLANE_SET=0 reserves inline).
+    // A fresh set's first forward backs rows + kPlaneGrowthMarginRows of all
+    // planes; the host chunk pool is refilled to that in the background
+    // (VOIDINFER_EXL3_HOST_CHUNK_POOL_RESERVE_MIB, default 320, 0 = off).
+    void top_up_plane_pool() const {
+        static const std::size_t target=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_HOST_CHUNK_POOL_RESERVE_MIB");
+            return static_cast<std::size_t>(value?std::strtoull(value,nullptr,10):320)<<20;
+        }();
+        if(!target)return;
+        for(int layer=0;layer<kLayers;++layer)
+            if(full_layers[layer] && cache_k[layer] && cache_k[layer]->host_region) {
+                cache_k[layer]->host_region->top_up_host_pool_async(target);
+                return;
+            }
+    }
+    void prepare_next_plane_set() {
+        static const bool prepare=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_PREPARE_PLANE_SET");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        if(!prepare || next_plane_set.valid())return;
+        // The worker thread makes the caller's context current (driver API).
+        CUcontext context=nullptr;
+        if(cuCtxGetCurrent(&context)!=CUDA_SUCCESS || !context)return;
+        // The set also backs its first forward's rows (16 + the growth
+        // margin) at its own range: binding then only mirrors those chunks
+        // into the windows instead of mapping them twice on the request path.
+        next_plane_set=std::async(std::launch::async,[bytes=plane_bytes(),context] {
+            if(cuCtxSetCurrent(context)!=CUDA_SUCCESS)
+                throw std::runtime_error("L0 plane set preparation context");
+            auto set=reserve_plane_set(bytes);
+            static const bool back=[] {
+                const char* value=std::getenv("VOIDINFER_EXL3_PREPARE_PLANE_BACKING");
+                return !value || std::strcmp(value,"0")!=0;
+            }();
+            if(back) {
+                const std::size_t initial=static_cast<std::size_t>(16+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+                for(int layer=0;layer<kLayers;++layer)
+                    for(const auto& region:{set->k[layer],set->v[layer]})
+                        if(region)region->ensure(std::min(initial,bytes[layer]));
+            }
+            return set;
+        });
+    }
+    void bind_fresh_plane_set() {
+        static const bool trace=std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE")!=nullptr;
+        const auto t0=std::chrono::steady_clock::now();
+        std::shared_ptr<PlaneSet> set;
+        const bool prepared=next_plane_set.valid();
+        if(prepared)try{set=next_plane_set.get();}catch(...){set.reset();}
+        if(!set)set=reserve_plane_set(plane_bytes());
+        const auto t1=std::chrono::steady_clock::now();
+        auto source=make_plane_source(set);
+        (void)source->try_bind(this);
+        const auto t2=std::chrono::steady_clock::now();
+        bind_plane_set(std::move(source));
+        prepare_next_plane_set();
+        top_up_plane_pool();
+        if(trace) {
+            const auto t3=std::chrono::steady_clock::now();
+            const auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
+            std::fprintf(stderr,"FRESH_PLANE_SET context=%p prepared=%d reserve_ms=%.2f source_ms=%.2f bind_ms=%.2f\n",
+                static_cast<const void*>(this),prepared?1:0,ms(t0,t1),ms(t1,t2),ms(t2,t3));
+        }
+    }
+    // Restoring a history whose rows an idle plane set holds (the agent's own
+    // set, where its last lane left it): bind that set instead of copying the
+    // rows into the current one, whose outgoing pages then stay in place (the
+    // copy path packs them out first). Rebinding remaps every plane window
+    // (~13 ms + ~3.7 ms per 1K rows); measured on 8 agents over 4 lanes the
+    // copy path took 125-190 ms at 16K and 0.5-3.3 s at 60K (adoption 95-105
+    // ms / 270-310 ms). Below VOIDINFER_EXL3_ADOPT_MIN_PAGES (default 32
+    // pages, 2K rows) the plane-to-plane copy is as cheap.
+    static std::size_t adopt_min_pages() {
+        static const std::size_t pages=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_ADOPT_MIN_PAGES");
+            return static_cast<std::size_t>(value?std::strtoull(value,nullptr,10):32);
+        }();
+        return pages;
+    }
+    void adopt_plane_set_of(const Exl3ExactHostState& state) {
+        if(!kv_source || !kv_source->backing() || exact_line || state.kv_pages_.size()<adopt_min_pages())return;
+        std::shared_ptr<Exl3LaneKvSource> best;
+        std::size_t best_count=0;
+        {
+            std::shared_lock payload(exl3_page_payload_mutex());
+            std::vector<std::pair<Exl3LaneKvSource*,std::size_t>> counts;
+            for(const auto& page:state.kv_pages_) {
+                const auto& owner=page->source;
+                if(!owner || owner==kv_source || !owner->backing() || !owner->holds(*page))continue;
+                auto at=std::find_if(counts.begin(),counts.end(),[&](const auto& c){return c.first==owner.get();});
+                std::size_t count=1;
+                if(at==counts.end())counts.emplace_back(owner.get(),1);
+                else count=++at->second;
+                if(count>best_count){best_count=count;best=owner;}
+            }
+        }
+        if(!best || best_count*2<state.kv_pages_.size() || !best->try_bind(this))return;
+        bind_plane_set(std::move(best));
+    }
+    std::uint64_t plane_set_binds=0;
+    // The next fresh set, reserving on a worker (std::async: destruction joins).
+    std::future<std::shared_ptr<PlaneSet>> next_plane_set;
+    // Called before rows >= `row` of the L0 planes are rewritten.
+    void kv_rows_rewritten_from(int row) {
+        line_fp8_rewritten_from(row);
+        if(kv_source)kv_source->materialize_from(row);
+    }
+    // A reset ends the lineage without touching the planes: the fill waits
+    // for the first plane write (a forward) and a restore replaces it with
+    // its own exact handover (materialize_except).
+    int kv_rewrite_pending=-1;
+    void consume_kv_rewrite() {
+        if(kv_rewrite_pending<0)return;
+        const int row=kv_rewrite_pending;
+        kv_rewrite_pending=-1;
+        // A fresh conversation over planes that still hold another history's
+        // deferred pages: that set stays as it is (idle) and a new one is bound.
+        if(row==0 && kv_source && kv_source->backing() && kv_source->deferred_beyond(0)) {
+            line_fp8_rewritten_from(0);
+            bind_fresh_plane_set();
+            return;
+        }
+        kv_rows_rewritten_from(row);
+    }
     // Complete L0 OSCAR code chunks of the resident lineage (export/restore).
     std::array<std::vector<std::shared_ptr<const Exl3ExactHostState::L0CodeChunk>>,16> l0_prefix_chunks;
     int rope_offset = 0;
@@ -1301,6 +1894,78 @@ struct Exl3TextContext::Impl {
     int fast_wmma32_split_count = 0;
     int fast_wmma32_split_capacity = 0;
     int gdn_bulk_capacity = 0;
+    struct RoundTrace { int base = -1, rows = 0, members = 0, graph = 0, member = 0; };
+    std::array<RoundTrace, 1024> round_traces{};
+    std::size_t round_trace_next = 0;
+    int trace_members = 1, trace_graph = 0, trace_member = 0;
+    // Owner of batched multi-agent rounds: every agent's final-norm rows and
+    // logits of one head pass (allocated on first lead).
+    // Nonzero while a batched multi-agent BatchBinding owns the layers.
+    int batch_bound = 0;
+    // GDN live checkpoint (VOIDINFER_EXL3_GDN_LIVE_CHECKPOINT; default with
+    // concurrent lanes): the transaction keeps no recurrent copy. Attempt
+    // forwards read the live state without writing it back (device flag 0)
+    // and the retained-prefix repair advances it in place at settlement.
+    bool gdn_live = false;
+    int* gdn_write_flag = nullptr;
+    std::size_t gdn_recurrent_total_bytes = 0;
+    void live_arm_attempt(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->active)return;
+        require(!transaction->live_pending && !transaction->live_host_saved,
+            "GDN live attempt after a state-writing forward");
+        cuda_check(cudaMemsetAsync(gdn_write_flag,0,sizeof(int),stream),"GDN live attempt flag");
+        transaction->live_pending=true;
+        for(auto& layer:gdn_layers)if(layer)layer->set_live_transaction(true);
+    }
+    // Before any other state-writing forward inside a live transaction the
+    // root goes to mapped host memory once, so a rollback can restore it.
+    void live_guard_write(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->active)return;
+        require(!transaction->live_pending,"GDN live transaction has an unrepaired attempt");
+        if(transaction->live_host_saved)return;
+        if(!transaction->live_host_root)
+            cuda_check(cudaHostAlloc(&transaction->live_host_root,gdn_recurrent_total_bytes,
+                cudaHostAllocMapped|cudaHostAllocPortable),"allocate GDN live host root");
+        auto* cursor=static_cast<std::byte*>(transaction->live_host_root);
+        for(auto& layer:gdn_layers)if(layer) {
+            cuda_check(cudaMemcpyAsync(cursor,layer->recurrent_state_,layer->recurrent_state_bytes(),
+                cudaMemcpyDefault,stream),"save GDN live host root");
+            cursor+=layer->recurrent_state_bytes();
+        }
+        transaction->live_host_saved=true;
+    }
+    void live_restore_host_root(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->live_host_saved)return;
+        const auto* cursor=static_cast<const std::byte*>(transaction->live_host_root);
+        for(auto& layer:gdn_layers)if(layer) {
+            cuda_check(cudaMemcpyAsync(layer->recurrent_state_,cursor,layer->recurrent_state_bytes(),
+                cudaMemcpyDefault,stream),"restore GDN live host root");
+            cursor+=layer->recurrent_state_bytes();
+        }
+    }
+    // Full acceptance: the owed repair advances the root by every attempted row.
+    void live_repair_all(cudaStream_t stream) {
+        if(!gdn_live || !transaction || !transaction->live_pending)return;
+        const int rows=transaction->attempted_rows;
+        require(rows>0,"GDN live repair rows");
+        for(int layer=0;layer<kLayers;++layer)
+            if(gdn_layers[layer])
+                gdn_layers[layer]->reconstruct_retained_prefix(
+                    transaction->gdn_checkpoints[layer],rows,stream);
+    }
+    void live_release(cudaStream_t stream) {
+        if(!gdn_live || !transaction)return;
+        if(transaction->live_pending || transaction->live_host_saved)
+            cuda_check(cudaMemsetAsync(gdn_write_flag,1,sizeof(int),stream),"GDN live release flag");
+        transaction->live_pending=false;
+        transaction->live_host_saved=false;
+        for(auto& layer:gdn_layers)if(layer)layer->set_live_transaction(false);
+    }
+    // Owner-side fork streams for batched peers' stateful cores
+    // (VOIDINFER_EXL3_BATCH_FORK, default on); created on first lead.
+    std::array<cudaStream_t,kMaxBatchedPeers> batch_fork_streams{};
+    cudaEvent_t batch_fork_event = nullptr;
+    std::array<cudaEvent_t,kMaxBatchedPeers> batch_join_events{};
     std::shared_ptr<DeviceAllocation> host_layer_k, host_layer_v;
     std::shared_ptr<Exl3AttentionStageStorage> attention_stage_storage;
     std::shared_ptr<Exl3AttentionStage> attention_stages;
@@ -1387,8 +2052,55 @@ struct Exl3TextContext::Impl {
     Exl3CudaLinearWorkspace::Owner prefill_qkv_v_workspace;
     std::size_t prefill_qkv_private_workspace_bytes = 0;
     int prefill_qkv_layer_count = 0;
-    std::unique_ptr<Exl3CudaReconstructGemmWorkspace>
+    std::shared_ptr<Exl3CudaReconstructGemmWorkspace>
         numeric_prefill_projection_workspace;
+    // Borrowed from the model's shared prompt workspace (counted by its owner).
+    bool numeric_prefill_workspace_borrowed = false;
+    // Concurrent Engine lanes: the layers' prompt-scale views live in the
+    // model's Exl3SharedPromptPool; this context's small tier serves rows
+    // <= small_tier_rows. PromptTierScope selects the pool around larger passes.
+    std::shared_ptr<Exl3SharedPromptPool> shared_prompt_pool;
+    std::shared_ptr<Exl3SharedPromptPool> shared_wmma;
+    std::shared_ptr<Exl3SharedPromptPool> shared_hidden;
+    std::uint16_t* large_hidden_a = nullptr;
+    std::uint16_t* large_hidden_b = nullptr;
+    void* small_tier_storage = nullptr;
+    int small_tier_rows = 0;
+    int prompt_tier_depth = 0;
+    std::function<void(cudaStream_t)> prefill_yield;
+    std::shared_ptr<Exl3TextModel::Impl::SharedBatchTier> batch_tier;
+    void select_batch_tier(bool batch) {
+        for(auto& layer:full_layers)if(layer)layer->set_batch_tier(batch);
+        for(auto& layer:gdn_layers)if(layer)layer->set_batch_tier(batch);
+    }
+    // suspend_l0_codes: stage of the code/meta rows [0,rows) (rows -1: resident),
+    // pinned unless the driver refused page-locked memory (then pageable).
+    std::byte* suspended_codes = nullptr;
+    std::size_t suspended_code_capacity = 0;
+    bool suspended_codes_pinned = false;
+    void free_suspended_codes() noexcept {
+        if(!suspended_codes)return;
+        Exl3HostMemoryLedger::get().suspended_bytes-=static_cast<std::int64_t>(suspended_code_capacity);
+        if(suspended_codes_pinned)(void)cudaFreeHost(suspended_codes);
+        else ::operator delete(suspended_codes);
+        suspended_codes=nullptr;suspended_code_capacity=0;
+    }
+    int suspended_code_rows = -1;
+    void select_prompt_tier(bool prompt,int position,cudaStream_t stream) {
+        if(shared_taps) {
+            if(prompt)enter_tap_pool(stream);
+            else leave_tap_pool(stream);
+        }
+        if(large_hidden_a) {
+            std::swap(hidden_a,large_hidden_a);
+            std::swap(hidden_b,large_hidden_b);
+        }
+        for(auto& layer:full_layers)if(layer) {
+            layer->set_prompt_tier(prompt);
+            layer->l0_select_ring(prompt,position,stream);
+        }
+        for(auto& layer:gdn_layers)if(layer)layer->set_prompt_tier(prompt);
+    }
     bool fast_same_weights_fp16kv_prefill_enabled = false;
     Exl3TextContext::FastSameWeightsFp16KvPrefillStats
         fast_same_weights_fp16kv_prefill_stats;
@@ -1482,49 +2194,271 @@ struct Exl3TextContext::Impl {
     std::uint16_t* gdn_mlp_up = nullptr;
     float* fast_wmma32_split2_output = nullptr;
     float* fast_wmma32_split2_stats = nullptr;
-    // Source of the most recent target final-normalized hidden row(s), before
-    // the H6 head. It is only a transient source; native MTP callers must use
-    // target_hidden_handoff(), which copies it into owned storage. The row
-    // metadata is separate from last_rows because root-only head consumers
-    // retain only the final row's normalized hidden.
-    const std::uint16_t* last_hidden_source = nullptr;
-    int last_hidden_source_rows = 0;
-    int last_hidden_source_first_row = 0;
-    int last_hidden_source_position = 0;
-    std::uint64_t last_hidden_generation = 0;
-    // Optional native-MTP source prepared before inference.  Unlike
-    // last_hidden_source, this storage is position-indexed and survives
-    // ping-pong reuse across ordinary chunked forwards.  It is intentionally
-    // separate from target KV/authority and is only populated when the
-    // caller explicitly arms the capture.
-    std::unique_ptr<DeviceAllocation> native_mtp_hidden_capture;
-    std::shared_ptr<const void> native_mtp_hidden_capture_model_identity;
-    int native_mtp_hidden_capture_capacity = 0;
-    int native_mtp_hidden_capture_first_position = -1;
-    int native_mtp_hidden_capture_valid_rows = 0;
-    std::uint64_t native_mtp_hidden_capture_generation = 0;
     std::uint16_t* final_norm = nullptr;
     std::uint16_t* logits = nullptr;
+    // Per-context cross-CTA slices of the split greedy argmax (concurrent
+    // contexts must not share them). Allocated outside any capture.
+    void* greedy_split_storage=nullptr;
+    Exl3GreedySplitScratch greedy_split_scratch() {
+        if(!greedy_split_storage) {
+            cuda_check(cudaMalloc(&greedy_split_storage,Exl3GreedySplitScratch::bytes()),
+                "allocate greedy split scratch");
+            cuda_check(cudaMemset(greedy_split_storage,0,Exl3GreedySplitScratch::bytes()),
+                "clear greedy split scratch");
+        }
+        return Exl3GreedySplitScratch::carve(greedy_split_storage);
+    }
+    // Per-context vocabulary-slice candidates of the sampled packet selection
+    // (sampled_select.cuh). Allocated outside any capture.
+    void* sampled_slice_storage=nullptr;
+    Exl3SampledSliceScratch sampled_slice_scratch() {
+        if(!sampled_slice_storage)
+            cuda_check(cudaMalloc(&sampled_slice_storage,Exl3SampledSliceScratch::bytes()),
+                "allocate sampled slice scratch");
+        return Exl3SampledSliceScratch::carve(sampled_slice_storage);
+    }
     // Final residual rows of the last completed layer stack (exact_row_scores).
     std::uint16_t* last_stack_output = nullptr;
-    // VeriCache verified root: device GDN recurrent/convolution checkpoint and
-    // frontier metadata, independent of the per-round transaction.
-    struct VerifiedRoot {
-        std::unique_ptr<DeviceAllocation> recurrent, conv;
-        std::array<Exl3GdnLayerCheckpoint, kLayers> checkpoints{};
-        int position = -1, last_rows = 0, tap_rows = 0, embedding_rows = 0;
-    };
+    // VeriCache verified roots, independent of the per-round transaction.
     std::unique_ptr<VerifiedRoot> verified_root;
+    std::unique_ptr<VerifiedRoot> verified_root_pending;   // folded VeriCache drafting line
+    // Exact line of folded VeriCache (make_exact_line): borrowed planes, no
+    // INT4 codes, exact history only.
+    bool exact_line = false;
+    // Constructed as an exact line: its L0 layers own no meta planes or hot rows.
+    bool exact_line_storage = false;
+    // FP8 history mirror the asynchronous line attends (make_exact_line,
+    // VOIDINFER_EXL3_VERICACHE_LINE_FP8; l0_exact.cuh L0LineFp8), owned by the
+    // drafting context beside its FP16 planes and grown with them.
+    std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,kLayers> line_fp8_k,line_fp8_v;
+    std::array<std::atomic<int>,kLayers> line_fp8_valid{};
+    static constexpr std::size_t kLineFp8RowBytes=1040;
+    void line_fp8_rewritten_from(int row) {
+        for(auto& valid:line_fp8_valid) {
+            int value=valid.load(std::memory_order_relaxed);
+            while(value>row && !valid.compare_exchange_weak(value,std::max(row,0),std::memory_order_acq_rel)) {}
+        }
+    }
     Exl3CudaLinearWorkspace::Owner head_workspace;
     std::unique_ptr<DeviceAllocation> greedy_rows;
     std::array<std::shared_ptr<Exl3GreedyPacketTransfer>,2> greedy_transfers;
     std::uint64_t greedy_serial = 0;
+    Exl3DeviceSampling sampling;
+    std::vector<int> sampling_row_depths;   // verification-tree rows (set_sampling_row_depths)
+    std::vector<int> sampling_row_inputs;   // verifier row input tokens (set_sampling_row_inputs)
     std::array<Exl3GreedyRow,16> greedy_host_rows{};
     bool greedy_readback_failed=false;
     GreedyReadbackStats greedy_readback;
     std::int64_t* token_ids = nullptr;
     std::size_t persistent_bytes = 0;
-    int tap_rows = 0;
+    // Rows of the last forward in the tap planes (and the embedding trace).
+    // Concurrent lanes (shared_taps): the planes keep private_tap_rows() rows;
+    // prompt-scale passes write the shared pool instead (the prompt tier swaps
+    // the planes like hidden A/B). Leaving the tier keeps the last rows
+    // privately (logical rows [private_first,value) at index 0) and the older
+    // rows readable from the pool while this context's claim lasts. Any other
+    // assignment of the row count means the current planes hold [0,value).
+    struct TapRows {
+        int value=0;
+        bool in_pool=false;
+        int private_first=0;
+        int pool_first=0,pool_rows=0;
+        std::uint64_t claim=0;
+        TapRows& operator=(int rows) noexcept {
+            value=rows;private_first=0;
+            if(in_pool) {pool_first=0;pool_rows=rows;} else pool_rows=0;
+            return *this;
+        }
+        operator int() const noexcept {return value;}
+    };
+    // The batched forward's rows: the owner's taps hold every member's rows.
+    static int private_tap_rows() noexcept {return exl3_batch_rows();}
+    TapRows tap_rows;
+    std::shared_ptr<Exl3SharedTapPool> shared_taps;
+    std::array<void*,6> private_tap_planes{};
+    DeviceAllocation& tap_plane(std::size_t plane) const {
+        return plane<kTapLayers.size()?*taps[plane]:*embedding_trace;
+    }
+    static constexpr std::size_t tap_row_bytes=static_cast<std::size_t>(kHidden)*sizeof(std::uint16_t);
+    static bool tap_pool_trace() noexcept {
+        static const bool value=std::getenv("VOIDINFER_EXL3_TAP_POOL_TRACE")!=nullptr;
+        return value;
+    }
+    void trace_tap_pool(const char* what,int a=0,int b=0) const noexcept {
+        if(tap_pool_trace())std::fprintf(stderr,"TAP_POOL %s ctx=%p value=%d private_first=%d pool_first=%d pool_rows=%d claim=%llu pool_claims=%llu owner=%p in_pool=%d a=%d b=%d\n",
+            what,static_cast<const void*>(this),tap_rows.value,tap_rows.private_first,tap_rows.pool_first,tap_rows.pool_rows,
+            static_cast<unsigned long long>(tap_rows.claim),static_cast<unsigned long long>(shared_taps?shared_taps->claims:0),
+            shared_taps?shared_taps->owner:nullptr,tap_rows.in_pool?1:0,a,b);
+    }
+    // Claims the pool for a prompt-scale pass and points the planes at it.
+    void enter_tap_pool(cudaStream_t stream) {
+        auto& pool=*shared_taps;
+        std::lock_guard lock(pool.mutex);
+        require(!tap_rows.in_pool && !(pool.owner_in_pass && pool.owner!=this),
+            "shared tap pool claimed during another context's pass");
+        const bool held=pool.owner==this && tap_rows.claim==pool.claims;
+        // After the pool's last use (this context's own may be on another stream).
+        if(pool.done_recorded)cuda_check(cudaStreamWaitEvent(stream,pool.done,0),"order shared tap pool");
+        if(!held) {
+            pool.owner=this;
+            tap_rows.claim=++pool.claims;
+        }
+        pool.owner_in_pass=true;
+        if(!held || tap_rows.pool_rows!=tap_rows.value) {
+            // The pool does not hold the current rows: bring the private ones.
+            // (None when a restored row count exceeds the private tier.)
+            const bool fits=tap_rows.value-tap_rows.private_first<=private_tap_rows();
+            const int first=fits?tap_rows.private_first:tap_rows.value;
+            const int rows=tap_rows.value-first;
+            for(std::size_t plane=0;plane<pool.data.size() && rows>0;++plane)
+                cuda_check(cudaMemcpyAsync(static_cast<std::byte*>(pool.data[plane])+first*tap_row_bytes,
+                    tap_plane(plane).ptr,rows*tap_row_bytes,cudaMemcpyDeviceToDevice,stream),
+                    "enter shared tap pool");
+            tap_rows.pool_first=first;
+            tap_rows.pool_rows=tap_rows.value;
+        }
+        for(std::size_t plane=0;plane<pool.data.size();++plane) {
+            auto& owner=tap_plane(plane);
+            private_tap_planes[plane]=owner.ptr;
+            owner.ptr=pool.data[plane];
+        }
+        tap_rows.in_pool=true;
+        trace_tap_pool("enter",held?1:0);
+    }
+    // Keeps the pass's last rows privately and returns the planes.
+    void leave_tap_pool(cudaStream_t stream) noexcept {
+        auto& pool=*shared_taps;
+        std::lock_guard lock(pool.mutex);
+        const bool owned=pool.owner==this && tap_rows.claim==pool.claims;
+        const int end=tap_rows.value;
+        const int first=std::max(tap_rows.pool_first,end-private_tap_rows());
+        for(std::size_t plane=0;plane<pool.data.size();++plane) {
+            auto& owner=tap_plane(plane);
+            if(owned && end>first)
+                (void)cudaMemcpyAsync(private_tap_planes[plane],
+                    static_cast<const std::byte*>(pool.data[plane])+first*tap_row_bytes,
+                    (end-first)*tap_row_bytes,cudaMemcpyDeviceToDevice,stream);
+            owner.ptr=private_tap_planes[plane];
+            private_tap_planes[plane]=nullptr;
+        }
+        tap_rows.in_pool=false;
+        // Lost claim (an unordered pass): no row stays readable.
+        tap_rows.private_first=owned?std::min(first,end):end;
+        tap_rows.pool_rows=owned?end:0;
+        trace_tap_pool("leave",owned?1:0,first);
+        if(owned) {
+            pool.owner_in_pass=false;
+            if(pool.done || cudaEventCreateWithFlags(&pool.done,cudaEventDisableTiming)==cudaSuccess)
+                pool.done_recorded=cudaEventRecord(pool.done,stream)==cudaSuccess;
+        }
+    }
+    // Device rows [first,first+rows) of the six planes (five taps, embedding
+    // trace) passed to `use`, which enqueues its reads on `stream` (rows still
+    // only in the shared pool are read under the claim).
+    template<class F> void read_tap_rows(int first,int rows,cudaStream_t stream,const char* what,F&& use) const {
+        require(rows>0 && first>=0 && first+rows<=tap_rows.value,what);
+        std::array<const std::uint16_t*,6> planes{};
+        const auto from=[&](const std::array<void*,6>& base,int offset) {
+            for(std::size_t plane=0;plane<planes.size();++plane)
+                planes[plane]=static_cast<const std::uint16_t*>(base[plane])+
+                    static_cast<std::size_t>(first-offset)*kHidden;
+        };
+        std::array<void*,6> current{};
+        for(std::size_t plane=0;plane<current.size();++plane)current[plane]=tap_plane(plane).ptr;
+        if(!shared_taps || tap_rows.in_pool) {
+            require(!shared_taps || first>=tap_rows.pool_first,what);
+            from(current,0);use(planes);return;
+        }
+        if(first>=tap_rows.private_first) {
+            if(tap_rows.private_first>0)trace_tap_pool("read_private",first,rows);
+            require(first+rows-tap_rows.private_first<=private_tap_rows(),what);
+            from(current,tap_rows.private_first);use(planes);return;
+        }
+        auto& pool=*shared_taps;
+        std::lock_guard lock(pool.mutex);
+        trace_tap_pool("read_pool",first,rows);
+        require(pool.owner==this && tap_rows.claim==pool.claims && tap_rows.pool_rows==tap_rows.value &&
+            first>=tap_rows.pool_first,
+            "tap rows left the shared pool (another context claimed it)");
+        from(pool.data,0);use(planes);
+        if(pool.done || cudaEventCreateWithFlags(&pool.done,cudaEventDisableTiming)==cudaSuccess)
+            pool.done_recorded=cudaEventRecord(pool.done,stream)==cudaSuccess;
+    }
+    // The rows still held, [first,value) for the smallest such first not below
+    // `lowest`, passed to use(first,planes) (nothing when none remain); returns first.
+    template<class F> int read_held_tap_rows(int lowest,cudaStream_t stream,F&& use) const {
+        const int end=tap_rows.value;
+        std::unique_lock<std::mutex> lock;
+        int first=0;
+        bool pooled=false;
+        if(shared_taps && !tap_rows.in_pool && tap_rows.private_first>0) {
+            auto& pool=*shared_taps;
+            lock=std::unique_lock(pool.mutex);
+            pooled=pool.owner==this && tap_rows.claim==pool.claims && tap_rows.pool_rows==end;
+            first=pooled?tap_rows.pool_first:tap_rows.private_first;
+        } else if(shared_taps) {
+            first=tap_rows.in_pool?tap_rows.pool_first:tap_rows.private_first;
+        }
+        // A row count restored without its rows (verified roots) can exceed
+        // what the private tier holds: then it holds none.
+        if(shared_taps && !tap_rows.in_pool && !(pooled && first<tap_rows.private_first) &&
+           end-tap_rows.private_first>private_tap_rows())
+            return end;
+        first=std::max(first,lowest);
+        if(first>=end)return end;
+        std::array<const std::uint16_t*,6> planes{};
+        const bool from_pool=pooled && first<tap_rows.private_first;
+        for(std::size_t plane=0;plane<planes.size();++plane) {
+            const auto* base=static_cast<const std::uint16_t*>(from_pool?shared_taps->data[plane]:tap_plane(plane).ptr);
+            const int offset=from_pool || tap_rows.in_pool || !shared_taps?0:tap_rows.private_first;
+            planes[plane]=base+static_cast<std::size_t>(first-offset)*kHidden;
+        }
+        if(!from_pool && shared_taps && !tap_rows.in_pool)
+            require(end-tap_rows.private_first<=private_tap_rows(),"held tap rows exceed the private tier");
+        if(tap_pool_trace() && (from_pool || first>0))trace_tap_pool(from_pool?"held_pool":"held_private",first,end);
+        use(first,planes);
+        if(from_pool) {
+            auto& pool=*shared_taps;
+            if(pool.done || cudaEventCreateWithFlags(&pool.done,cudaEventDisableTiming)==cudaSuccess)
+                pool.done_recorded=cudaEventRecord(pool.done,stream)==cudaSuccess;
+        }
+        return first;
+    }
+    // Uploads `rows` host rows of the six planes ([0,rows) each); returns the
+    // first row the planes keep (publish_tap_rows).
+    int upload_tap_rows(const std::array<const std::vector<std::uint16_t>*,6>& source,int rows,
+                        cudaStream_t stream,const char* label) {
+        const int first=tap_write_first(rows);
+        for(std::size_t plane=0;plane<source.size() && rows>first;++plane) {
+            require(source[plane]->size()==static_cast<std::size_t>(rows)*kHidden,label);
+            cuda_check(exl3_h2d_async(tap_write_plane(plane,first),source[plane]->data()+static_cast<std::size_t>(first)*kHidden,
+                static_cast<std::size_t>(rows-first)*tap_row_bytes,stream),label);
+        }
+        cuda_check(cudaStreamSynchronize(stream),label);
+        return first;
+    }
+    // Writes of `rows` rows [0,rows) from outside a forward: the planes take
+    // logical rows [first,rows) (first >= available_first) at `first`'s slot;
+    // publish_tap_rows records them.
+    int tap_write_first(int rows,int available_first=0) const noexcept {
+        if(!shared_taps || tap_rows.in_pool)return available_first;
+        return std::max(available_first,rows-private_tap_rows());
+    }
+    std::uint16_t* tap_write_plane(std::size_t plane,int first) const noexcept {
+        auto* base=static_cast<std::uint16_t*>(tap_plane(plane).ptr);
+        return tap_rows.in_pool || !shared_taps?base+static_cast<std::size_t>(first)*kHidden:base;
+    }
+    void publish_tap_rows(int rows,int first) noexcept {
+        tap_rows=rows;
+        if(tap_rows.in_pool)tap_rows.pool_first=first;
+        else tap_rows.private_first=first;
+        if(first>0)trace_tap_pool("publish",rows,first);
+    }
+    // Readers that address the planes directly (graphs, sibling rows, batched
+    // peers): the planes must hold [0,value) at index 0.
+    bool tap_rows_identity() const noexcept {
+        return !shared_taps || (tap_rows.in_pool?tap_rows.pool_first==0:tap_rows.private_first==0);
+    }
     int embedding_rows = 0;
     int last_rows = 0;
     std::atomic<std::uint64_t> tap_generation{0};
@@ -1535,6 +2469,38 @@ struct Exl3TextContext::Impl {
     std::unique_ptr<DeviceAllocation> embedding_trace;
     int* position_device = nullptr;
     std::int64_t* draft_token_id = nullptr;
+    // Vision prompts: M-RoPE table (rope_map.cuh, pointed to by
+    // position_device[4..7]) and FP16 media embedding rows.
+    struct MediaScratch {
+        void* ptr=nullptr;std::size_t bytes=0;
+        MediaScratch()=default;
+        MediaScratch(const MediaScratch&)=delete;
+        MediaScratch& operator=(const MediaScratch&)=delete;
+        ~MediaScratch(){if(ptr)(void)cudaFree(ptr);}
+        void reserve(std::size_t size,cudaStream_t stream) {
+            if(size<=bytes)return;
+            cuda_check(cudaStreamSynchronize(stream),"fence media scratch growth");
+            if(ptr){cuda_check(cudaFree(ptr),"release media scratch");ptr=nullptr;bytes=0;}
+            cuda_check(cudaMalloc(&ptr,size),"allocate media scratch");bytes=size;
+        }
+    };
+    MediaScratch rope_table,media_embeddings;
+    std::vector<Exl3TextContext::MediaRowSpan> media_spans;
+    void apply_media_rows(std::uint16_t* hidden,int first,int rows,cudaStream_t stream) {
+        for(const auto& span:media_spans) {
+            const int lo=std::max(first,span.first),hi=std::min(first+rows,span.first+span.rows);
+            if(lo>=hi)continue;
+            cudaStreamCaptureStatus capturing=cudaStreamCaptureStatusNone;
+            cuda_check(cudaStreamIsCapturing(stream,&capturing),"query media row capture");
+            require(capturing==cudaStreamCaptureStatusNone,"media prompt rows cannot be captured");
+            const auto row_bytes=static_cast<std::size_t>(kHidden)*sizeof(std::uint16_t);
+            cuda_check(cudaMemcpyAsync(hidden+static_cast<std::size_t>(lo-first)*kHidden,
+                static_cast<const std::uint8_t*>(media_embeddings.ptr)+
+                    (span.offset+static_cast<std::size_t>(lo-span.first))*row_bytes,
+                static_cast<std::size_t>(hi-lo)*row_bytes,cudaMemcpyDeviceToDevice,stream),
+                "copy media prompt rows");
+        }
+    }
     std::unique_ptr<Exl3OscarContext> oscar;
     Exl3OscarTelemetry oscar_telemetry{};
     DecodeGraphDefinition graph_definition;
@@ -1550,7 +2516,7 @@ struct Exl3TextContext::Impl {
     Exl3TextContext::SnapshotMetadataReservation request_metadata_reservation;
     Exl3TextContext::RequestHostPayloadReservation request_host_payload_reservation;
     Exl3TextContext::RequestHostPayloadObserver request_host_payload_observer;
-    bool pinned_recurrent_export = []{const auto* p=std::getenv("NINFER_EXL3_PINNED_RECURRENT_EXPORT");return p && std::string_view(p)=="1";}();
+    bool pinned_recurrent_export = []{const auto* p=std::getenv("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT");return p && std::string_view(p)=="1";}();
     bool batched_recurrent_export = false;
 
     static constexpr std::size_t continuation_graph_role_record_count=3;
@@ -1653,8 +2619,8 @@ struct Exl3TextContext::Impl {
         }};
         const auto update=table->update(bindings);
         if(update.changed || table->uploaded_generation()!=table->generation()) {
-            cuda_check(cudaMemcpyAsync(device_record,&table->record(),
-                sizeof(Exl3DeviceGraphRoleRecord),cudaMemcpyHostToDevice,stream),
+            cuda_check(exl3_h2d_async(device_record,&table->record(),
+                sizeof(Exl3DeviceGraphRoleRecord),stream),
                 "publish continuation graph pointer roles");
             if(synchronize)
                 cuda_check(cudaStreamSynchronize(stream),
@@ -1675,13 +2641,13 @@ struct Exl3TextContext::Impl {
         const auto row_storage=static_cast<std::size_t>(
             (host_kv.enabled || oscar_only) ? prefill_capacity :
                 (Exl3NativeContextExtent::l0_oscar_enabled() ?
-                    std::min<int>(max_context,Exl3NativeContextExtent::l0_prefill_block_rows) : max_context));
+                    std::min<int>(max_context,Exl3NativeContextExtent::l0_prefill_block_rows()) : max_context));
         const auto hidden_bytes=row_storage*static_cast<std::size_t>(kHidden)*
             sizeof(std::uint16_t);
         const auto add=[&](const void* address,std::size_t bytes) noexcept {
             result.buffers[result.count++]={address,bytes};
         };
-        add(position_device,3*sizeof(int));
+        add(position_device,8*sizeof(int));
         add(hidden_a,hidden_bytes);
         add(hidden_b,hidden_bytes);
         add(embedding_trace?embedding_trace->ptr:nullptr,hidden_bytes);
@@ -1814,7 +2780,7 @@ struct Exl3TextContext::Impl {
             continuation->additional_graphs[0].lifecycle.pending() ||
             continuation->additional_graphs[1].lifecycle.pending();
         if(!pending)return;
-        const auto* option=std::getenv("NINFER_EXL3_NARROW_GRAPH_DRAIN");
+        const auto* option=std::getenv("VOIDINFER_EXL3_NARROW_GRAPH_DRAIN");
         if(option && std::string_view(option)!="0" &&
            std::string_view(option)!="1")
             throw std::invalid_argument(
@@ -1836,7 +2802,7 @@ struct Exl3TextContext::Impl {
                 "drain owned-stream continuation graph uses before context mutation");
             ++continuation->graph_stats.narrow_final_use_drains;
         } else {
-            cuda_check(cudaDeviceSynchronize(),
+            cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),
                 "drain continuation graph uses before context mutation");
             ++continuation->graph_stats.device_final_use_drains;
         }
@@ -1901,33 +2867,33 @@ struct Exl3TextContext::Impl {
     cudaError_t retire_graph_handles_with(Query&& query,Drain&& drain) noexcept {
         if(graph_retirement_error)return static_cast<cudaError_t>(graph_retirement_error);
         if(!has_graph_handles())return cudaSuccess;
-        const auto error=ninfer::detail::retire_decode_graph_device(graph_owner_device,
+        const auto error=voidinfer::detail::retire_decode_graph_device(graph_owner_device,
             query,drain,
             [&]() noexcept {
-                auto result=ninfer::detail::retire_decode_graph_pair(graph_executable,graph_definition);
+                auto result=voidinfer::detail::retire_decode_graph_pair(graph_executable,graph_definition);
                 if(result!=cudaSuccess)return result;
                 for(auto& graph:host_kv_gdn_segment_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 for(auto& graph:host_kv_full_layer_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 for(auto& graph:ordinary_full_layer_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 for(auto& graph:host_kv_mlp_tail_graphs) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         graph.executable,graph.definition);
                     if(result!=cudaSuccess)return result;
                 }
                 if(transaction) {
-                    result=ninfer::detail::retire_decode_graph_pair(
+                    result=voidinfer::detail::retire_decode_graph_pair(
                         transaction->checkpoint_graph_executable,
                         transaction->checkpoint_graph_definition);
                     if(result!=cudaSuccess)return result;
@@ -1961,7 +2927,7 @@ struct Exl3TextContext::Impl {
                         }
                         if(phase!=Exl3BoundedGraphEntry::Phase::empty)
                             lifecycle.invalidate("context graph retirement");
-                        const auto retired=ninfer::detail::retire_decode_graph_pair(
+                        const auto retired=voidinfer::detail::retire_decode_graph_pair(
                             executable,definition);
                         if(retired!=cudaSuccess) {
                             if(had_handles)++continuation->graph_stats.destruction_failures;
@@ -2013,7 +2979,7 @@ struct Exl3TextContext::Impl {
     cudaError_t retire_graph_handles() noexcept {
         return retire_graph_handles_with(
             [](int* device) noexcept {return cudaGetDevice(device);},
-            []() noexcept {return cudaDeviceSynchronize();});
+            []() noexcept {return voidinfer::cuda_device_synchronize_outside_capture();});
     }
     void poison_graph_retirement(cudaError_t error) noexcept {
         if(error==cudaSuccess || graph_retirement_error)return;
@@ -2068,6 +3034,17 @@ struct Exl3TextContext::Impl {
         return true;
     }
     ~Impl() {
+        // Exported pages may outlive this context: fill them while the planes exist.
+        try {if(kv_source)kv_source->materialize_from(0);} catch(...) {}
+        if(small_tier_storage)(void)cudaFree(small_tier_storage);
+        free_suspended_codes();
+        if(gdn_write_flag){(void)cudaFree(gdn_write_flag);gdn_write_flag=nullptr;}
+        if(transaction && transaction->live_host_root){
+            (void)voidinfer::cuda_device_synchronize_outside_capture();(void)cudaFreeHost(transaction->live_host_root);
+            transaction->live_host_root=nullptr;}
+        for(auto& s:batch_fork_streams)if(s){(void)cudaStreamSynchronize(s);(void)cudaStreamDestroy(s);s=nullptr;}
+        for(auto& e:batch_join_events)if(e){(void)cudaEventDestroy(e);e=nullptr;}
+        if(batch_fork_event){(void)cudaEventDestroy(batch_fork_event);batch_fork_event=nullptr;}
         if(repair_stream) {
             (void)cudaStreamSynchronize(repair_stream);
             (void)cudaEventDestroy(repair_fork);
@@ -2478,11 +3455,11 @@ struct Exl3TextContext::Impl {
                 bytes,bank,key_plane});
             host_kv.d2h_bytes+=bytes;++host_kv.transfer_calls;
         }
-        const auto copy=cudaMemcpyAsync(
+        const auto copy=exl3_d2h_async(
             static_cast<std::byte*>(host_kv_banked_d2h_staging->data())+staging_base,
             static_cast<const std::byte*>(source)+
                 static_cast<std::size_t>(position)*host_kv_row_bytes,
-            copy_bytes,cudaMemcpyDeviceToHost,host_kv_copy_stream);
+            copy_bytes,host_kv_copy_stream);
         cuda_check(copy,label);
         ++host_kv.copy_submissions;++host_kv.banked_d2h_planes;
         host_kv.banked_d2h_bytes+=copy_bytes;
@@ -2531,75 +3508,6 @@ struct Exl3TextContext::Impl {
     void allocate(std::size_t bytes, void** pointer, const char* label) {
         Exl3LinearWorkspaceRequirements::allocate_owned(allocations,persistent_bytes,pointer,bytes,
             [&]{return make_private_allocation(bytes,label);});
-    }
-
-    bool native_mtp_hidden_capture_active() const noexcept {
-        return native_mtp_hidden_capture &&
-            native_mtp_hidden_capture->ptr != nullptr &&
-            native_mtp_hidden_capture_capacity > 0 &&
-            native_mtp_hidden_capture_model_identity != nullptr;
-    }
-
-    void invalidate_native_mtp_hidden_capture() {
-        native_mtp_hidden_capture_first_position = -1;
-        native_mtp_hidden_capture_valid_rows = 0;
-        if (++native_mtp_hidden_capture_generation == 0)
-            throw std::overflow_error("native MTP hidden capture generation exhausted");
-    }
-
-    void validate_native_mtp_hidden_capture_extent(int position, int rows) const {
-        if (!native_mtp_hidden_capture_active()) return;
-        require(!graph_capture_active && !graph_active,
-            "native MTP hidden capture is unavailable during graph execution");
-        require(position >= 0 && rows > 0 &&
-                    position <= std::numeric_limits<int>::max() - rows,
-                "native MTP hidden capture position extent is invalid");
-        if (native_mtp_hidden_capture_valid_rows == 0) {
-            require(native_mtp_hidden_capture_first_position == -1,
-                "native MTP hidden capture empty-range metadata is invalid");
-        } else {
-            require(native_mtp_hidden_capture_first_position >= 0 &&
-                        position == native_mtp_hidden_capture_first_position +
-                            native_mtp_hidden_capture_valid_rows,
-                    "native MTP hidden capture requires a contiguous forward range");
-        }
-        require(rows <= native_mtp_hidden_capture_capacity -
-                    native_mtp_hidden_capture_valid_rows,
-            "native MTP hidden capture capacity exhausted");
-    }
-
-    void note_native_mtp_hidden_capture_rows(int position, int rows) {
-        require(native_mtp_hidden_capture_active(),
-            "native MTP hidden capture is not prepared");
-        require(position >= 0 && rows > 0 &&
-                    rows <= native_mtp_hidden_capture_capacity -
-                        native_mtp_hidden_capture_valid_rows,
-            "native MTP hidden capture publication extent is invalid");
-        if (native_mtp_hidden_capture_valid_rows == 0)
-            native_mtp_hidden_capture_first_position = position;
-        else require(position == native_mtp_hidden_capture_first_position +
-                          native_mtp_hidden_capture_valid_rows,
-                      "native MTP hidden capture publication is not contiguous");
-        native_mtp_hidden_capture_valid_rows += rows;
-        if (++native_mtp_hidden_capture_generation == 0)
-            throw std::overflow_error("native MTP hidden capture generation exhausted");
-    }
-
-    void copy_native_mtp_hidden_capture_rows(const std::uint16_t* source,
-                                             int position, int rows,
-                                             cudaStream_t stream) {
-        require(source != nullptr, "native MTP hidden capture source is null");
-        validate_native_mtp_hidden_capture_extent(position, rows);
-        const std::size_t row_bytes = static_cast<std::size_t>(kHidden) *
-            sizeof(std::uint16_t);
-        auto* destination = static_cast<std::uint16_t*>(
-            native_mtp_hidden_capture->ptr) +
-            static_cast<std::size_t>(native_mtp_hidden_capture_valid_rows) * kHidden;
-        cuda_check(cudaMemcpyAsync(destination, source,
-            static_cast<std::size_t>(rows) * row_bytes,
-            cudaMemcpyDeviceToDevice, stream),
-            "capture native MTP target hidden rows");
-        note_native_mtp_hidden_capture_rows(position, rows);
     }
 
     int tap_index(int layer) const {
@@ -2880,13 +3788,13 @@ struct Exl3TextContext::Impl {
                 std::chrono::steady_clock::now()-started).count();
     }
 
-    // NINFER_EXL3_ORDINARY_STACK_GRAPH (default 1). Captured after the
+    // VOIDINFER_EXL3_ORDINARY_STACK_GRAPH (default 1). Captured after the
     // per-segment graphs with the same layer arguments: GDN layers as their
     // segment graphs (rows 1), full layers at the capacity frontier with the
     // live position read from position_device_ at replay.
     void capture_ordinary_stack_graph() {
         static const bool enabled=[] {
-            const char* value=std::getenv("NINFER_EXL3_ORDINARY_STACK_GRAPH");
+            const char* value=std::getenv("VOIDINFER_EXL3_ORDINARY_STACK_GRAPH");
             return !value || std::strcmp(value,"0")!=0;
         }();
         if(!enabled || !ordinary_gdn_segment_graphs_enabled || !ordinary_full_layer_graphs_enabled ||
@@ -3137,6 +4045,191 @@ struct Exl3TextContext::Impl {
                 after.rows-before.rows;
         }
     };
+    // Batched multi-agent continuation: this context's all-row verification
+    // head over its rows of a shared layer stack (the all_head_rows path of
+    // process_rows).
+    // Growable L0 FP16 planes follow the INT4 code backing: rows used plus a
+    // margin that spaces the map calls (1024 rows = one 2 MiB granule).
+    static constexpr int kPlaneGrowthMarginRows=4096;
+    static constexpr int kL0RetainedBackingRows=16384;
+    static constexpr std::size_t kPlaneRowBytes=static_cast<std::size_t>(kKVHeads)*kHeadDim*sizeof(std::uint16_t);
+    void ensure_l0_rows(int rows) {
+        // An exact line writes rows its drafting context already backs and
+        // keeps no INT4 codes: nothing to grow.
+        if(exact_line)return;
+        static const bool trace=std::getenv("VOIDINFER_EXL3_ROW_BACKING_TRACE")!=nullptr;
+        using TraceClock=std::chrono::steady_clock;
+        auto t0=TraceClock::now();
+        const auto lap=[&](const char* what) {
+            if(!trace)return;
+            const double ms=std::chrono::duration<double,std::milli>(TraceClock::now()-t0).count();
+            if(ms>2.0)std::fprintf(stderr,"ROW_BACKING %s rows=%d ms=%.1f\n",what,rows,ms);
+            t0=TraceClock::now();
+        };
+        require(suspended_code_rows<0,"L0 forward on suspended codes");
+        consume_kv_rewrite();
+        lap("kv_rewrite");
+        ensure_self_fp8_history();
+        // Plane growth under host memory pressure spills idle histories first.
+        Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
+        lap("pressure");
+        for(auto& layer:full_layers)if(layer)layer->ensure_l0_rows(rows);
+        lap("device_rows");
+        const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(cache_k[layer])cache_k[layer]->ensure_host_bytes(used);
+            if(cache_v[layer])cache_v[layer]->ensure_host_bytes(used);
+        }
+        lap("host_planes");
+        // Growth may have drawn on the host chunk pool: refill it off the path.
+        top_up_plane_pool();
+        const std::size_t mirror=line_fp8_bytes(rows);
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
+                if(region)region->ensure(mirror);
+    }
+    // TEST (VOIDINFER_TEST_L0_FP8_HISTORY=1): this context's own staged exact
+    // passes attend its history through an FP8 mirror (quality measurement
+    // of the line's FP8 history on prompt ingestion / NLL scoring).
+    void ensure_self_fp8_history() {
+        static const bool requested=std::getenv("VOIDINFER_TEST_L0_FP8_HISTORY")!=nullptr;
+        if(!requested || exact_line)return;
+        int first=-1;
+        for(int layer=0;layer<kLayers;++layer)if(full_layers[layer]){first=layer;break;}
+        if(first<0 || line_fp8_k[first])return;
+        const std::size_t capacity=static_cast<std::size_t>(max_context)*kLineFp8RowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(!full_layers[layer])continue;
+            for(auto* region:{&line_fp8_k[layer],&line_fp8_v[layer]}) {
+                *region=std::make_unique<Exl3GrowableDeviceRegion>();
+                (*region)->reserve(capacity,true);
+            }
+            line_fp8_valid[layer].store(0);
+            full_layers[layer]->set_l0_fp8_mirror(line_fp8_k[layer]->data<std::uint8_t>(),
+                line_fp8_v[layer]->data<std::uint8_t>(),&line_fp8_valid[layer],true);
+        }
+    }
+    std::size_t line_fp8_bytes(int rows) const {
+        return static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kLineFp8RowBytes;
+    }
+    // Backs the planes for `rows` on a helper thread, one granule of every
+    // plane at a time in row order, so the per-chunk ensure_l0_rows of a long
+    // prompt finds its rows mapped: host page pinning costs ~0.5 ms per 2 MiB
+    // granule (~1 s of GPU idle at 64K when mapped inline). The returned
+    // future must be joined before the planes shrink or are released.
+    std::future<void> pregrow_l0_planes(int rows) {
+        if(!exact_line)consume_kv_rewrite();
+        const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        std::vector<DeviceAllocation*> planes;
+        std::size_t step=0;
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* plane:{cache_k[layer].get(),cache_v[layer].get()})
+                if(plane && plane->host_growth_bytes(used)) {
+                    planes.push_back(plane);
+                    step=plane->host_region->granularity_bytes();
+                }
+        const std::size_t mirror=line_fp8_bytes(rows);
+        std::vector<Exl3GrowableDeviceRegion*> mirrors;
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
+                if(region && region->mapped_bytes()<std::min(mirror,region->capacity_bytes())) {
+                    mirrors.push_back(region);
+                    step=region->granularity_bytes();
+                }
+        if((planes.empty() && mirrors.empty()) || !step)return {};
+        Exl3LaneKvSource::relieve_memory_pressure(plane_growth_bytes(rows));
+        CUcontext context=nullptr;
+        if(cuCtxGetCurrent(&context)!=CUDA_SUCCESS || !context)return {};
+        return std::async(std::launch::async,[planes=std::move(planes),mirrors=std::move(mirrors),used,mirror,
+                                              step,context] {
+            if(cuCtxSetCurrent(context)!=CUDA_SUCCESS)
+                throw std::runtime_error("L0 plane pre-growth context");
+            for(std::size_t target=step;;target+=step) {
+                for(auto* plane:planes)plane->ensure_host_bytes(std::min(target,used));
+                // The mirror rows are half the plane rows: one granule per two.
+                for(auto* region:mirrors)region->ensure(std::min(target/2,mirror));
+                if(target>=std::max(used,mirror))break;
+            }
+        });
+    }
+    // Host bytes the planes would add to back `rows` rows.
+    std::uint64_t plane_growth_bytes(int rows) const {
+        const std::size_t used=static_cast<std::size_t>(std::max(rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        std::uint64_t bytes=0;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(cache_k[layer])bytes+=cache_k[layer]->host_growth_bytes(used);
+            if(cache_v[layer])bytes+=cache_v[layer]->host_growth_bytes(used);
+        }
+        return bytes;
+    }
+    // plane_rows: rows of FP16 plane backing to keep (defaults to rows).
+    void release_l0_rows_beyond(int rows,int plane_rows=-1) {
+        for(auto& layer:full_layers)if(layer)layer->release_l0_rows_beyond(rows);
+        if(plane_rows<0)plane_rows=rows;
+        // Rows still backing deferred pages stay mapped.
+        if(kv_source && kv_source->deferred_beyond(plane_rows))plane_rows=max_context;
+        const std::size_t used=static_cast<std::size_t>(std::max(plane_rows,0)+kPlaneGrowthMarginRows)*kPlaneRowBytes;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(cache_k[layer])cache_k[layer]->shrink_host_bytes(used);
+            if(cache_v[layer])cache_v[layer]->shrink_host_bytes(used);
+        }
+        // Mirror rows beyond the kept planes go with their backing.
+        line_fp8_rewritten_from(plane_rows);
+        for(int layer=0;layer<kLayers;++layer)
+            for(auto* region:{line_fp8_k[layer].get(),line_fp8_v[layer].get()})
+                if(region)region->shrink(line_fp8_bytes(plane_rows));
+    }
+    // precomputed_norm/logits: this agent's rows of the owner's batched head
+    // (one H6 head over every agent's rows); copied into this context's
+    // continuation scratch instead of recomputing.
+    void finish_batched_continuation(const std::uint16_t* hidden,int rows,int position,
+                                     cudaStream_t stream,const std::uint16_t* precomputed_norm=nullptr,
+                                     const std::uint16_t* precomputed_logits=nullptr) {
+        require(continuation && continuation->capacity>=rows && rows>=2 &&
+                !precomputed_norm==!precomputed_logits,
+            "batched continuation head capacity");
+        auto& scratch=*continuation;
+        auto* norm=static_cast<std::uint16_t*>(scratch.final_norm->ptr);
+        auto* all_logits=static_cast<std::uint16_t*>(scratch.logits->ptr);
+        // Batched head: the member's norm rows, logits rows and final-row
+        // logits in one copy launch.
+        if(precomputed_norm && precomputed_logits) {
+            Exl3SegmentCopies copies;
+            copies.add(norm,precomputed_norm,static_cast<std::size_t>(rows)*kHidden*sizeof(std::uint16_t));
+            copies.add(all_logits,precomputed_logits,static_cast<std::size_t>(rows)*kVocab*sizeof(std::uint16_t));
+            copies.add(logits,precomputed_logits+static_cast<std::size_t>(rows-1)*kVocab,
+                kVocab*sizeof(std::uint16_t));
+            cuda_check(exl3_launch_segment_copies(copies,stream),"copy batched head rows");
+        }
+        if(precomputed_norm) {}
+        else for(int row=0;row<rows;++row)
+            final_rms_norm_kernel<<<1,512,0,stream>>>(
+                hidden+static_cast<std::size_t>(row)*kHidden,model->final_norm,
+                norm+static_cast<std::size_t>(row)*kHidden);
+        cuda_check(cudaGetLastError(),"launch batched continuation final RMSNorm");
+        if(precomputed_logits) {}
+        else if(std::strcmp(scratch.head_workspace->dispatch_name(model->lm_head_metadata,rows),
+                       "h6_small_m_single_split")==0)
+            scratch.head_workspace->forward(model->lm_head,model->lm_head_metadata,
+                norm,all_logits,rows,stream);
+        else for(int row=0;row<rows;++row)
+            head_workspace->forward(model->lm_head,model->lm_head_metadata,
+                norm+static_cast<std::size_t>(row)*kHidden,
+                all_logits+static_cast<std::size_t>(row)*kVocab,1,stream);
+        cuda_check(cudaGetLastError(),"launch batched continuation LM head");
+        if(!(precomputed_norm && precomputed_logits))
+            cuda_check(cudaMemcpyAsync(logits,all_logits+static_cast<std::size_t>(rows-1)*kVocab,
+                kVocab*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+                "retain batched continuation final-row logits");
+        head_work.submitted_rows+=static_cast<std::uint64_t>(rows);
+        last_rows=rows;
+        if(capture_taps) {
+            const auto generation=tap_generation.fetch_add(1,std::memory_order_release)+1;
+            require(generation,"authoritative tap generation exhausted");
+        }
+        qkv_trace_valid=true;
+    }
+
     void process_rows(const std::int64_t* ids, int rows, int position, cudaStream_t stream,
                       ProfileEvents* events = nullptr, bool include_embedding = true,
                       bool continuation_reference = false,
@@ -3157,7 +4250,17 @@ struct Exl3TextContext::Impl {
                 (layer_end==layer_begin+1 && gdn_layers[layer_begin] &&
                  gdn_prepared->rows==rows && !include_embedding),
                 "bulk GDN prepared input requires one layer and matching rows");
+        {
+            cudaStreamCaptureStatus capturing=cudaStreamCaptureStatusNone;
+            cuda_check(cudaStreamIsCapturing(stream,&capturing),"query forward capture for L0 backing");
+            // Captured launches read live positions; replays back their rows.
+            if(capturing==cudaStreamCaptureStatusNone)ensure_l0_rows(position+rows);
+        }
         retain_host_kv_forward_stream(stream);
+        // A whole multi-row pass: rows below `position` are final in every
+        // layer (see l0_history_mark.h).
+        std::optional<L0HistoryWrittenScope> history_written;
+        if(rows>8 && layer_begin==0 && layer_end==kLayers)history_written.emplace(position,stream);
         const bool fast_same_weights_wide_candidate =
             fast_same_weights_fp16kv_prefill_enabled && wide_prefill && rows>=256 &&
             !graph_capture_active && !graph_active &&
@@ -3168,13 +4271,10 @@ struct Exl3TextContext::Impl {
             fast_same_weights_telemetry.owner.fast_same_weights_fp16kv_prefill_stats.wide_prefill_rows+=
                 static_cast<std::uint64_t>(rows);
         const bool all_head_rows=continuation_reference && !final_row_only;
-        const bool capture_native_mtp_rows =
-            native_mtp_hidden_capture_active() && !graph_capture_active && !graph_active;
-        if (capture_native_mtp_rows)
-            validate_native_mtp_hidden_capture_extent(position, rows);
         const auto head_plan=Exl3HeadConsumerPlan::make(rows,
             all_head_rows?Exl3HeadConsumer::verification:Exl3HeadConsumer::root_only,!all_head_rows);
-        require(!all_head_rows || (continuation && continuation->capacity>=head_plan.rows),
+        require(!all_head_rows || skip_head ||
+            (continuation && continuation->capacity>=head_plan.rows),
             "all-row head consumer lacks prepared output capacity");
         require(!oscar_only || oscar!=nullptr,"OSCAR-only context needs explicit OSCAR initialization");
         resident_exact_state_id=0;
@@ -3235,6 +4335,7 @@ struct Exl3TextContext::Impl {
             embedding_lookup_kernel<<<(rows * kHidden + 255) / 256, 256, 0, stream>>>(
                 ids, model->embedding, hidden_a, rows);
             cuda_check(cudaGetLastError(), "launch E4A embedding lookup");
+            if (!media_spans.empty()) apply_media_rows(hidden_a, position, rows, stream);
             if (events) record(events->embedding_end, stream, "record E4B1 embedding end");
             embedding_range.reset();
             if (capture_taps) {
@@ -3261,8 +4362,10 @@ struct Exl3TextContext::Impl {
         const bool gdn_segment_graphs_enabled=
             ((host_kv_gdn_segment_graphs_enabled && host_kv.enabled) ||
              (ordinary_gdn_segment_graphs_enabled && !host_kv.enabled));
+        // Single-context layer graphs know nothing of a batched multi-agent
+        // binding (peer segments, arming): batched forwards run eagerly.
         const bool use_host_kv_gdn_segment_graphs=
-            gdn_segment_graphs_enabled && !oscar &&
+            gdn_segment_graphs_enabled && !oscar && !batch_bound &&
             !graph_active && !graph_capture_active && !events && !layer_observer &&
             !target_projection_timing && !target_projection_observer &&
             !wide_prefill && !positions_xyz && !eager_mlp_gateup_concurrent &&
@@ -3273,11 +4376,11 @@ struct Exl3TextContext::Impl {
             use_host_kv_gdn_segment_graphs &&
             rows<=host_kv_full_graph_row_shapes;
         const bool use_ordinary_full_layer_graphs=
-            ordinary_full_layer_graphs_enabled && !host_kv.enabled && !oscar &&
+            ordinary_full_layer_graphs_enabled && !host_kv.enabled && !oscar && !batch_bound &&
             !oscar_only && !graph_active && !graph_capture_active && !events &&
             !layer_observer && !target_projection_timing &&
             !target_projection_observer && !wide_prefill && !positions_xyz &&
-            !eager_mlp_gateup_concurrent && !native_mtp_hidden_capture_active() &&
+            !eager_mlp_gateup_concurrent &&
             ((!continuation_reference && rows==1 &&
               (position<=ordinary_full_layer_graph_capture_position ||
                (ordinary_full_layer_graph_extended_replay &&
@@ -3286,19 +4389,19 @@ struct Exl3TextContext::Impl {
               continuation_reference && rows>=2 &&
               rows<=host_kv_full_graph_row_shapes &&
               position+rows<=max_context));
-        if (rows==1 && std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+        if (rows==1 && std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
             std::fprintf(stderr,
-                "ordinary_full_layer_graph_route position=%d max=%d enabled=%d extended=%d use=%d wide=%d graph=%d capture=%d events=%d observer=%d timing=%d projection=%d eager_mlp=%d continuation=%d native_mtp=%d\\n",
+                "ordinary_full_layer_graph_route position=%d max=%d enabled=%d extended=%d use=%d wide=%d graph=%d capture=%d events=%d observer=%d timing=%d projection=%d eager_mlp=%d continuation=%d\\n",
                 position,max_context,ordinary_full_layer_graphs_enabled ? 1 : 0,
                 ordinary_full_layer_graph_extended_replay ? 1 : 0,
                 use_ordinary_full_layer_graphs ? 1 : 0,wide_prefill ? 1 : 0,
                 graph_active ? 1 : 0,graph_capture_active ? 1 : 0,events ? 1 : 0,
                 layer_observer ? 1 : 0,target_projection_timing ? 1 : 0,
                 target_projection_observer ? 1 : 0,eager_mlp_gateup_concurrent ? 1 : 0,
-                continuation_reference ? 1 : 0,native_mtp_hidden_capture_active() ? 1 : 0);
+                continuation_reference ? 1 : 0);
         const bool use_host_kv_mlp_tail_graphs=
             ((host_kv_mlp_tail_graphs_enabled && host_kv.enabled) ||
-             (ordinary_mlp_tail_graphs_enabled && !host_kv.enabled)) && !oscar &&
+             (ordinary_mlp_tail_graphs_enabled && !host_kv.enabled)) && !oscar && !batch_bound &&
             !graph_active && !graph_capture_active && !events &&
             !layer_observer && !target_projection_timing &&
             !target_projection_observer && !wide_prefill && !positions_xyz &&
@@ -3477,9 +4580,8 @@ struct Exl3TextContext::Impl {
                             const auto extent=Exl3ExactKVExtent::view(page,host_bank,plane,position);
                             if(!extent.rows())return;
                             const auto bytes=extent.bytes();
-                            cuda_check(cudaMemcpyAsync(static_cast<std::uint16_t*>(destination)+
-                                extent.destination_offset(max_context),extent.data(),bytes,
-                                cudaMemcpyHostToDevice,stream),"stream full required layer KV");
+                            cuda_check(exl3_h2d_async(static_cast<std::uint16_t*>(destination)+
+                                extent.destination_offset(max_context),extent.data(),bytes,stream),"stream full required layer KV");
                             ++host_kv.copy_submissions;
                             if(!host_kv_batch_sync)
                                 cuda_check(cudaStreamSynchronize(stream),"complete required layer KV transfer");
@@ -3580,7 +4682,7 @@ struct Exl3TextContext::Impl {
                         full_layers[layer]->arm_captured_retained_prefix(
                             rows,position,stream);
                     if (rows==1 &&
-                        std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
+                        std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_DIAGNOSTIC"))
                         std::fprintf(stderr,
                             "ordinary_full_layer_graph_replay position=%d layer=%d count=%llu\\n",
                             position,layer,
@@ -3733,9 +4835,9 @@ struct Exl3TextContext::Impl {
                             const std::size_t bytes=static_cast<std::size_t>(page->rows-skip)*1024*2;
                             if(!bytes)continue;
                             const auto download=[&](auto& plane,const void* source) {
-                                cuda_check(cudaMemcpyAsync(plane.data()+skip*1024,
+                                cuda_check(exl3_d2h_async(plane.data()+skip*1024,
                                     static_cast<const std::uint16_t*>(source)+static_cast<std::size_t>(page->first+skip)*1024,
-                                    bytes,cudaMemcpyDeviceToHost,stream),"stream authoritative new KV");
+                                    bytes,stream),"stream authoritative new KV");
                                 ++host_kv.copy_submissions;
                                 if(!host_kv_batch_sync)
                                     cuda_check(cudaStreamSynchronize(stream),"complete new authoritative KV transfer");
@@ -3784,7 +4886,7 @@ struct Exl3TextContext::Impl {
         last_stack_output = current;
         if (skip_head) {
             require(!host_kv.enabled && !forward_publish_device_prefix &&
-                    !events && !graph_active && !graph_capture_active,
+                    !events && !graph_active && (!graph_capture_active || continuation_reference),
                     "layer-major partial forward requires ordinary eager ownership");
             return;
         }
@@ -3808,52 +4910,11 @@ struct Exl3TextContext::Impl {
                         static_cast<std::size_t>(row) * kHidden);
                 cuda_check(cudaGetLastError(), "launch P2 continuation final RMSNorm");
             }
-            if (capture_native_mtp_rows)
-                copy_native_mtp_hidden_capture_rows(
-                    static_cast<const std::uint16_t*>(scratch.final_norm->ptr),
-                    position, rows, stream);
-        } else if (capture_native_mtp_rows) {
-            auto* captured = static_cast<std::uint16_t*>(
-                native_mtp_hidden_capture->ptr) +
-                static_cast<std::size_t>(native_mtp_hidden_capture_valid_rows) * kHidden;
-            for (int row = 0; row < rows; ++row) {
-                final_rms_norm_kernel<<<1, 512, 0, stream>>>(
-                    current + static_cast<std::size_t>(row) * kHidden,
-                    model->final_norm,
-                    captured + static_cast<std::size_t>(row) * kHidden);
-                cuda_check(cudaGetLastError(), "launch native MTP capture final RMSNorm");
-            }
-            cuda_check(cudaMemcpyAsync(
-                           final_norm,
-                           captured + static_cast<std::size_t>(head_plan.first_row) * kHidden,
-                           static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t),
-                           cudaMemcpyDeviceToDevice, stream),
-                       "retain native MTP capture root final norm");
-            note_native_mtp_hidden_capture_rows(position, rows);
         } else {
             final_rms_norm_kernel<<<1, 512, 0, stream>>>(
                 current + static_cast<std::size_t>(head_plan.first_row) * kHidden,
                 model->final_norm, final_norm);
             cuda_check(cudaGetLastError(), "launch E4A final RMSNorm");
-        }
-        // Native MTP consumes the target's final-normalized hidden h_t, not
-        // the residual immediately before the target final norm. Keep only a
-        // transient source identity here; target_hidden_handoff() copies the
-        // row(s) into independently owned storage before publishing them.
-        if (!graph_capture_active) {
-            if (all_head_rows) {
-                last_hidden_source = static_cast<const std::uint16_t*>(
-                    continuation->final_norm->ptr);
-                last_hidden_source_rows = rows;
-                last_hidden_source_first_row = 0;
-            } else {
-                last_hidden_source = final_norm;
-                last_hidden_source_rows = 1;
-                last_hidden_source_first_row = head_plan.first_row;
-            }
-            last_hidden_source_position = position;
-            if (++last_hidden_generation == 0)
-                throw std::overflow_error("native MTP hidden generation exhausted");
         }
         if (events) record(events->final_norm_end, stream, "record E4B1 final norm end");
         if (events) record(events->lm_head_start, stream, "record E4B1 LM head start");
@@ -3983,27 +5044,10 @@ const Exl3ModelLoadStats& Exl3TextModel::load_stats() const noexcept { return im
 
 std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& model_directory,
                                                    int max_context, const Exl3LoadOptions& options) {
-    const char* extended_context=std::getenv("NINFER_EXL3_EXTENDED_CONTEXT_64K");
-    require(!extended_context || std::strcmp(extended_context,"0")==0 ||
-            std::strcmp(extended_context,"1")==0,
-            "extended 64K context must be 0 or 1");
-    const bool extended_context_enabled=extended_context &&
-        std::strcmp(extended_context,"1")==0;
-    const char* extended_context_128=std::getenv("NINFER_EXL3_EXTENDED_CONTEXT_128K");
-    require(!extended_context_128 || std::strcmp(extended_context_128,"0")==0 ||
-            std::strcmp(extended_context_128,"1")==0,
-            "extended 128K context must be 0 or 1");
-    const bool extended_context_128_enabled=extended_context_128 &&
-        std::strcmp(extended_context_128,"1")==0;
-    const int context_limit=static_cast<int>(Exl3NativeContextExtent::configuration_limit(
-        extended_context_enabled,extended_context_128_enabled));
+    const int context_limit=static_cast<int>(Exl3NativeContextExtent::configuration_limit());
     require(max_context > 0 && max_context <= context_limit,
-            extended_context_128_enabled ? "E4C1 extended max_context must be 1..131072" :
-            (extended_context_enabled ? "E4C1 extended max_context must be 1..65536" :
-             (Exl3NativeContextExtent::l0_oscar_enabled() ? "E4C1 L0 OSCAR max_context must be 1..262144" :
-                                        "E4C1 max_context must be 1..32768")));
-    require(!extended_context_128_enabled,
-        "128K is a static configuration candidate only; model execution is unsupported");
+            Exl3NativeContextExtent::l0_oscar_enabled() ? "E4C1 L0 OSCAR max_context must be 1..262144" :
+                                                          "E4C1 max_context must be 1..32768");
     auto impl = std::make_unique<Impl>();
     impl->directory = model_directory;
     if(std::filesystem::is_directory(model_directory/"l0_oscar"))
@@ -4012,8 +5056,7 @@ std::unique_ptr<Exl3TextModel> Exl3TextModel::load(const std::filesystem::path& 
     impl->load_from_disk();
     auto result = std::unique_ptr<Exl3TextModel>(new Exl3TextModel(std::move(impl)));
     result->max_context_ = Exl3NativeContextExtent::checked_max_context(
-        static_cast<std::uint64_t>(max_context),extended_context_enabled,
-        extended_context_128_enabled);
+        static_cast<std::uint64_t>(max_context));
     result->model_bytes_ = result->impl_->model_bytes;
     return result;
 }
@@ -4034,7 +5077,7 @@ std::unique_ptr<Exl3TextContext> Exl3TextModel::create_context(bool capture_taps
 std::shared_ptr<Exl3TextContext> Exl3TextModel::create_context_reserved(
     Exl3VeriCacheServingCoordinator& authority,bool capture_taps,
     unsigned startup_fault_for_test,bool enable_qualified_media,
-    bool allow_ordinary_graphs) const {
+    bool allow_ordinary_graphs,bool exact_line) const {
     Exl3ResourceInventory::Requirement initial;initial.configuration=0x4354585354415254;
     initial.add(Exl3ResourceInventory::Domain::host_metadata,1,Exl3TextContext::fixed_owner_metadata_bytes());
     ContextConstruction prepared;
@@ -4043,7 +5086,7 @@ std::shared_ptr<Exl3TextContext> Exl3TextModel::create_context_reserved(
         require(configuration==initial.configuration,"context planning reservation identity");
         Exl3ResourceInventory actual;
         prepared=create_context_impl(capture_taps,false,true,&authority,startup_fault_for_test,
-            extend,&actual,enable_qualified_media,allow_ordinary_graphs);
+            extend,&actual,enable_qualified_media,allow_ordinary_graphs,exact_line);
         return actual;
     },[&]() noexcept {
         const auto before=Exl3TextContext::retirement_quarantine_witness();
@@ -4063,7 +5106,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     Exl3VeriCacheServingCoordinator* authority,unsigned startup_fault,
     const std::function<void(const Exl3ResourceInventory::Requirement&)>& extend,
     Exl3ResourceInventory* actual_result,bool enable_qualified_media,
-    bool allow_ordinary_graphs) const {
+    bool allow_ordinary_graphs,bool exact_line) const {
     require((startup_fault<=4 || (startup_fault>=6 && startup_fault<=27)) && (!startup_fault || authority),
         "context startup fault requires reserved stage1..4 or6..19");
     require(hostkv_quarantined_contexts.load(std::memory_order_acquire)==0,
@@ -4088,9 +5131,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     } construction_retirement{impl,authority};
     impl->model = impl_;
     impl->max_context = max_context_;
+    impl->exact_line_storage = exact_line;
     impl->capture_taps = capture_taps;
     const char* continuation_graph_b8=
-        std::getenv("NINFER_E5A4_CONTINUATION_GRAPH_B8");
+        std::getenv("VOIDINFER_E5A4_CONTINUATION_GRAPH_B8");
     require(!continuation_graph_b8 ||
                 std::strcmp(continuation_graph_b8,"0")==0 ||
                 std::strcmp(continuation_graph_b8,"1")==0,
@@ -4098,17 +5142,17 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->continuation_graph_b8_enabled=continuation_graph_b8 &&
         std::strcmp(continuation_graph_b8,"1")==0;
     const char* graph_gdn_qkvz =
-        std::getenv("NINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT");
+        std::getenv("VOIDINFER_EXL3_CONTINUATION_GRAPH_GDN_QKVZ_CONCURRENT");
     require(!graph_gdn_qkvz || std::strcmp(graph_gdn_qkvz,"0")==0 ||
                 std::strcmp(graph_gdn_qkvz,"1")==0,
             "fixed-B8 graph GDN QKV/Z concurrency must be 0 or 1");
     impl->continuation_graph_gdn_qkvz_concurrent =
         impl->continuation_graph_b8_enabled && graph_gdn_qkvz &&
         std::strcmp(graph_gdn_qkvz,"1")==0;
-    const char* host_kv=std::getenv("NINFER_EXL3_EXACT_HOST_KV");
+    const char* host_kv=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV");
     impl->host_kv.enabled=host_kv && std::strcmp(host_kv,"1")==0;
     const char* host_kv_gdn_segment_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS");
     require(!host_kv_gdn_segment_graphs ||
             std::strcmp(host_kv_gdn_segment_graphs,"0")==0 ||
             std::strcmp(host_kv_gdn_segment_graphs,"1")==0,
@@ -4120,7 +5164,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             !impl->continuation_graph_b8_enabled,
         "HostKV GDN segment graphs exclude OSCAR continuation graphs");
     const char* host_kv_full_layer_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_FULL_LAYER_GRAPHS");
     require(!host_kv_full_layer_graphs ||
             std::strcmp(host_kv_full_layer_graphs,"0")==0 ||
             std::strcmp(host_kv_full_layer_graphs,"1")==0,
@@ -4133,7 +5177,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "HostKV full-layer graphs require compatible GDN segment graphs");
     const char* ordinary_gdn_segment_graphs=
-        std::getenv("NINFER_EXL3_ORDINARY_GDN_SEGMENT_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_ORDINARY_GDN_SEGMENT_GRAPHS");
     require(!ordinary_gdn_segment_graphs ||
             std::strcmp(ordinary_gdn_segment_graphs,"0")==0 ||
             std::strcmp(ordinary_gdn_segment_graphs,"1")==0,
@@ -4146,7 +5190,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "ordinary device-KV GDN segment graphs require physical device KV");
     const char* host_kv_mlp_tail_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS");
     require(!host_kv_mlp_tail_graphs ||
             std::strcmp(host_kv_mlp_tail_graphs,"0")==0 ||
             std::strcmp(host_kv_mlp_tail_graphs,"1")==0,
@@ -4158,7 +5202,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "HostKV MLP-tail graphs require ordinary exact HostKV");
     const char* ordinary_mlp_tail_graphs=
-        std::getenv("NINFER_EXL3_ORDINARY_MLP_TAIL_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_ORDINARY_MLP_TAIL_GRAPHS");
     require(!ordinary_mlp_tail_graphs ||
             std::strcmp(ordinary_mlp_tail_graphs,"0")==0 ||
             std::strcmp(ordinary_mlp_tail_graphs,"1")==0,
@@ -4171,7 +5215,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "ordinary device-KV MLP-tail graphs require physical device KV");
     const char* ordinary_full_layer_graphs=
-        std::getenv("NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPHS");
     require(!ordinary_full_layer_graphs ||
             std::strcmp(ordinary_full_layer_graphs,"0")==0 ||
             std::strcmp(ordinary_full_layer_graphs,"1")==0,
@@ -4185,7 +5229,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              !impl->continuation_graph_b8_enabled),
         "ordinary device-KV full-layer graphs require physical C1 and exclude MLP-tail graphs");
     const char* ordinary_full_layer_graph_extended_replay=std::getenv(
-        "NINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_EXTENDED_REPLAY");
+        "VOIDINFER_EXL3_ORDINARY_FULL_LAYER_GRAPH_EXTENDED_REPLAY");
     require(!ordinary_full_layer_graph_extended_replay ||
             std::strcmp(ordinary_full_layer_graph_extended_replay,"0")==0 ||
             std::strcmp(ordinary_full_layer_graph_extended_replay,"1")==0,
@@ -4197,7 +5241,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->ordinary_full_layer_graphs_enabled,
         "ordinary full-layer graph extended replay requires ordinary full-layer graphs");
     const char* ordinary_full_layer_multirow=std::getenv(
-        "NINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS");
+        "VOIDINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS");
     require(!ordinary_full_layer_multirow ||
             std::strcmp(ordinary_full_layer_multirow,"0")==0 ||
             std::strcmp(ordinary_full_layer_multirow,"1")==0,
@@ -4209,7 +5253,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!ordinary_full_layer_multirow ||
          std::strcmp(ordinary_full_layer_multirow,"1")==0);
     const char* host_kv_transaction_checkpoint_graph=std::getenv(
-        "NINFER_EXL3_HOST_KV_TRANSACTION_CHECKPOINT_GRAPH");
+        "VOIDINFER_EXL3_HOST_KV_TRANSACTION_CHECKPOINT_GRAPH");
     require(!host_kv_transaction_checkpoint_graph ||
             std::strcmp(host_kv_transaction_checkpoint_graph,"0")==0 ||
             std::strcmp(host_kv_transaction_checkpoint_graph,"1")==0,
@@ -4221,7 +5265,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             (impl->host_kv.enabled && !impl->continuation_graph_b8_enabled),
         "HostKV transaction checkpoint graph requires exact HostKV ownership");
     const char* device_transaction_checkpoint_graph=std::getenv(
-        "NINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH");
+        "VOIDINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH");
     require(!device_transaction_checkpoint_graph ||
             std::strcmp(device_transaction_checkpoint_graph,"0")==0 ||
             std::strcmp(device_transaction_checkpoint_graph,"1")==0,
@@ -4238,7 +5282,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
              fast_device_kv_transaction_enabled()),
         "device-KV transaction checkpoint graph requires guarded device KV");
     const char* host_kv_transaction_recurrent_trace=std::getenv(
-        "NINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE");
+        "VOIDINFER_EXL3_HOST_KV_TRANSACTION_RECURRENT_TRACE");
     require(!host_kv_transaction_recurrent_trace ||
             std::strcmp(host_kv_transaction_recurrent_trace,"0")==0 ||
             std::strcmp(host_kv_transaction_recurrent_trace,"1")==0,
@@ -4250,7 +5294,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->host_kv.enabled,
         "HostKV transaction recurrent trace requires exact HostKV ownership");
     const char* batched_recurrent_export=std::getenv(
-        "NINFER_EXL3_BATCHED_RECURRENT_EXPORT");
+        "VOIDINFER_EXL3_BATCHED_RECURRENT_EXPORT");
     require(!batched_recurrent_export ||
             std::strcmp(batched_recurrent_export,"0")==0 ||
             std::strcmp(batched_recurrent_export,"1")==0,
@@ -4262,21 +5306,21 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->batched_recurrent_export,
         "batched recurrent export is rejected on this caller: the CUDA batch "
         "faulted at the immutable recurrent-state fence");
-    const char* native16 = std::getenv("NINFER_EXL3_NATIVE_CONTINUATION16");
+    const char* native16 = std::getenv("VOIDINFER_EXL3_NATIVE_CONTINUATION16");
     require(!native16 || std::strcmp(native16,"0")==0 || std::strcmp(native16,"1")==0,
         "native continuation16 must be 0 or 1");
     impl->native_continuation16_enabled = native16 && std::strcmp(native16,"1")==0;
     require(!impl->native_continuation16_enabled ||
         (impl->host_kv.enabled && !impl->oscar_only && !impl->continuation_graph_b8_enabled),
         "native continuation16 requires ordinary eager exact-host ownership");
-    const char* host_kv_cpu_profile=std::getenv("NINFER_EXL3_HOST_KV_CPU_PROFILE");
+    const char* host_kv_cpu_profile=std::getenv("VOIDINFER_EXL3_HOST_KV_CPU_PROFILE");
     require(!host_kv_cpu_profile || std::strcmp(host_kv_cpu_profile,"0")==0 ||
         std::strcmp(host_kv_cpu_profile,"1")==0,
         "exact host KV CPU profile must be 0 or 1");
     impl->host_kv_cpu_profile=impl->host_kv.enabled && host_kv_cpu_profile &&
         std::strcmp(host_kv_cpu_profile,"1")==0;
     const char* host_kv_unique_tail_reuse=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_UNIQUE_TAIL_REUSE");
     require(!host_kv_unique_tail_reuse ||
             std::strcmp(host_kv_unique_tail_reuse,"0")==0 ||
             std::strcmp(host_kv_unique_tail_reuse,"1")==0,
@@ -4284,7 +5328,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->host_kv_unique_tail_reuse=impl->host_kv.enabled &&
         host_kv_unique_tail_reuse &&
         std::strcmp(host_kv_unique_tail_reuse,"1")==0;
-    const char* host_kv_batch_sync=std::getenv("NINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC");
+    const char* host_kv_batch_sync=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_SYNC");
     require(!host_kv_batch_sync || std::strcmp(host_kv_batch_sync,"0")==0 ||
         std::strcmp(host_kv_batch_sync,"1")==0,
         "exact host KV batch synchronization must be 0 or 1");
@@ -4294,7 +5338,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!host_kv_batch_sync || std::strcmp(host_kv_batch_sync,"0")!=0);
     require(!impl->host_kv_batch_sync || impl->host_kv.enabled,
         "batched host KV synchronization requires exact host KV");
-    const char* host_kv_batch_copy=std::getenv("NINFER_EXL3_EXACT_HOST_KV_BATCH_COPY");
+    const char* host_kv_batch_copy=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_BATCH_COPY");
     require(!host_kv_batch_copy || std::strcmp(host_kv_batch_copy,"0")==0 ||
         std::strcmp(host_kv_batch_copy,"1")==0,
         "exact host KV batch copy must be 0 or 1");
@@ -4304,7 +5348,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!host_kv_batch_copy || std::strcmp(host_kv_batch_copy,"0")!=0);
     require(!impl->host_kv_batch_copy || (impl->host_kv.enabled && impl->host_kv_batch_sync),
         "exact host KV batch copy requires final-barrier host KV");
-    const char* host_kv_pinned_chunks=std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS");
+    const char* host_kv_pinned_chunks=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_CHUNKS");
     require(!host_kv_pinned_chunks || std::strcmp(host_kv_pinned_chunks,"0")==0 ||
         std::strcmp(host_kv_pinned_chunks,"1")==0,
         "exact host KV pinned chunks must be 0 or 1");
@@ -4313,7 +5357,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     impl->host_kv_pinned_chunks=impl->host_kv_batch_copy &&
         (!host_kv_pinned_chunks || std::strcmp(host_kv_pinned_chunks,"0")!=0);
     const char* host_kv_pinned_h2d_slots=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
     require(!host_kv_pinned_h2d_slots ||
             std::strcmp(host_kv_pinned_h2d_slots,"2")==0 ||
             std::strcmp(host_kv_pinned_h2d_slots,"32")==0,
@@ -4322,7 +5366,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         host_kv_pinned_h2d_slots &&
         std::strcmp(host_kv_pinned_h2d_slots,"32")==0?32:2;
     const char* host_kv_prefill_pinned_batch=
-        std::getenv("NINFER_EXL3_PREFILL_PINNED_BATCH_OVER_REGISTERED");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PINNED_BATCH_OVER_REGISTERED");
     require(!host_kv_prefill_pinned_batch ||
             std::strcmp(host_kv_prefill_pinned_batch,"0")==0 ||
             std::strcmp(host_kv_prefill_pinned_batch,"1")==0,
@@ -4332,7 +5376,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         std::strcmp(host_kv_prefill_pinned_batch,"1")==0;
     require(!impl->host_kv_prefill_pinned_batch || impl->host_kv_pinned_chunks,
         "exact host KV prefill pinned batch requires pinned chunks");
-    const char* host_kv_pinned_d2h=std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_D2H");
+    const char* host_kv_pinned_d2h=std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_D2H");
     require(!host_kv_pinned_d2h || std::strcmp(host_kv_pinned_d2h,"0")==0 ||
         std::strcmp(host_kv_pinned_d2h,"1")==0,
         "exact host KV pinned D2H must be 0 or 1");
@@ -4344,7 +5388,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->host_kv_pinned_d2h || impl->host_kv_pinned_chunks,
         "exact host KV pinned D2H requires pinned chunks");
     const char* host_kv_banked_d2h=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_BANKED_D2H");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_BANKED_D2H");
     require(!host_kv_banked_d2h || std::strcmp(host_kv_banked_d2h,"0")==0 ||
             std::strcmp(host_kv_banked_d2h,"1")==0,
         "exact host KV banked D2H must be 0 or 1");
@@ -4353,7 +5397,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->host_kv_banked_d2h || impl->host_kv_pinned_d2h,
         "exact host KV banked D2H requires pinned D2H");
     const char* host_kv_deferred_scatter=
-        std::getenv("NINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER");
+        std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_DEFERRED_SCATTER");
     require(!host_kv_deferred_scatter ||
             std::strcmp(host_kv_deferred_scatter,"0")==0 ||
             std::strcmp(host_kv_deferred_scatter,"1")==0,
@@ -4431,11 +5475,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         }
     }
     };
-    const char* oscar_only=std::getenv("NINFER_EXL3_OSCAR_L0_ONLY");
+    const char* oscar_only=std::getenv("VOIDINFER_EXL3_OSCAR_L0_ONLY");
     impl->oscar_only=oscar_only && std::strcmp(oscar_only,"1")==0;
     require(!impl->host_kv.enabled || !impl->oscar_only,"exact host KV and OSCAR-only modes are separate");
     const char* eager_mlp_gateup=
-        std::getenv("NINFER_EXL3_EAGER_MLP_GATEUP_CONCURRENT");
+        std::getenv("VOIDINFER_EXL3_EAGER_MLP_GATEUP_CONCURRENT");
     require(!eager_mlp_gateup || std::strcmp(eager_mlp_gateup,"0")==0 ||
             std::strcmp(eager_mlp_gateup,"1")==0,
         "eager MLP gate/up concurrency must be 0 or 1");
@@ -4448,10 +5492,10 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(max_context_<=32768 || impl->host_kv.enabled || impl->oscar_only ||
             Exl3NativeContextExtent::l0_oscar_enabled(),
             "extended context requires exact-host KV or OSCAR-only storage");
-    const char* wide_prefill = std::getenv("NINFER_EXL3_WIDE_PREFILL");
+    const char* wide_prefill = std::getenv("VOIDINFER_EXL3_WIDE_PREFILL");
     impl->wide_prefill_enabled = wide_prefill && std::strcmp(wide_prefill, "1") == 0;
     const char* prefill_qkv=
-        std::getenv("NINFER_EXL3_PREFILL_QKV_CONCURRENT");
+        std::getenv("VOIDINFER_EXL3_PREFILL_QKV_CONCURRENT");
     require(!prefill_qkv || std::strcmp(prefill_qkv,"0")==0 ||
             std::strcmp(prefill_qkv,"1")==0,
         "wide-prefill QKV concurrency must be 0 or 1");
@@ -4461,20 +5505,20 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             (impl->wide_prefill_enabled && impl->host_kv.enabled &&
              !impl->oscar_only && !impl->continuation_graph_b8_enabled),
         "wide-prefill QKV concurrency requires ordinary exact HostKV wide prefill");
-    const char* staged = std::getenv("NINFER_EXL3_PREFILL_STAGED_REDUCTION");
+    const char* staged = std::getenv("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION");
     const bool staged_prefill_enabled = staged && std::strcmp(staged, "1") == 0;
-    const char* shared_accum = std::getenv("NINFER_EXL3_SHARED_ACCUM");
+    const char* shared_accum = std::getenv("VOIDINFER_EXL3_SHARED_ACCUM");
     const bool shared_accumulation_enabled =
         shared_accum && std::strcmp(shared_accum, "1") == 0;
-    const char* wide64 = std::getenv("NINFER_EXL3_PREFILL_WIDE64");
+    const char* wide64 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE64");
     const bool wide64_enabled = wide64 && std::strcmp(wide64, "1") == 0;
-    const char* wide128 = std::getenv("NINFER_EXL3_PREFILL_WIDE128");
+    const char* wide128 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE128");
     const bool wide128_enabled = wide128 && std::strcmp(wide128, "1") == 0;
-    const char* wide256 = std::getenv("NINFER_EXL3_PREFILL_WIDE256");
+    const char* wide256 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE256");
     const bool wide256_enabled = wide256 && std::strcmp(wide256, "1") == 0;
-    const char* wide512 = std::getenv("NINFER_EXL3_PREFILL_WIDE512");
+    const char* wide512 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE512");
     const bool wide512_enabled = wide512 && std::strcmp(wide512, "1") == 0;
-    const char* wide1024 = std::getenv("NINFER_EXL3_PREFILL_WIDE1024");
+    const char* wide1024 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE1024");
     const bool wide1024_enabled = wide1024 && std::strcmp(wide1024, "1") == 0;
     // Resolve the requested width ladder before validating transform/scratch
     // prerequisites so unset optional defaults can be admitted at final 128/1024.
@@ -4491,16 +5535,16 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         requested_prefill_capacity = 512;
     if (requested_prefill_capacity == 512 && wide1024_enabled)
         requested_prefill_capacity = 1024;
-    const char* shared_layer = std::getenv("NINFER_EXL3_SHARED_LAYER_SCRATCH");
+    const char* shared_layer = std::getenv("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH");
     const bool qualified_default_group = exl3_prefill_qualified_default_group(
         requested_prefill_capacity, impl->wide_prefill_enabled,
         staged_prefill_enabled, shared_accumulation_enabled);
     const bool shared_layer_enabled = shared_layer
         ? std::strcmp(shared_layer, "1") == 0 : qualified_default_group;
-    const char* shared_transform = std::getenv("NINFER_EXL3_SHARED_TRANSFORM");
+    const char* shared_transform = std::getenv("VOIDINFER_EXL3_SHARED_TRANSFORM");
     const bool shared_transform_enabled = shared_transform
         ? std::strcmp(shared_transform, "1") == 0 : qualified_default_group;
-    const char* gdn_wide_slab = std::getenv("NINFER_EXL3_GDN_WIDE_SLAB");
+    const char* gdn_wide_slab = std::getenv("VOIDINFER_EXL3_GDN_WIDE_SLAB");
     if (impl->wide_prefill_enabled && staged_prefill_enabled)
         impl->prefill_capacity = 32;
     if (impl->prefill_capacity == 32 && wide64_enabled)
@@ -4520,7 +5564,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     if (impl->prefill_capacity == 512 && wide1024_enabled)
         impl->prefill_capacity=1024;
     const char* numeric_prefill_projection = std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC");
     require(!numeric_prefill_projection ||
             std::strcmp(numeric_prefill_projection, "0") == 0 ||
             std::strcmp(numeric_prefill_projection, "1") == 0,
@@ -4529,14 +5573,14 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         numeric_prefill_projection &&
         std::strcmp(numeric_prefill_projection, "1") == 0;
     const char* numeric_prefill_k7 = std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC");
     require(!numeric_prefill_k7 || std::strcmp(numeric_prefill_k7, "0") == 0 ||
             std::strcmp(numeric_prefill_k7, "1") == 0,
         "numeric K7 reconstruct GEMM prefill must be 0 or 1");
     const bool numeric_prefill_k7_enabled = numeric_prefill_k7 &&
         std::strcmp(numeric_prefill_k7, "1") == 0;
     const char* fast_same_weights_fp16kv_prefill = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     require(!fast_same_weights_fp16kv_prefill ||
             std::strcmp(fast_same_weights_fp16kv_prefill, "0") == 0 ||
             std::strcmp(fast_same_weights_fp16kv_prefill, "1") == 0,
@@ -4545,7 +5589,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         fast_same_weights_fp16kv_prefill &&
         std::strcmp(fast_same_weights_fp16kv_prefill, "1") == 0;
     const char* fast_same_weights_fp16kv_decode = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_DECODE");
     require(!fast_same_weights_fp16kv_decode ||
             std::strcmp(fast_same_weights_fp16kv_decode, "0") == 0 ||
             std::strcmp(fast_same_weights_fp16kv_decode, "1") == 0,
@@ -4565,7 +5609,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!impl->native_continuation16_enabled ||
         !numeric_prefill_workspace_enabled,
         "native continuation16 excludes numeric projection candidates");
-    const char* oscar_requested = std::getenv("NINFER_OSCAR_EXL3");
+    const char* oscar_requested = std::getenv("VOIDINFER_OSCAR_EXL3");
     const bool fast_same_weights_fp16kv_scope =
         fast_same_weights_fp16kv_prefill_enabled && !impl->host_kv.enabled &&
         !impl->oscar_only && !impl->continuation_graph_b8_enabled &&
@@ -4576,7 +5620,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // never changes the resident KV representation, so it may share the
     // ordinary device-KV construction path while remaining default-off.
     const char* fast_wide_prefill_gemm = std::getenv(
-        "NINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM");
+        "VOIDINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM");
     const bool fast_wide_prefill_gemm_scope =
         fast_wide_prefill_gemm &&
         std::strcmp(fast_wide_prefill_gemm, "1") == 0 &&
@@ -4590,20 +5634,20 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         !impl->oscar_only && !impl->continuation_graph_b8_enabled &&
         (!oscar_requested || std::strcmp(oscar_requested, "0") == 0);
     impl->fast_same_weights_fp16kv_prefill_enabled = fast_same_weights_fp16kv_scope;
-    const char* gdn_bulk=std::getenv("NINFER_EXL3_FAST_GDN_BULK_PREFILL");
+    const char* gdn_bulk=std::getenv("VOIDINFER_EXL3_FAST_GDN_BULK_PREFILL");
     require(!gdn_bulk || std::strcmp(gdn_bulk,"0")==0 ||
             std::strcmp(gdn_bulk,"1")==0,
             "GDN bulk prefill must be 0 or 1");
     impl->gdn_bulk_prefill_enabled=fast_same_weights_fp16kv_scope &&
         gdn_bulk && std::strcmp(gdn_bulk,"1")==0;
-    const char* gdn_bulk_mlp=std::getenv("NINFER_EXL3_FAST_GDN_BULK_MLP");
+    const char* gdn_bulk_mlp=std::getenv("VOIDINFER_EXL3_FAST_GDN_BULK_MLP");
     require(!gdn_bulk_mlp || std::strcmp(gdn_bulk_mlp,"0")==0 ||
             std::strcmp(gdn_bulk_mlp,"1")==0,
             "GDN bulk MLP must be 0 or 1");
     impl->gdn_bulk_mlp_enabled=fast_same_weights_fp16kv_scope &&
         gdn_bulk_mlp && std::strcmp(gdn_bulk_mlp,"1")==0;
     const char* gdn_bulk_mlp_short_k5=std::getenv(
-        "NINFER_EXL3_FAST_GDN_BULK_MLP_SHORT_K5");
+        "VOIDINFER_EXL3_FAST_GDN_BULK_MLP_SHORT_K5");
     require(!gdn_bulk_mlp_short_k5 ||
             std::strcmp(gdn_bulk_mlp_short_k5,"0")==0 ||
             std::strcmp(gdn_bulk_mlp_short_k5,"1")==0,
@@ -4615,17 +5659,17 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(gdn_bulk_mlp_short_k5,"1")!=0 ||
             impl->gdn_bulk_mlp_short_k5_enabled,
             "GDN bulk MLP short K5 requires Fast90 bulk MLP admission");
-    const char* gdn_bulk_mlp_rows=std::getenv("NINFER_EXL3_FAST_GDN_BULK_MLP_ROWS");
+    const char* gdn_bulk_mlp_rows=std::getenv("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_ROWS");
     require(!gdn_bulk_mlp_rows || std::strcmp(gdn_bulk_mlp_rows,"4096")==0 ||
             std::strcmp(gdn_bulk_mlp_rows,"8192")==0,
             "GDN bulk MLP rows must be 4096 or 8192");
-    const char* wmma_split2=std::getenv("NINFER_EXL3_FAST_WMMA32_SPLIT2");
+    const char* wmma_split2=std::getenv("VOIDINFER_EXL3_FAST_WMMA32_SPLIT2");
     require(!wmma_split2 || std::strcmp(wmma_split2,"0")==0 ||
             std::strcmp(wmma_split2,"1")==0,
             "WMMA32 split2 option must be 0 or 1");
     impl->fast_wmma32_split2_enabled=fast_same_weights_fp16kv_scope &&
         wmma_split2 && std::strcmp(wmma_split2,"1")==0;
-    const char* wmma_split4=std::getenv("NINFER_EXL3_FAST_WMMA32_SPLIT4");
+    const char* wmma_split4=std::getenv("VOIDINFER_EXL3_FAST_WMMA32_SPLIT4");
     require(!wmma_split4 || std::strcmp(wmma_split4,"0")==0 ||
             std::strcmp(wmma_split4,"1")==0,
             "WMMA32 split4 option must be 0 or 1");
@@ -4654,21 +5698,21 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             fast_same_weights_fp16kv_decode_scope,
         "numeric reconstruct GEMM requires target-only exact-host wide1024 or an admitted same-weight FP16-KV scope");
     const char* reconstructed_exact = std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7");
     require(!reconstructed_exact || std::strcmp(reconstructed_exact, "0") == 0 ||
             std::strcmp(reconstructed_exact, "1") == 0,
         "exact K7 reconstruction must be 0 or 1");
     const bool reconstructed_exact_enabled = reconstructed_exact &&
         std::strcmp(reconstructed_exact, "1") == 0;
     const int reconstruction_columns=exl3_reconstruction_slice_columns(
-        std::getenv("NINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
+        std::getenv("VOIDINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
     require(reconstructed_exact_enabled || reconstruction_columns==5120,
         "bounded reconstruction slices require exact reconstruction enabled");
-    const char* reconstructed_k6=std::getenv("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN");
+    const char* reconstructed_k6=std::getenv("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_DOWN");
     const bool reconstructed_k6_enabled=exl3_reconstruction_k6_down_option(
         reconstructed_k6,reconstructed_exact_enabled);
     const char* reconstructed_k6_gate_up=std::getenv(
-        "NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_GATE_UP");
+        "VOIDINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K6_GATE_UP");
     const bool reconstructed_k6_gate_up_enabled=
         exl3_reconstruction_k6_gate_up_option(
             reconstructed_k6_gate_up,reconstructed_exact_enabled);
@@ -4677,7 +5721,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          staged_prefill_enabled && impl->prefill_capacity == 1024 &&
          !numeric_prefill_workspace_enabled) || fast_wide_prefill_gemm_scope,
         "exact K7 reconstruction requires ordinary exact-host wide1024 or the admitted same-weight wide GEMM scope");
-    const char* direct_partials = std::getenv("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
+    const char* direct_partials = std::getenv("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS");
     require(!reconstructed_exact_enabled ||
         ((!direct_partials && qualified_default_group) ||
          (direct_partials && std::strcmp(direct_partials, "1") == 0)),
@@ -4691,13 +5735,13 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         require(impl->wide_prefill_enabled && shared_layer_enabled,
                 "GDN wide slab requires wide prefill and shared layer scratch");
     }
-    const char* target_timing = std::getenv("NINFER_EXL3_TARGET_PROJECTION_TIMING");
+    const char* target_timing = std::getenv("VOIDINFER_EXL3_TARGET_PROJECTION_TIMING");
     impl->target_projection_timing_opt_in =
         target_timing != nullptr && std::strcmp(target_timing, "1") == 0;
     // L0 OSCAR contexts prefill in bounded chunks: per-row buffers hold one chunk.
     const int row_storage=(impl->host_kv.enabled || impl->oscar_only) ? impl->prefill_capacity :
         (Exl3NativeContextExtent::l0_oscar_enabled() ?
-            std::min<int>(max_context_,Exl3NativeContextExtent::l0_prefill_block_rows) : max_context_);
+            std::min<int>(max_context_,Exl3NativeContextExtent::l0_prefill_block_rows()) : max_context_);
     require(row_storage>0,"target context storage rows must be positive");
     const auto checked_extent=[&](std::size_t bytes_per_row) {
         Exl3ResourceInventory::Requirement required;
@@ -4708,9 +5752,19 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     };
     const std::size_t hidden_bytes=checked_extent(kHidden*sizeof(std::uint16_t));
     const auto token_bytes=checked_extent(sizeof(std::int64_t));
+    // Concurrent Engine lanes (VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE=1): the
+    // prompt-only WMMA32 partials come from one model-level allocation.
+    static const bool share_prompt_rows=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
     const auto visit_base_allocations=[&](auto&& allocate) {
-        allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
-        allocate(hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
+        // Concurrent lanes keep batch-row (32 or 64) hidden planes; the prompt-block planes
+        // live in the model's shared pool (swapped by the prompt tier).
+        const std::size_t private_hidden_bytes=share_prompt_rows?
+            static_cast<std::size_t>(exl3_batch_rows())*kHidden*sizeof(std::uint16_t):hidden_bytes;
+        allocate(private_hidden_bytes,reinterpret_cast<void**>(&impl->hidden_a),"allocate E4A hidden A");
+        allocate(private_hidden_bytes,reinterpret_cast<void**>(&impl->hidden_b),"allocate E4A hidden B");
         if (impl->gdn_bulk_prefill_enabled) {
             const auto bulk_rows=static_cast<std::size_t>(impl->gdn_bulk_capacity);
             allocate(bulk_rows*kHidden*sizeof(std::uint16_t),
@@ -4731,7 +5785,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             allocate(bulk_rows*17408*sizeof(std::uint16_t),
                 reinterpret_cast<void**>(&impl->gdn_mlp_up),"allocate GDN bulk up");
         }
-        if (impl->fast_wmma32_split_capacity) {
+        if (impl->fast_wmma32_split_capacity && !share_prompt_rows) {
             constexpr std::size_t rows=1024;
             allocate(static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*
                 rows*kQHeads*kHeadDim*sizeof(float),
@@ -4747,8 +5801,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         allocate(token_bytes,reinterpret_cast<void**>(&impl->token_ids),"allocate E4A token ids");
         // [0] device position, [1..2] verifier layout {chain rows, packed
         // sibling offsets} (chain rows 0: every row is a chain row; see
-        // sibling_rows.cuh).
-        allocate(3*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
+        // sibling_rows.cuh), [4..7] rotary position map (rope_map.cuh).
+        allocate(8*sizeof(int),reinterpret_cast<void**>(&impl->position_device),"allocate E4B2 position parameter");
         allocate(sizeof(std::int64_t),reinterpret_cast<void**>(&impl->draft_token_id),"allocate E5A2 draft token id");
     };
     std::size_t base_bytes=0,base_owners=0;
@@ -4767,9 +5821,9 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     float* exact_scores=nullptr;
     float* numeric_attention_splitk_workspace=nullptr;
     std::size_t numeric_attention_splitk_workspace_bytes=0;
-    const char* parallel_exact=std::getenv("NINFER_EXL3_EXACT_ATTENTION_PARALLEL");
+    const char* parallel_exact=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL");
     const char* numeric_attention_splitk=
-        std::getenv("NINFER_EXL3_NUMERIC_ATTENTION_TILED");
+        std::getenv("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED");
     require(!numeric_attention_splitk || std::strcmp(numeric_attention_splitk,"0")==0 ||
         std::strcmp(numeric_attention_splitk,"1")==0,
         "numeric tiled attention must be 0 or 1");
@@ -4804,8 +5858,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         impl->host_kv.numeric_attention_scratch_bytes=numeric_attention_splitk_workspace_bytes;
       }
     };
-    const char* exact_q_shared=std::getenv("NINFER_EXL3_EXACT_ATTENTION_Q_SHARED");
-    const char* query_pair=std::getenv("NINFER_EXL3_EXACT_ATTENTION_QUERY_PAIR");
+    const char* exact_q_shared=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_Q_SHARED");
+    const char* query_pair=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_QUERY_PAIR");
     const bool query_pair_enabled=exl3_attention_query_pair_option(query_pair,exact_scores_enabled);
     require(!exact_q_shared || std::strcmp(exact_q_shared,"0")==0 ||
         std::strcmp(exact_q_shared,"1")==0,
@@ -4817,7 +5871,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_q_shared && std::strcmp(exact_q_shared,"1")==0));
     require(!exact_q_shared_enabled || exact_scores_enabled,
         "exact attention Q-shared requires parallel exact attention");
-    const char* exact_k_half2=std::getenv("NINFER_EXL3_EXACT_ATTENTION_K_HALF2");
+    const char* exact_k_half2=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_K_HALF2");
     require(!exact_k_half2 || std::strcmp(exact_k_half2,"0")==0 ||
         std::strcmp(exact_k_half2,"1")==0,
         "exact attention K-half2 must be 0 or 1");
@@ -4827,7 +5881,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (!exact_k_half2 || std::strcmp(exact_k_half2,"0")!=0);
     require(!exact_k_half2_enabled || exact_q_shared_enabled,
         "exact attention K-half2 requires Q-shared");
-    const char* exact_v_half2=std::getenv("NINFER_EXL3_EXACT_ATTENTION_V_HALF2");
+    const char* exact_v_half2=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_V_HALF2");
     require(!exact_v_half2 || std::strcmp(exact_v_half2,"0")==0 ||
         std::strcmp(exact_v_half2,"1")==0,
         "exact attention V-half2 must be 0 or 1");
@@ -4839,7 +5893,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_v_half2 && std::strcmp(exact_v_half2,"1")==0));
     require(!exact_v_half2_enabled || exact_k_half2_enabled,
         "exact attention V-half2 requires K-half2");
-    const char* exact_gqa_pair=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_PAIR");
+    const char* exact_gqa_pair=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_PAIR");
     require(!exact_gqa_pair || std::strcmp(exact_gqa_pair,"0")==0 ||
         std::strcmp(exact_gqa_pair,"1")==0,
         "exact attention GQA pair must be 0 or 1");
@@ -4850,7 +5904,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_gqa_pair && std::strcmp(exact_gqa_pair,"1")==0));
     require(!exact_gqa_pair_enabled || exact_v_half2_enabled,
         "exact attention GQA pair requires V-half2");
-    const char* exact_gqa_triple=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE");
+    const char* exact_gqa_triple=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE");
     require(!exact_gqa_triple || std::strcmp(exact_gqa_triple,"0")==0 ||
         std::strcmp(exact_gqa_triple,"1")==0,
         "exact attention GQA triple must be 0 or 1");
@@ -4861,7 +5915,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_gqa_triple && std::strcmp(exact_gqa_triple,"1")==0));
     require(!exact_gqa_triple_enabled || exact_gqa_pair_enabled,
         "exact attention GQA triple requires GQA pair");
-    const char* exact_gqa_triple_values128=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES128");
+    const char* exact_gqa_triple_values128=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES128");
     require(!exact_gqa_triple_values128 || std::strcmp(exact_gqa_triple_values128,"0")==0 ||
         std::strcmp(exact_gqa_triple_values128,"1")==0,
         "exact attention GQA triple values128 must be 0 or 1");
@@ -4869,7 +5923,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_triple_values128 && std::strcmp(exact_gqa_triple_values128,"1")==0;
     require(!exact_gqa_triple_values128_enabled || exact_gqa_triple_enabled,
         "exact attention GQA triple values128 requires GQA triple");
-    const char* exact_gqa_triple_softmax_staged=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED");
+    const char* exact_gqa_triple_softmax_staged=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED");
     require(!exact_gqa_triple_softmax_staged || std::strcmp(exact_gqa_triple_softmax_staged,"0")==0 ||
         std::strcmp(exact_gqa_triple_softmax_staged,"1")==0,
         "exact attention GQA triple staged softmax must be 0 or 1");
@@ -4879,7 +5933,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         ((impl->host_kv.enabled && (!exact_gqa_triple_softmax_staged ||
             std::strcmp(exact_gqa_triple_softmax_staged,"0")!=0)) ||
          (exact_gqa_triple_softmax_staged && std::strcmp(exact_gqa_triple_softmax_staged,"1")==0));
-    const char* exact_gqa_six=std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX");
+    const char* exact_gqa_six=std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX");
     require(!exact_gqa_six || std::strcmp(exact_gqa_six,"0")==0 ||
         std::strcmp(exact_gqa_six,"1")==0,
         "exact attention GQA six must be 0 or 1");
@@ -4888,7 +5942,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!exact_gqa_six_enabled || exact_gqa_triple_softmax_staged_enabled,
         "exact attention GQA six requires staged GQA triple");
     const char* exact_gqa_six_scores=
-        std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES");
+        std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES");
     require(!exact_gqa_six_scores || std::strcmp(exact_gqa_six_scores,"0")==0 ||
         std::strcmp(exact_gqa_six_scores,"1")==0,
         "exact attention GQA six scores must be 0 or 1");
@@ -4905,7 +5959,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             std::strcmp(exact_gqa_six_scores,"0")!=0)) ||
          (exact_gqa_six_scores && std::strcmp(exact_gqa_six_scores,"1")==0));
     const char* exact_gqa_six_extent_shards=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS");
     require(!exact_gqa_six_extent_shards ||
         std::strcmp(exact_gqa_six_extent_shards,"0")==0 ||
         std::strcmp(exact_gqa_six_extent_shards,"1")==0,
@@ -4921,7 +5975,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!exact_gqa_six_extent_shards_enabled || exact_gqa_six_scores_enabled,
         "exact attention GQA six extent shards require six-head scores");
     const char* exact_gqa_six_values_sharded=
-        std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED");
+        std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED");
     require(!exact_gqa_six_values_sharded ||
         std::strcmp(exact_gqa_six_values_sharded,"0")==0 ||
         std::strcmp(exact_gqa_six_values_sharded,"1")==0,
@@ -4932,7 +5986,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!(exact_gqa_six_enabled && exact_gqa_six_values_sharded_enabled),
         "full GQA six and sharded-value GQA six are separate controls");
     const char* exact_gqa_six_softmax_triple_values=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES");
     require(!exact_gqa_six_softmax_triple_values ||
         std::strcmp(exact_gqa_six_softmax_triple_values,"0")==0 ||
         std::strcmp(exact_gqa_six_softmax_triple_values,"1")==0,
@@ -4948,7 +6002,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
          (exact_gqa_six_softmax_triple_values &&
             std::strcmp(exact_gqa_six_softmax_triple_values,"1")==0));
     const char* exact_gqa_six_softmax_triple_values_pair_dimensions=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS");
     require(!exact_gqa_six_softmax_triple_values_pair_dimensions ||
         std::strcmp(exact_gqa_six_softmax_triple_values_pair_dimensions,"0")==0 ||
         std::strcmp(exact_gqa_six_softmax_triple_values_pair_dimensions,"1")==0,
@@ -4960,7 +6014,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_six_softmax_triple_values_enabled,
         "pair-dimension triple values require selected six-head softmax triple values");
     const char* exact_gqa_six_softmax_six_values_single_load=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD");
     require(!exact_gqa_six_softmax_six_values_single_load ||
         std::strcmp(exact_gqa_six_softmax_six_values_single_load,"0")==0 ||
         std::strcmp(exact_gqa_six_softmax_six_values_single_load,"1")==0,
@@ -4972,7 +6026,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_six_softmax_triple_values_enabled,
         "single-load six values require selected six-head softmax triple values");
     const char* exact_gqa_six_packed_triples=std::getenv(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES");
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES");
     require(!exact_gqa_six_packed_triples ||
         std::strcmp(exact_gqa_six_packed_triples,"0")==0 ||
         std::strcmp(exact_gqa_six_packed_triples,"1")==0,
@@ -4982,7 +6036,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         exact_gqa_six_packed_triples &&
         std::strcmp(exact_gqa_six_packed_triples,"1")==0;
     const char* exact_gqa_triple_values4=
-        std::getenv("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4");
+        std::getenv("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4");
     require(!exact_gqa_triple_values4 ||
         std::strcmp(exact_gqa_triple_values4,"0")==0 ||
         std::strcmp(exact_gqa_triple_values4,"1")==0,
@@ -5057,12 +6111,28 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     if(impl->host_kv.enabled)impl->host_kv.layer_workspace_bytes=required_kv_bytes;
     };
     Exl3ResourceInventory::Requirement tap_requirement;
-    if(capture_taps)tap_requirement.add(Exl3ResourceInventory::Domain::device,kTapLayers.size()+1,hidden_bytes);
+    // Taps and the embedding trace hold one forward's rows (at most the
+    // prefill capacity: layer-major blocks capture chunk by chunk), not the
+    // whole L0 prompt block that hidden A/B keep.
+    const std::size_t prompt_tap_plane_bytes=std::min(hidden_bytes,
+        static_cast<std::size_t>(impl->prefill_capacity)*kHidden*sizeof(std::uint16_t));
+    // Concurrent lanes keep 32-row planes; prompt-scale passes use the model's
+    // shared tap pool (Impl::TapRows). C4 with exact lines: ~430 MiB less
+    // device memory, same speed. VOIDINFER_EXL3_SHARE_TAPS=0: private planes.
+    static const bool share_taps=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_TAPS");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool tap_pool=share_prompt_rows && share_taps;
+    const std::size_t tap_plane_bytes=tap_pool?
+        std::min(prompt_tap_plane_bytes,static_cast<std::size_t>(exl3_batch_rows())*kHidden*sizeof(std::uint16_t)):
+        prompt_tap_plane_bytes;
+    if(capture_taps)tap_requirement.add(Exl3ResourceInventory::Domain::device,kTapLayers.size()+1,tap_plane_bytes);
     const auto tap_extent=tap_requirement.units[static_cast<unsigned>(Exl3ResourceInventory::Domain::device)];
     require(tap_extent<=std::numeric_limits<std::size_t>::max(),"target tap extent overflow");
     const auto materialize_taps=[&] {
       if(capture_taps) {
-        const std::size_t tap_bytes=hidden_bytes;
+        const std::size_t tap_bytes=tap_plane_bytes;
         const auto expected_tap_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             impl->persistent_bytes,static_cast<std::size_t>(tap_extent));
         for (std::size_t i = 0; i < kTapLayers.size(); ++i) {
@@ -5070,8 +6140,14 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->persistent_bytes += tap_bytes;
             impl->taps[i] = std::move(tap);
         }
-        impl->embedding_trace = impl->make_private_allocation(hidden_bytes, "allocate E4A embedding trace");
-        impl->persistent_bytes += hidden_bytes;
+        impl->embedding_trace = impl->make_private_allocation(tap_bytes, "allocate E4A embedding trace");
+        impl->persistent_bytes += tap_bytes;
+        // Rows read before any forward wrote them (a pool claim's stale rows,
+        // a restored count) read zeros, never uninitialized bits.
+        if(tap_pool) {
+            for(auto& tap:impl->taps)cuda_check(cudaMemset(tap->ptr,0,tap_bytes),"clear E4A hidden tap");
+            cuda_check(cudaMemset(impl->embedding_trace->ptr,0,tap_bytes),"clear E4A embedding trace");
+        }
         require(impl->persistent_bytes==expected_tap_persistent,"target tap allocation requirement mismatch");
       }
     };
@@ -5087,28 +6163,28 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         accumulation.bytes = shared_linear_requirement.accumulation_bytes;
     }
     const auto* prefill_gate_up_pair=std::getenv(
-        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR");
     require(!prefill_gate_up_pair || std::strcmp(prefill_gate_up_pair,"0")==0 ||
         std::strcmp(prefill_gate_up_pair,"1")==0,
         "target prefill gate/up pair must be 0 or 1");
     const auto* fast_m1_gate_up_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_PAIR");
     require(!fast_m1_gate_up_pair || std::strcmp(fast_m1_gate_up_pair,"0")==0 ||
         std::strcmp(fast_m1_gate_up_pair,"1")==0,
         "FAST same-weight FP16-KV M1 gate/up pair must be 0 or 1");
     const auto* fast_gdn_m1_gate_up_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GDN_M1_GATE_UP_PAIR");
     require(!fast_gdn_m1_gate_up_pair ||
         std::strcmp(fast_gdn_m1_gate_up_pair,"0")==0 ||
         std::strcmp(fast_gdn_m1_gate_up_pair,"1")==0,
         "FAST same-weight FP16-KV GDN M1 gate/up pair must be 0 or 1");
     const auto* fast_m1_kv_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_PAIR");
     require(!fast_m1_kv_pair || std::strcmp(fast_m1_kv_pair,"0")==0 ||
         std::strcmp(fast_m1_kv_pair,"1")==0,
         "FAST same-weight FP16-KV M1 K/V pair must be 0 or 1");
     const auto* fast_m1_kv_wide_pair=std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_KV_WIDE_PAIR");
     require(!fast_m1_kv_wide_pair || std::strcmp(fast_m1_kv_wide_pair,"0")==0 ||
         std::strcmp(fast_m1_kv_wide_pair,"1")==0,
         "FAST same-weight FP16-KV M1 wide K/V pair must be 0 or 1");
@@ -5132,7 +6208,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         (fast_gdn_m1_gate_up_pair && std::strcmp(fast_gdn_m1_gate_up_pair,"1")==0)))
         paired_up_transformed.bytes=shared_linear_requirement.transformed_bytes;
     Exl3CudaLayerScratchView scratch;
-    const auto* coalesce_scratch=std::getenv("NINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP");
+    const auto* coalesce_scratch=std::getenv("VOIDINFER_EXL3_ATTENTION_COALESCE_INPUT_MLP");
     require(!coalesce_scratch || std::strcmp(coalesce_scratch,"0")==0 || std::strcmp(coalesce_scratch,"1")==0,
         "attention scratch coalescing must be 0 or 1");
     impl->coalesce_attention_input_mlp=coalesce_scratch && std::strcmp(coalesce_scratch,"1")==0;
@@ -5148,6 +6224,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     }
     if (gdn_wide_slab_enabled) {
         gdn_wide_scratch.bytes = Exl3GdnLayer::wide_scratch_bytes(impl->prefill_capacity);
+        if(impl->exact_line_storage && exact_line_compact_gdn.load())
+            gdn_wide_scratch.private_rows=static_cast<int>(Exl3GdnScratchReuseContract::line_private_history_rows);
     }
     const auto visit_shared_allocations=[&](auto&& allocate) {
         if(accumulation.bytes)allocate(accumulation.bytes,reinterpret_cast<void**>(&accumulation.data),"allocate shared target accumulation");
@@ -5161,12 +6239,41 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         if(scratch.bytes)allocate(scratch.bytes,&scratch.data,"allocate shared target layer scratch");
         if(gdn_wide_scratch.bytes)allocate(gdn_wide_scratch.bytes,&gdn_wide_scratch.data,"allocate shared GDN wide slab");
     };
+    // An exact VeriCache line (asynchronous / folded verification) never runs
+    // a prompt-scale pass while its drafting context does: they share it.
+    static const bool share_prompt_pool_env=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    const bool share_prompt_pool=share_prompt_pool_env || exl3_exact_line_shares_prompt_workspace();
+    const bool tiered=share_prompt_pool && scratch.bytes!=0;
+    require(!tiered || (accumulation.bytes && transformed.bytes),
+        "shared prompt pool requires shared accumulation and transform views");
     std::size_t shared_bytes=0,shared_owners=0;
-    visit_shared_allocations([&](std::size_t bytes,void**,const char*) {
+    if(!tiered)visit_shared_allocations([&](std::size_t bytes,void**,const char*) {
         shared_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(shared_bytes,bytes);++shared_owners;
     });
     const auto materialize_shared=[&] {
-    if(shared_owners) {
+    if(tiered) {
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        auto& pool=impl->model->shared_prompt_pool;
+        std::array<void**,6> views{{reinterpret_cast<void**>(&accumulation.data),
+            reinterpret_cast<void**>(&paired_up_accumulation.data),reinterpret_cast<void**>(&transformed.data),
+            reinterpret_cast<void**>(&paired_up_transformed.data),&scratch.data,&gdn_wide_scratch.data}};
+        const std::array<std::size_t,6> extents{{accumulation.bytes,paired_up_accumulation.bytes,transformed.bytes,
+            paired_up_transformed.bytes,scratch.bytes,gdn_wide_scratch.bytes}};
+        if(!pool) {
+            auto created=std::make_shared<Exl3SharedPromptPool>();
+            for(std::size_t i=0;i<views.size();++i)if(extents[i]) {
+                cuda_check(cudaMalloc(&created->data[i],extents[i]),"allocate shared prompt pool");
+                created->bytes[i]=extents[i];
+            }
+            pool=std::move(created);
+        }
+        require(pool->bytes==extents,"shared prompt pool geometry differs between contexts");
+        for(std::size_t i=0;i<views.size();++i)*views[i]=pool->data[i];
+        impl->shared_prompt_pool=pool;
+    } else if(shared_owners) {
         const auto expected_bytes=Exl3LinearWorkspaceRequirements::append_owned_bytes(impl->persistent_bytes,shared_bytes);
         require(shared_owners<=impl->allocations.max_size()-impl->allocations.size(),"target shared owner capacity overflow");
         const auto expected_owners=impl->allocations.size()+shared_owners;
@@ -5185,12 +6292,27 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         ? 17408 : (numeric_prefill_k7_enabled ? kHidden : 17408);
     const bool numeric_workspace_transpose =
         fast_same_weights_all_model_shapes || !numeric_prefill_k7_enabled;
-    const auto numeric_requirement=numeric_prefill_workspace_enabled?
+    static const bool share_prompt_workspace_env=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    const bool share_prompt_workspace=share_prompt_workspace_env || exl3_exact_line_shares_prompt_workspace();
+    std::shared_ptr<Exl3CudaReconstructGemmWorkspace> shared_numeric;
+    if(share_prompt_workspace && numeric_prefill_workspace_enabled) {
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        shared_numeric=impl->model->shared_numeric_workspace;
+    }
+    const auto numeric_requirement=numeric_prefill_workspace_enabled && !shared_numeric?
         Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
             numeric_workspace_in,numeric_workspace_out,
             impl->gdn_bulk_capacity ? impl->gdn_bulk_capacity : impl->prefill_capacity,
-            numeric_workspace_transpose):0;
+            numeric_workspace_transpose,fast_same_weights_all_model_shapes):0;
     const auto materialize_numeric=[&] {
+      if(shared_numeric) {
+        impl->numeric_prefill_projection_workspace=shared_numeric;
+        impl->numeric_prefill_workspace_borrowed=true;
+        return;
+      }
       if(numeric_requirement) {
         const auto expected_numeric_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             impl->persistent_bytes,numeric_requirement);
@@ -5202,6 +6324,11 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 fast_same_weights_all_model_shapes);
         require(impl->numeric_prefill_projection_workspace->workspace_bytes()==numeric_requirement,
             "target numeric projection requirement mismatch");
+        if(share_prompt_workspace) {
+            std::lock_guard lock(impl->model->shared_numeric_mutex);
+            if(!impl->model->shared_numeric_workspace)
+                impl->model->shared_numeric_workspace=impl->numeric_prefill_projection_workspace;
+        }
         impl->persistent_bytes=expected_numeric_persistent;
       }
     };
@@ -5234,7 +6361,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
       }
     };
     const auto head_requirement=Exl3LinearWorkspaceRequirements::derive(kHidden,kVocab,1);
-    const auto* resident_option=std::getenv("NINFER_EXL3_PREFILL_GDN_RESIDENT");
+    const auto* resident_option=std::getenv("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT");
     const bool resident_required=impl->gaming[Gopt::GdnSmallResident] ||
         (resident_option?std::strcmp(resident_option,"1")==0:
         (qualified_default_group && scratch.bytes!=0));
@@ -5247,19 +6374,20 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                 impl->coalesce_attention_input_mlp):
             Exl3GdnLayer::workspace_bytes_required(impl->prefill_capacity,
                 accumulation.bytes!=0,transformed.bytes!=0,scratch.bytes!=0,
-                gdn_wide_scratch.bytes!=0,resident_required);
-        required_layer_group=Exl3LinearWorkspaceRequirements::append_owned_bytes(
+                gdn_wide_scratch.bytes!=0,resident_required,gdn_wide_scratch.private_rows);
+        // Concurrent lanes' full-attention layers may borrow every buffer.
+        if(layer_requirements[layer])required_layer_group=Exl3LinearWorkspaceRequirements::append_owned_bytes(
             required_layer_group,layer_requirements[layer]);
     }
-    const char* media=std::getenv("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH");
+    const char* media=std::getenv("VOIDINFER_EXL3_MEDIA_EXECUTION_RESEARCH");
     require(!media||std::strcmp(media,"0")==0||std::strcmp(media,"1")==0,"media research option must be0 or1");
     const bool media_enabled=enable_qualified_media || (media && std::strcmp(media,"1")==0);
     require(!media_enabled || (impl->host_kv.enabled&&!impl->oscar_only&&!impl->continuation_graph_b8_enabled),
         "media research requires ordinary eager host context");
-    const char* device_prefix=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
-    const char* segmented_prefix=std::getenv("NINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
+    const char* device_prefix=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+    const char* segmented_prefix=std::getenv("VOIDINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
     const char* forward_publish_prefix=std::getenv(
-        "NINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH");
+        "VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH");
     require(!segmented_prefix || std::strcmp(segmented_prefix,"0")==0 || std::strcmp(segmented_prefix,"1")==0,
         "segmented device prefix must be0 or1");
     impl->segmented_device_prefix=allocate_device_prefix && segmented_prefix && std::strcmp(segmented_prefix,"1")==0;
@@ -5271,7 +6399,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     require(!device_prefix||std::strcmp(device_prefix,"0")==0||std::strcmp(device_prefix,"1")==0,"device prefix option must be0 or1");
     int cache_rows=0;
     if(allocate_device_prefix && device_prefix && std::strcmp(device_prefix,"1")==0) {
-        const char* row_option=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
+        const char* row_option=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
         require(!row_option||std::strcmp(row_option,"4096")==0||std::strcmp(row_option,"16384")==0,"device prefix row menu4096/16384");
         cache_rows=row_option?std::atoi(row_option):4096;
         require(!impl->device_prefix_forward_publish ||
@@ -5280,7 +6408,7 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         require(impl->host_kv.enabled&&impl->host_kv_pinned_chunks&&!impl->oscar_only&&!impl->continuation_graph_b8_enabled&&max_context_>=cache_rows,
             "device prefix requires ordinary eager pinned HostKV context covering reserved rows");
     }
-    const auto* greedy=std::getenv("NINFER_EXL3_DEVICE_GREEDY");
+    const auto* greedy=std::getenv("VOIDINFER_EXL3_DEVICE_GREEDY");
     require(!greedy || std::strcmp(greedy,"0")==0 || std::strcmp(greedy,"1")==0,"device greedy must be0 or1");
     const bool greedy_enabled=!greedy || std::strcmp(greedy,"1")==0;
     // Check the combined delayed groups before creating any of their storage.
@@ -5387,13 +6515,73 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     // buffers; the closure retains all partial construction in Impl on failure.
     const auto construct=[&]() -> std::unique_ptr<Exl3TextContext> {
     impl->constructor_authority=authority;
-    materialize_base();
-    materialize_kv();
-    materialize_taps();
-    materialize_shared();
-    materialize_numeric();
-    materialize_reconstruction();
-    materialize_attention();
+    static const bool memory_trace=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    const auto trace_stage=[&](const char* stage) {
+        if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE %s persistent=%.1f MiB\n",stage,
+            impl->persistent_bytes/1048576.0);
+    };
+    materialize_base();trace_stage("base");
+    materialize_kv();trace_stage("kv");
+    materialize_taps();trace_stage("taps");
+    materialize_shared();trace_stage("shared");
+    if(share_prompt_rows) {
+        require(tiered,"shared prompt hidden planes require the tiered prompt pool");
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        auto& pool=impl->model->shared_hidden;
+        if(!pool) {
+            auto created=std::make_shared<Exl3SharedPromptPool>();
+            for(std::size_t i=0;i<2;++i) {
+                cuda_check(cudaMalloc(&created->data[i],hidden_bytes),"allocate shared prompt hidden plane");
+                created->bytes[i]=hidden_bytes;
+            }
+            pool=std::move(created);
+        }
+        require(pool->bytes[0]==hidden_bytes,"shared prompt hidden geometry differs between contexts");
+        if(capture_taps && tap_pool) {
+            auto& taps=impl->model->shared_taps;
+            if(!taps) {
+                auto created=std::make_shared<Exl3SharedTapPool>();
+                for(auto& plane:created->data) {
+                    cuda_check(cudaMalloc(&plane,prompt_tap_plane_bytes),"allocate shared tap pool plane");
+                    cuda_check(cudaMemset(plane,0,prompt_tap_plane_bytes),"clear shared tap pool plane");
+                }
+                created->bytes=prompt_tap_plane_bytes;
+                taps=std::move(created);
+            }
+            require(taps->bytes==prompt_tap_plane_bytes,"shared tap pool geometry differs between contexts");
+            impl->shared_taps=taps;
+        }
+        impl->large_hidden_a=static_cast<std::uint16_t*>(pool->data[0]);
+        impl->large_hidden_b=static_cast<std::uint16_t*>(pool->data[1]);
+        impl->shared_hidden=pool;
+    }
+    if(share_prompt_rows && impl->fast_wmma32_split_capacity) {
+        constexpr std::size_t rows=1024;
+        const std::array<std::size_t,2> extents{{
+            static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*rows*kQHeads*kHeadDim*sizeof(float),
+            static_cast<std::size_t>(impl->fast_wmma32_split_capacity)*rows*kQHeads*2*sizeof(float)}};
+        std::lock_guard lock(impl->model->shared_numeric_mutex);
+        auto& pool=impl->model->shared_wmma;
+        if(!pool) {
+            auto created=std::make_shared<Exl3SharedPromptPool>();
+            for(std::size_t i=0;i<extents.size();++i) {
+                cuda_check(cudaMalloc(&created->data[i],extents[i]),"allocate shared WMMA32 partials");
+                created->bytes[i]=extents[i];
+            }
+            pool=std::move(created);
+        }
+        require(pool->bytes[0]==extents[0] && pool->bytes[1]==extents[1],
+            "shared WMMA32 partial geometry differs between contexts");
+        impl->fast_wmma32_split2_output=static_cast<float*>(pool->data[0]);
+        impl->fast_wmma32_split2_stats=static_cast<float*>(pool->data[1]);
+        impl->shared_wmma=pool;
+    }
+    if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE shared accum=%.1f paired=%.1f transform=%.1f paired_t=%.1f scratch=%.1f wide=%.1f prefill_capacity=%d\n",
+        accumulation.bytes/1048576.0,paired_up_accumulation.bytes/1048576.0,transformed.bytes/1048576.0,
+        paired_up_transformed.bytes/1048576.0,scratch.bytes/1048576.0,gdn_wide_scratch.bytes/1048576.0,impl->prefill_capacity);
+    materialize_numeric();trace_stage("numeric");
+    materialize_reconstruction();trace_stage("reconstruction");
+    materialize_attention();trace_stage("attention");
     require(impl->allocations.size()==expected_generic_owners &&
         impl->allocations.capacity()==reserved_generic_capacity,
         "target generic owner plan changed during device construction");
@@ -5409,8 +6597,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl->model->layers[layer].full_attention) {
             const auto layer_requirement=layer_requirements[layer];
-            const auto expected_layer_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
-                impl->persistent_bytes,layer_requirement);
+            const auto expected_layer_persistent=layer_requirement?Exl3LinearWorkspaceRequirements::append_owned_bytes(
+                impl->persistent_bytes,layer_requirement):impl->persistent_bytes;
             if(startup_fault==18) {
                 require(!transformed.data,"attention constructor failure fixture requires owned transform");
                 Exl3CudaLinearWorkspace::fail_constructor_cleanup_for_test(true);
@@ -5433,10 +6621,14 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
                     static_cast<std::uint64_t>(impl->prefill_capacity)*kHidden*sizeof(std::uint16_t);
             }
             impl->full_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
+            impl->full_layers[layer]->set_l0_scratch_owner(impl.get());
+            if(exact_line)impl->full_layers[layer]->set_l0_exact_only(true);
             impl->full_layers[layer]->set_kv_cache(
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_k->ptr:impl->cache_k[layer]->ptr),
                 impl->oscar_only?nullptr:static_cast<std::uint16_t*>(impl->host_kv.enabled?impl->host_layer_v->ptr:impl->cache_v[layer]->ptr), max_context_);
             impl->full_layers[layer]->set_position_device(impl->position_device);
+            impl->full_layers[layer]->set_rope_map(impl->position_device+4);
+            cuda_check(cudaMemset(impl->position_device+4,0,4*sizeof(int)),"clear rope map");
             impl->full_layers[layer]->set_exact_attention_scores(exact_scores,16);
             impl->full_layers[layer]->set_exact_attention_q_shared(exact_q_shared_enabled);
             impl->full_layers[layer]->set_exact_attention_query_pair(query_pair_enabled);
@@ -5503,14 +6695,33 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
             impl->persistent_bytes=expected_layer_persistent;
             impl->gdn_layers[layer]->set_reconstructed_exact(reconstructed_exact_view);
             impl->gdn_layers[layer]->set_chain_rows_device(impl->position_device+1);
-            // NINFER_EXL3_GDN_STATE_TRACE=1 restores the per-forward state-before
+            // VOIDINFER_EXL3_GDN_STATE_TRACE=1 restores the per-forward state-before
             // copy; the HostKV recurrent-trace checkpoint alias always keeps it.
             static const bool keep_state_trace=[] {
-                const char* value=std::getenv("NINFER_EXL3_GDN_STATE_TRACE");
+                const char* value=std::getenv("VOIDINFER_EXL3_GDN_STATE_TRACE");
                 return value && std::strcmp(value,"1")==0;
             }();
             impl->gdn_layers[layer]->set_skip_state_trace(
                 !keep_state_trace && !impl->host_kv_transaction_recurrent_trace_enabled);
+        }
+    }
+    {
+        static const bool gdn_live=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_GDN_LIVE_CHECKPOINT");
+            if(value)return std::strcmp(value,"0")!=0;
+            const char* shared=std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE");
+            return shared && std::strcmp(shared,"1")==0;
+        }();
+        if(gdn_live && Exl3NativeContextExtent::l0_oscar_enabled() &&
+           !impl->host_kv_transaction_recurrent_trace_enabled) {
+            impl->gdn_live=true;
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&impl->gdn_write_flag),sizeof(int)),
+                "allocate GDN live write flag");
+            cuda_check(cudaMemset(impl->gdn_write_flag,1,sizeof(int)),"initialize GDN live write flag");
+            for(auto& layer:impl->gdn_layers)if(layer) {
+                layer->set_state_write_flag(impl->gdn_write_flag);
+                impl->gdn_recurrent_total_bytes+=layer->recurrent_state_bytes();
+            }
         }
     }
     for (int layer = 0; layer + 1 < kLayers; ++layer) {
@@ -5524,6 +6735,79 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         else if (impl->full_layers[layer]) impl->full_layers[layer]->set_next_layer_prefetch(next);
     }
     require(impl->persistent_bytes==expected_layer_group,"target complete layer group requirement mismatch");
+    trace_stage("layers");
+    if(tiered) {
+        // Four (eight) agents' verifier rows; the compact exact line's <= 8-row
+        // forwards (its wider passes take the prompt tier).
+        const bool line=impl->exact_line_storage && exact_line_compact_gdn.load();
+        // Eight-lane Engines (VOIDINFER_EXL3_SHARED_BATCH_TIER=0 keeps one
+        // private 64-row tier per context): 32 private rows plus the model's
+        // shared 64-row batch views.
+        static const bool shared_batch=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_SHARED_BATCH_TIER");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        const bool split_batch=!line && shared_batch && exl3_batch_rows()>32;
+        const int small_rows=line?static_cast<int>(Exl3GdnScratchReuseContract::line_private_history_rows):
+            split_batch?32:exl3_batch_rows();
+        const bool paired_accumulation=paired_up_accumulation.data!=nullptr;
+        const bool paired_transform=paired_up_transformed.data!=nullptr;
+        const auto align=[](std::size_t bytes){return (bytes+255)&~std::size_t{255};};
+        // One tier's views at `rows`, carved from `storage` (null: total bytes only).
+        const auto tier=[&](int rows,void* storage,Exl3SmallTierViews* out) {
+            const auto small=Exl3LinearWorkspaceRequirements::derive(17408,17408,rows);
+            // The widest small-tier use is the paired 16-row gate/up route (two
+            // stacked 10-partition planes) = 32-row M32 calls at 5 partitions x 4.
+            const std::size_t accumulation_bytes=small.accumulation_bytes*2;
+            const std::size_t transform_bytes=small.transformed_bytes*2;
+            const std::size_t scratch_bytes=std::max(Exl3GdnLayer::shared_scratch_bytes(rows),
+                Exl3FullAttentionLayer::shared_scratch_bytes(rows,false));
+            const std::size_t paired_accumulation_bytes=paired_accumulation?accumulation_bytes:0;
+            const std::size_t paired_transform_bytes=paired_transform?transform_bytes:0;
+            const std::size_t total=align(accumulation_bytes)+align(paired_accumulation_bytes)+
+                align(transform_bytes)+align(paired_transform_bytes)+align(scratch_bytes);
+            if(!out)return total;
+            auto* cursor=static_cast<std::byte*>(storage);
+            const auto carve=[&](std::size_t bytes) {auto* p=bytes?cursor:nullptr;cursor+=align(bytes);return p;};
+            out->rows=rows;
+            out->accumulation={reinterpret_cast<float*>(carve(accumulation_bytes)),accumulation_bytes};
+            out->paired_up_accumulation={reinterpret_cast<float*>(carve(paired_accumulation_bytes)),paired_accumulation_bytes};
+            out->transformed={reinterpret_cast<std::uint16_t*>(carve(transform_bytes)),transform_bytes};
+            out->paired_up_transformed={reinterpret_cast<std::uint16_t*>(carve(paired_transform_bytes)),paired_transform_bytes};
+            out->scratch={carve(scratch_bytes),scratch_bytes};
+            return total;
+        };
+        const std::size_t total=tier(small_rows,nullptr,nullptr);
+        cuda_check(cudaMalloc(&impl->small_tier_storage,total),"allocate context small tier");
+        Exl3SmallTierViews views;
+        tier(small_rows,impl->small_tier_storage,&views);
+        views.large_paired_up_accumulation=paired_up_accumulation.data;
+        views.large_paired_up_transformed=paired_up_transformed.data;
+        Exl3SmallTierViews batch_views;
+        if(split_batch) {
+            const auto& model_impl=*impl->model;
+            std::lock_guard lock(model_impl.shared_batch_tier_mutex);
+            if(!model_impl.shared_batch_tier) {
+                auto created=std::make_shared<Exl3TextModel::Impl::SharedBatchTier>();
+                const int rows=exl3_batch_rows();
+                const std::size_t bytes=tier(rows,nullptr,nullptr);
+                cuda_check(cudaMalloc(&created->storage,bytes),"allocate shared batch tier");
+                tier(rows,created->storage,&created->views);
+                cuda_check(cudaEventCreateWithFlags(&created->done,cudaEventDisableTiming),"shared batch tier event");
+                if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE shared_batch_tier=%.1f MiB\n",bytes/1048576.0);
+                model_impl.shared_batch_tier=std::move(created);
+            }
+            impl->batch_tier=model_impl.shared_batch_tier;
+            batch_views=impl->batch_tier->views;
+            batch_views.large_paired_up_accumulation=paired_up_accumulation.data;
+            batch_views.large_paired_up_transformed=paired_up_transformed.data;
+            views.batch=&batch_views;
+        }
+        for(auto& layer:impl->full_layers)if(layer)layer->enable_small_tier(views);
+        for(auto& layer:impl->gdn_layers)if(layer)layer->enable_small_tier(views);
+        impl->small_tier_rows=small_rows;
+        if(memory_trace)std::fprintf(stderr,"MEMORY_TRACE small_tier=%.1f MiB\n",total/1048576.0);
+    }
     require(impl->persistent_bytes==expected_delayed_persistent,"target delayed construction requirement mismatch");
     if (impl->continuation_graph_gdn_qkvz_concurrent) {
         const auto expected_graph_z_persistent=Exl3LinearWorkspaceRequirements::append_owned_bytes(
@@ -5657,6 +6941,8 @@ Exl3TextModel::ContextConstruction Exl3TextModel::create_context_impl(
         impl->host_kv_retirement_failure_for_test=startup_fault==7;
         throw std::runtime_error("injected context post-transfer construction failure");
     }
+    // The lane KV source exists before any other thread can query residency.
+    impl->ensure_kv_source();
     auto result = std::unique_ptr<Exl3TextContext>(new Exl3TextContext(std::move(impl)));
     struct WrappedStartupRetirement {
         std::unique_ptr<Exl3TextContext>& owner;
@@ -5884,11 +7170,11 @@ void Exl3TextContext::reserve_reconstruction_lanes(Exl3VeriCacheServingCoordinat
     std::span<Exl3TextContext*> contexts,bool allow_budget_fallback) {
     require(ReconstructionBacking::quarantined_allocations.load(std::memory_order_acquire)==0,
         "unresolved reconstruction allocation cleanup; reservation refused");
-    require(!contexts.empty() && contexts.size()<=2,"reconstruction reservation lane count");
+    require(!contexts.empty() && contexts.size()<=8,"reconstruction reservation lane count");
     using Inventory=Exl3ResourceInventory;
     Inventory::Requirement required;required.configuration=0x524543534c;
-    std::array<std::size_t,2> attached_persistent{};
-    std::array<std::size_t,2> attached_public_persistent{};
+    std::array<std::size_t,8> attached_persistent{};
+    std::array<std::size_t,8> attached_public_persistent{};
     bool needed=false;
     for(std::size_t i=0;i<contexts.size();++i) {
         auto* context=contexts[i];
@@ -5920,7 +7206,7 @@ void Exl3TextContext::reserve_reconstruction_lanes(Exl3VeriCacheServingCoordinat
         required.add(Inventory::Domain::host_metadata,1,sizeof(ReconstructionBacking)+ReconstructionBacking::control_bytes+sizeof(DeviceAllocation::Retained));
     }
     if(!needed)return;
-    std::array<std::shared_ptr<ReconstructionBacking>,2> pending;
+    std::array<std::shared_ptr<ReconstructionBacking>,8> pending;
     const auto quarantine_before=ReconstructionBacking::quarantined_allocations.load(std::memory_order_acquire);
     bool factory_entered=false;
     try {
@@ -5987,7 +7273,7 @@ Exl3TextContext::~Exl3TextContext() {
     const auto retired=exl3_retire_reconstruction_device(impl_->reconstruction_backing->device,
         [](int* device) noexcept {return static_cast<int>(cudaGetDevice(device));},
         [](int device) noexcept {return static_cast<int>(cudaSetDevice(device));},
-        []() noexcept {return static_cast<int>(cudaDeviceSynchronize());},
+        []() noexcept {return static_cast<int>(voidinfer::cuda_device_synchronize_outside_capture());},
         [&]() noexcept {impl_.reset();},impl_->reconstruction_retirement_failure_for_test);
     if(retired.released)return;
     static std::atomic<Impl*> quarantine{nullptr};
@@ -5996,10 +7282,10 @@ Exl3TextContext::~Exl3TextContext() {
     auto* head=quarantine.load(std::memory_order_relaxed);
     do {retained->reconstruction_quarantine_next=head;}
     while(!quarantine.compare_exchange_weak(head,retained,std::memory_order_release,std::memory_order_relaxed));
-    ::ninfer::exl3::reconstruction_quarantined_contexts.fetch_add(1,std::memory_order_release);
+    ::voidinfer::exl3::reconstruction_quarantined_contexts.fetch_add(1,std::memory_order_release);
 }
 std::size_t Exl3TextContext::reconstruction_quarantined_contexts() noexcept {
-    return ::ninfer::exl3::reconstruction_quarantined_contexts.load(std::memory_order_acquire);
+    return ::voidinfer::exl3::reconstruction_quarantined_contexts.load(std::memory_order_acquire);
 }
 std::size_t Exl3TextContext::host_kv_quarantined_contexts() noexcept {
     return hostkv_quarantined_contexts.load(std::memory_order_acquire);
@@ -6895,7 +8181,7 @@ std::uint64_t Exl3TextContext::Impl::allocation_owner_metadata_bytes() const {
         requirement.add(Domain::host_metadata,1,Exl3CudaLinearWorkspace::metadata_bytes());
     if(impl_->prefill_qkv_v_workspace)
         requirement.add(Domain::host_metadata,1,Exl3CudaLinearWorkspace::metadata_bytes());
-    if(impl_->numeric_prefill_projection_workspace)
+    if(impl_->numeric_prefill_projection_workspace && !impl_->numeric_prefill_workspace_borrowed)
         requirement.add(Domain::host_metadata,1,sizeof(Exl3CudaReconstructGemmWorkspace));
     for(const auto& staging:impl_->host_kv_pinned_staging)if(staging)
         requirement.add(Domain::host_metadata,1,sizeof(PinnedHostBuffer));
@@ -6993,6 +8279,37 @@ Exl3TextContext::host_kv_mlp_tail_graph_stats() const noexcept {
         impl_->host_kv_mlp_tail_graph_capture_ms};
 }
 int Exl3TextContext::rope_offset() const noexcept {return impl_->rope_offset;}
+
+void Exl3TextContext::set_rope_map(std::span<const std::int32_t> rows_thw,int delta,cudaStream_t stream) {
+    require(rows_thw.size()%3==0 && rows_thw.size()/3<=static_cast<std::size_t>(impl_->max_context),
+        "rope map table extent");
+    struct {std::int32_t rows,delta;const void* table;} map{
+        static_cast<std::int32_t>(rows_thw.size()/3),delta,nullptr};
+    if(!rows_thw.empty()) {
+        impl_->rope_table.reserve(rows_thw.size_bytes(),stream);
+        cuda_check(cudaMemcpyAsync(impl_->rope_table.ptr,rows_thw.data(),rows_thw.size_bytes(),
+            cudaMemcpyHostToDevice,stream),"upload rope map table");
+        map.table=impl_->rope_table.ptr;
+    }
+    static_assert(sizeof(map)==4*sizeof(int));
+    cuda_check(cudaMemcpyAsync(impl_->position_device+4,&map,sizeof(map),cudaMemcpyHostToDevice,stream),
+        "upload rope map");
+    // Pageable sources: fence before `map` and the caller's table go away.
+    cuda_check(cudaStreamSynchronize(stream),"fence rope map upload");
+}
+
+std::uint16_t* Exl3TextContext::media_rows_buffer(std::size_t rows,cudaStream_t stream) {
+    impl_->media_embeddings.reserve(rows*kHidden*sizeof(std::uint16_t),stream);
+    return static_cast<std::uint16_t*>(impl_->media_embeddings.ptr);
+}
+
+void Exl3TextContext::set_media_rows(std::vector<MediaRowSpan> spans) {
+    for(const auto& span:spans)
+        require(span.first>=0 && span.rows>0 && span.first+span.rows<=impl_->max_context &&
+            (span.offset+static_cast<std::size_t>(span.rows))*kHidden*sizeof(std::uint16_t)<=
+                impl_->media_embeddings.bytes,"media prompt row span");
+    impl_->media_spans=std::move(spans);
+}
 Exl3ReconstructGemmStats Exl3TextContext::numeric_prefill_projection_stats() const noexcept {
     return impl_->numeric_prefill_projection_workspace
         ? impl_->numeric_prefill_projection_workspace->stats()
@@ -7061,6 +8378,10 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     impl_->drain_continuation_graph_uses();
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
+    // Every request starts with text positions; a vision request sets its
+    // map and media rows after the reset.
+    cuda_check(cudaMemsetAsync(impl_->position_device+4,0,4*sizeof(int),stream),"reset rope map");
+    impl_->media_spans.clear();
     // A captured decode graph is bound to the prior eager/OSCAR lifecycle.
     // Invalidate its admission immediately; the objects are replaced on the
     // next synchronized capture, after reset/reingest work on this stream.
@@ -7068,6 +8389,7 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     impl_->graph_capture_active = false;
     impl_->graph_reason = "not captured after context reset";
     if(!preserve_exact_payload) {
+    impl_->kv_rewrite_pending=0;
     impl_->resident_exact_state_id=0;
     impl_->exact_prefix_pages.clear();
     if(impl_->device_prefix && !impl_->device_prefix_shared)impl_->device_prefix->invalidate();
@@ -7148,24 +8470,15 @@ void Exl3TextContext::reset_impl(cudaStream_t stream,bool preserve_exact_payload
     cuda_check(cudaMemsetAsync(impl_->position_device, 0, 3*sizeof(int), stream),
                "reset E4B2 position parameter");
     if (impl_->oscar) impl_->oscar->reset();
+    for (auto& layer : impl_->full_layers)
+        if (layer) layer->l0_reset_history(stream);
     position_ = 0;
-    impl_->l0_planes_valid_from = 0;
     for(auto& chunks:impl_->l0_prefix_chunks) chunks.clear();
     impl_->tap_rows = 0;
     impl_->embedding_rows = 0;
     impl_->last_rows = 0;
-    impl_->last_hidden_source = nullptr;
-    impl_->last_hidden_source_rows = 0;
-    impl_->last_hidden_source_first_row = 0;
-    impl_->last_hidden_source_position = 0;
-    if (++impl_->last_hidden_generation == 0)
-        throw std::overflow_error("native MTP hidden generation exhausted");
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     }
-    // A request/context reset revokes every previously captured hidden range,
-    // including a preserved exact HostKV root.  The prepared allocation stays
-    // owned for reuse, but no row from the prior request may be exposed.
-    impl_->invalidate_native_mtp_hidden_capture();
     last_decode_h2d_ = 0;
     impl_->qkv_trace_valid = false;
     if (impl_->transaction) impl_->transaction->rollback_required = false;
@@ -7180,11 +8493,13 @@ std::size_t Exl3TextContext::transaction_bytes_required() const {
     require(host_kv || device_kv ||
             (impl_->oscar != nullptr && impl_->oscar->graph_class() == 0),
             "P2 target transaction requires eager OSCAR, HostKV or guarded device KV");
-    std::size_t bytes = 0;
+    // GDN live checkpoint: the recurrent owner is a one-byte sentinel.
+    std::size_t bytes = impl_->gdn_live ? 1 : 0;
     for (const auto& layer : impl_->gdn_layers) {
         if (!layer) continue;
-        bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-            bytes, layer->recurrent_state_bytes());
+        if (!impl_->gdn_live)
+            bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
+                bytes, layer->recurrent_state_bytes());
         bytes = Exl3LinearWorkspaceRequirements::append_owned_bytes(
             bytes, layer->physical_conv_state_bytes());
     }
@@ -7258,7 +8573,9 @@ void Exl3TextContext::prepare_transaction_impl(
                 conv_bytes, layer->physical_conv_state_bytes());
         }
         prepared->gdn_recurrent = allocate(
-            recurrent_bytes, "allocate P2 target recurrent checkpoint");
+            impl_->gdn_live ? 1 : recurrent_bytes,
+            impl_->gdn_live ? "allocate P2 target recurrent checkpoint sentinel" :
+                              "allocate P2 target recurrent checkpoint");
         prepared->gdn_conv = allocate(
             conv_bytes, "allocate P2 target convolution checkpoint");
         auto* recurrent = static_cast<std::byte*>(prepared->gdn_recurrent->ptr);
@@ -7274,15 +8591,18 @@ void Exl3TextContext::prepare_transaction_impl(
                 impl_->host_kv_transaction_recurrent_trace_enabled;
             checkpoint={recurrent_trace_alias ?
                     static_cast<void*>(impl_->gdn_layers[layer]->recurrent_state_before_) :
+                    impl_->gdn_live ?
+                    static_cast<void*>(impl_->gdn_layers[layer]->recurrent_state_) :
                     static_cast<void*>(recurrent),
                 recurrent_size,conv,conv_size};
             checkpoint.recurrent_trace_alias=recurrent_trace_alias;
+            checkpoint.recurrent_live_alias=impl_->gdn_live && !recurrent_trace_alias;
             checkpoint.model_owner=impl_->model->host_state_identity;
             checkpoint.model_layer=layer;
             checkpoint.recurrent_layer_stride_bytes=Exl3GdnRecurrentLayout::recurrent_bytes;
             checkpoint.convolution_layer_stride_bytes=
                 Exl3GdnRecurrentLayout::convolution_storage_bytes;
-            recurrent += recurrent_size;
+            if (!impl_->gdn_live) recurrent += recurrent_size;
             conv += conv_size;
         }
         prepared->oscar_cache = allocate(
@@ -7386,11 +8706,11 @@ void Exl3TextContext::prepare_transaction_impl(
     impl_->transaction = std::move(prepared);
 }
 
-// NINFER_EXL3_CHECKPOINT_OVERLAP (default 1): the device-KV checkpoint graph
+// VOIDINFER_EXL3_CHECKPOINT_OVERLAP (default 1): the device-KV checkpoint graph
 // runs on a side stream; target-state consumers join it (join_repair).
 static bool checkpoint_overlap_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_CHECKPOINT_OVERLAP");
+        const char* value=std::getenv("VOIDINFER_EXL3_CHECKPOINT_OVERLAP");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -7424,6 +8744,8 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                 impl_->last_rows <= impl_->prefill_capacity && impl_->tap_rows == impl_->embedding_rows &&
                 impl_->tap_rows == impl_->last_rows,
             "P2 target transaction captured rows are invalid or inconsistent");
+    if(impl_->tap_rows>16 && std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))
+        std::fprintf(stderr,"TRANSACTION_TAP_ROWS rows=%d position=%d%c",impl_->tap_rows.value,position_,10);
     impl_->validate_target_projection_execution(stream);
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     cuda_check(cudaStreamIsCapturing(stream, &capture_status),
@@ -7456,16 +8778,30 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                                    impl_->position_device,sizeof(int),
                                    cudaMemcpyDeviceToDevice, stream),
                    "save P2 target device position checkpoint");
+        if(impl_->shared_taps) {
+            transaction.tap_first=impl_->read_held_tap_rows(0,stream,
+                [&](int first,const std::array<const std::uint16_t*,6>& planes) {
+                    const std::size_t offset=static_cast<std::size_t>(first)*Impl::tap_row_bytes;
+                    const std::size_t bytes=static_cast<std::size_t>(impl_->tap_rows-first)*Impl::tap_row_bytes;
+                    for(std::size_t tap=0;tap<kTapLayers.size();++tap)
+                        cuda_check(cudaMemcpyAsync(tap_destination+tap*impl_->prefill_capacity*Impl::tap_row_bytes+offset,
+                            planes[tap],bytes,cudaMemcpyDefault,stream),"save P2 target hidden tap checkpoint");
+                    cuda_check(cudaMemcpyAsync(static_cast<std::byte*>(transaction.embedding->ptr)+offset,
+                        planes[5],bytes,cudaMemcpyDefault,stream),"save P2 target embedding checkpoint");
+                });
+            return;
+        }
         for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
             cuda_check(cudaMemcpyAsync(
                 tap_destination + tap * impl_->prefill_capacity * kHidden *
                     sizeof(std::uint16_t),
-                impl_->taps[tap]->ptr,tap_bytes,cudaMemcpyDeviceToDevice,stream),
+                impl_->taps[tap]->ptr,tap_bytes,cudaMemcpyDefault,stream),
                 "save P2 target hidden tap checkpoint");
         cuda_check(cudaMemcpyAsync(transaction.embedding->ptr,
                                    impl_->embedding_trace->ptr,embedding_bytes,
-                                   cudaMemcpyDeviceToDevice,stream),
+                                   cudaMemcpyDefault,stream),
                    "save P2 target embedding checkpoint");
+        transaction.tap_first=0;
     };
     // The ordinary device-KV probe has B2..B8 continuation frontiers. Capture
     // the eight-row allocation extent once so the same graph can checkpoint
@@ -7474,9 +8810,11 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
     const bool device_checkpoint_graph_eligible=
         impl_->device_transaction_checkpoint_graph_enabled && device_kv &&
         impl_->tap_rows<=8 && impl_->prefill_capacity>=8;
+    // The graph copies the private planes from row 0.
     const bool checkpoint_graph_eligible=
-        (impl_->host_kv_transaction_checkpoint_graph_enabled && host_kv &&
-         impl_->tap_rows==1) || device_checkpoint_graph_eligible;
+        ((impl_->host_kv_transaction_checkpoint_graph_enabled && host_kv &&
+         impl_->tap_rows==1) || device_checkpoint_graph_eligible) &&
+        !impl_->tap_rows.in_pool && impl_->tap_rows_identity();
     if(checkpoint_graph_eligible) {
         const std::size_t graph_copy_rows=device_checkpoint_graph_eligible?
             8:static_cast<std::size_t>(impl_->tap_rows);
@@ -7521,11 +8859,11 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                                 tap_destination+tap*impl_->prefill_capacity*kHidden*
                                     sizeof(std::uint16_t),
                                 impl_->taps[tap]->ptr,graph_copy_bytes,
-                                cudaMemcpyDeviceToDevice,capture_stream),
+                                cudaMemcpyDefault,capture_stream),
                             "capture P2 target hidden tap checkpoint");
                     cuda_check(cudaMemcpyAsync(transaction.embedding->ptr,
                             impl_->embedding_trace->ptr,graph_copy_bytes,
-                            cudaMemcpyDeviceToDevice,capture_stream),
+                            cudaMemcpyDefault,capture_stream),
                         "capture P2 target embedding checkpoint");
                     });
                 transaction.checkpoint_graph_executable.instantiate(
@@ -7572,6 +8910,7 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
                     "order checkpoint after overlapped GDN repair");
         }
         transaction.checkpoint_graph_executable.launch(graph_stream);
+        transaction.tap_first=0;
         if(overlap_checkpoint) {
             cuda_check(cudaEventRecord(impl_->checkpoint_join,graph_stream),
                 "record overlapped transaction checkpoint completion");
@@ -7622,6 +8961,8 @@ void Exl3TextContext::begin_transaction(cudaStream_t stream) {
         transaction.host_kv_tail.reset();
     }
     transaction.fresh_snapshot = true;
+    transaction.live_pending = false;
+    transaction.live_host_saved = false;
     transaction.active = true;
 }
 
@@ -7666,21 +9007,25 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
                                sizeof(int), cudaMemcpyDeviceToDevice, stream),
                "restore P2 target device position checkpoint");
     const auto* tap_source = static_cast<const std::byte*>(transaction.taps->ptr);
+    const int tap_first=impl_->tap_write_first(transaction.tap_rows,transaction.tap_first);
+    const std::size_t tap_offset=static_cast<std::size_t>(tap_first)*Impl::tap_row_bytes;
     const std::size_t tap_bytes =
-        static_cast<std::size_t>(transaction.tap_rows) * kHidden * sizeof(std::uint16_t);
+        static_cast<std::size_t>(transaction.tap_rows-tap_first) * kHidden * sizeof(std::uint16_t);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) {
-        cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
-                                   tap_source + tap * impl_->prefill_capacity * kHidden * sizeof(std::uint16_t),
-                                   tap_bytes, cudaMemcpyDeviceToDevice, stream),
+        cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(tap,tap_first),
+                                   tap_source + tap * impl_->prefill_capacity * kHidden * sizeof(std::uint16_t)+tap_offset,
+                                   tap_bytes, cudaMemcpyDefault, stream),
                    "restore P2 target hidden tap checkpoint");
     }
     const std::size_t embedding_bytes =
-        static_cast<std::size_t>(transaction.embedding_rows) * kHidden * sizeof(std::uint16_t);
-    cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr, transaction.embedding->ptr,
-                               embedding_bytes, cudaMemcpyDeviceToDevice, stream),
+        static_cast<std::size_t>(transaction.embedding_rows-tap_first) * kHidden * sizeof(std::uint16_t);
+    cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(5,tap_first),
+                               static_cast<const std::byte*>(transaction.embedding->ptr)+tap_offset,
+                               embedding_bytes, cudaMemcpyDefault, stream),
                "restore P2 target embedding checkpoint");
+    impl_->kv_rows_rewritten_from(transaction.position);
     position_ = transaction.position;
-    impl_->tap_rows = transaction.tap_rows;
+    impl_->publish_tap_rows(transaction.tap_rows,tap_first);
     impl_->embedding_rows = transaction.embedding_rows;
     impl_->last_rows = transaction.last_rows;
     if (host_kv) {
@@ -7696,7 +9041,10 @@ void Exl3TextContext::rollback_transaction(cudaStream_t stream) {
     }
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->qkv_trace_valid = false;
-    impl_->invalidate_native_mtp_hidden_capture();
+    // Live checkpoint: an unrepaired attempt left the root in place; a
+    // state-writing forward saved it to host memory first.
+    impl_->live_restore_host_root(stream);
+    impl_->live_release(stream);
     transaction.rollback_required = false;
     transaction.active = false;
 }
@@ -7715,6 +9063,12 @@ void Exl3TextContext::commit_transaction() {
             "P2 target transaction commit requires its eager OSCAR or exact HostKV mode");
     require(!impl_->transaction->rollback_required,
             "P2 target transaction requires rollback after failed prefix retention");
+    // Full acceptance of a live-checkpoint attempt: the owed repair advances
+    // the root by every attempted row before the transaction closes.
+    if (impl_->gdn_live) {
+        impl_->live_repair_all(transaction.stream);
+        impl_->live_release(transaction.stream);
+    }
     if (impl_->transaction->continuation_graph_attempt) {
         require(impl_->transaction->continuation_graph_rows ==
                     impl_->transaction->attempted_rows,
@@ -8062,7 +9416,59 @@ void Exl3TextContext::set_layer_observer_for_test(
     impl_->layer_observer_user = observer ? user : nullptr;
 }
 
+// Selects the shared prompt pool for passes wider than the context's small
+// tier (concurrent Engine lanes run those exclusively); nests.
+struct Exl3TextContext::PromptTierScope {
+    PromptTierScope(Exl3TextContext& context,std::size_t rows,cudaStream_t stream)
+        : context_(context),impl_(*context.impl_),stream_(stream),
+          // Passes wider than 32 rows use the prompt tier even when the small
+          // tier holds a wider (64-row, eight-lane) batched forward.
+          active_(impl_.small_tier_rows && rows>static_cast<std::size_t>(std::min(impl_.small_tier_rows,32))) {
+        if(active_ && impl_.prompt_tier_depth==0)impl_.select_prompt_tier(true,context_.position_,stream_);
+        if(active_)++impl_.prompt_tier_depth;
+    }
+    ~PromptTierScope() {
+        if(active_ && --impl_.prompt_tier_depth==0)
+            impl_.select_prompt_tier(false,context_.position_,stream_);
+    }
+    PromptTierScope(const PromptTierScope&)=delete;
+    PromptTierScope& operator=(const PromptTierScope&)=delete;
+    Exl3TextContext& context_;
+    Exl3TextContext::Impl& impl_;
+    cudaStream_t stream_;
+    bool active_;
+};
+
+// Selects the model's shared batch views around an owner's batched forward
+// wider than its private small tier. `fence` (eager forwards and replays, not
+// captures) holds the tier's host order and orders the stream after its last use.
+struct Exl3TextContext::BatchTierScope {
+    BatchTierScope(Impl& impl,int rows,cudaStream_t stream,bool fence)
+        : impl_(impl),stream_(stream),active_(impl.batch_tier && rows>impl.small_tier_rows),
+          fence_(active_ && fence) {
+        if(!active_)return;
+        if(fence_) {
+            lock_=std::unique_lock(impl_.batch_tier->mutex);
+            if(impl_.batch_tier->recorded)
+                cuda_check(cudaStreamWaitEvent(stream_,impl_.batch_tier->done,0),"order shared batch tier");
+        }
+        impl_.select_batch_tier(true);
+    }
+    ~BatchTierScope() {
+        if(!active_)return;
+        impl_.select_batch_tier(false);
+        if(fence_)impl_.batch_tier->recorded=cudaEventRecord(impl_.batch_tier->done,stream_)==cudaSuccess;
+    }
+    BatchTierScope(const BatchTierScope&)=delete;
+    BatchTierScope& operator=(const BatchTierScope&)=delete;
+    Impl& impl_;
+    cudaStream_t stream_;
+    bool active_,fence_;
+    std::unique_lock<std::mutex> lock_;
+};
+
 void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStream_t stream) {
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -8078,8 +9484,7 @@ void Exl3TextContext::prefill(std::span<const std::int64_t> token_ids, cudaStrea
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream), "upload E4A prefill token IDs");
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream), "upload E4A prefill token IDs");
     cuda_check(cudaMemsetAsync(impl_->position_device, 0, 3*sizeof(int), stream),
                "set E4B2 prefill position parameter");
     if(impl_->host_kv_prefill_fault_for_test==1) {
@@ -8105,13 +9510,12 @@ void Exl3TextContext::decode(std::int64_t token_id, cudaStream_t stream) {
             "P2 target transaction requires rollback after failed prefix retention");
     require(position_ < impl_->max_context, "E4A context capacity exhausted");
     impl_->validate_target_projection_execution(stream);
+    impl_->live_guard_write(stream);
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, &token_id, sizeof(token_id),
-                               cudaMemcpyHostToDevice, stream), "upload E4A decode token ID");
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &position_, sizeof(position_),
-                               cudaMemcpyHostToDevice, stream), "upload E4B2 decode position");
+    cuda_check(exl3_h2d_async(impl_->token_ids, &token_id, sizeof(token_id), stream), "upload E4A decode token ID");
+    cuda_check(exl3_h2d_async(impl_->position_device, &position_, sizeof(position_), stream), "upload E4B2 decode position");
     ++last_decode_h2d_;
     impl_->process_rows(impl_->token_ids, 1, position_, stream,
                         nullptr, true, false, true);
@@ -8131,6 +9535,7 @@ void Exl3TextContext::append_prefill_wide(std::span<const std::int64_t> token_id
 
 void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_ids,
                                         cudaStream_t stream, bool wide, bool exact) {
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->fast_prefill_failed,"failed layer-major prefill requires context reset");
@@ -8171,15 +9576,12 @@ void Exl3TextContext::append_prefill_impl(std::span<const std::int64_t> token_id
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     if (impl_->continuation) impl_->continuation->rows = 0;
     const int base_position = position_;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream), "upload chunked prefill IDs");
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &base_position, sizeof(base_position),
-                               cudaMemcpyHostToDevice, stream), "upload chunked prefill position");
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream), "upload chunked prefill IDs");
+    cuda_check(exl3_h2d_async(impl_->position_device, &base_position, sizeof(base_position), stream), "upload chunked prefill position");
     impl_->process_rows(impl_->token_ids, rows, base_position, stream,
                         nullptr, true, rows > 1, true, true, wide);
     const int final_position = base_position + rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &final_position, sizeof(final_position),
-                               cudaMemcpyHostToDevice, stream), "publish chunked prefill position");
+    cuda_check(exl3_h2d_async(impl_->position_device, &final_position, sizeof(final_position), stream), "publish chunked prefill position");
     position_ += rows;
     ++last_decode_h2d_;
 }
@@ -8193,17 +9595,93 @@ Exl3TextContext::device_transaction_checkpoint_graph_stats() const noexcept {
 
 bool Exl3TextContext::layer_major_from_zero() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_LAYER_MAJOR_FROM_ZERO");
+        const char* value = std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_FROM_ZERO");
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_LAYER_MAJOR_FROM_ZERO must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_LAYER_MAJOR_FROM_ZERO must be 0 or 1");
     }();
     return enabled;
+}
+
+void Exl3TextContext::continue_rows_for_verification(
+    std::span<const std::int64_t> token_ids,cudaStream_t stream) {
+    const int base=position_;
+    impl_->trace_members=1;impl_->trace_graph=0;impl_->trace_member=0;
+    if(fold_peer_) {
+        // Folded VeriCache: the exact line's block rides along this round.
+        const BatchedPeer peer{fold_peer_,std::span<const std::int64_t>(fold_tokens_),
+            fold_stream_?fold_stream_:stream};
+        fold_peer_=nullptr;
+        continue_rows_batched(std::span<const BatchedPeer>(&peer,1),token_ids,stream);
+    } else if(batched_verify_)batched_verify_->continue_rows(*this,token_ids,stream);
+    else continue_rows(token_ids,stream);
+    auto& trace=impl_->round_traces[impl_->round_trace_next++%impl_->round_traces.size()];
+    trace={base,static_cast<int>(token_ids.size()),impl_->trace_members,impl_->trace_graph,
+        impl_->trace_member};
+}
+
+std::string Exl3TextContext::round_trace(int position) const {
+    for(std::size_t i=0;i<impl_->round_traces.size();++i) {
+        const auto& t=impl_->round_traces[(impl_->round_trace_next+impl_->round_traces.size()-1-i)%
+            impl_->round_traces.size()];
+        if(t.base>=0 && position>=t.base && position<t.base+t.rows)
+            return "base="+std::to_string(t.base)+" rows="+std::to_string(t.rows)+" members="+
+                std::to_string(t.members)+" member="+std::to_string(t.member)+" graph="+std::to_string(t.graph);
+    }
+    return "untraced";
+}
+
+// Free-memory reserve kept beside the layer-major projection cache of L0 OSCAR
+// contexts (VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB, default 1024). Concurrent
+// Engine lanes ingest prompts exclusively, so a smaller reserve is safe there.
+static std::size_t l0_layer_major_reserve_bytes() {
+    static const std::size_t bytes=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB");
+        const long mib=value?std::atol(value):1024;
+        if(mib<64 || mib>8192)
+            throw std::invalid_argument("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB must be 64..8192");
+        return static_cast<std::size_t>(mib)*1024*1024;
+    }();
+    return bytes;
+}
+
+bool Exl3TextContext::l0_layer_major_headroom() const {
+    // Mirrors the projection-cache admission of the layer-major schedule for
+    // L0 OSCAR contexts (1 GiB reserve plus a 256 MiB minimum cache).
+    static const bool row_major=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_ROW_MAJOR_PREFILL");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    if(row_major)return false;
+    std::size_t free_bytes=0,total_bytes=0;
+    cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),"query layer-major headroom");
+    // Concurrent lanes: memory promised to admitted lanes' code growth is not
+    // headroom for cache growth (running on the retained cache allocates nothing).
+    const std::size_t raw_free=free_bytes;
+    free_bytes-=std::min<std::size_t>(free_bytes,reserved_l0_code_growth());
+    const std::size_t existing=impl_->numeric_prefill_projection_workspace?
+        impl_->numeric_prefill_projection_workspace->layer_reuse_bytes():0;
+    const std::size_t reserve=l0_layer_major_reserve_bytes();
+    constexpr std::size_t minimum_cache=256ull*1024*1024;
+    // A retained cache that already covers the minimum needs no growth: half
+    // the reserve then suffices (the block reuses what it holds).
+    if(existing>=minimum_cache && raw_free>=reserve/2)return true;
+    return free_bytes>=reserve && existing+free_bytes-reserve>=minimum_cache;
+}
+
+void Exl3TextContext::set_prefill_yield(std::function<void(cudaStream_t)> yield) {
+    impl_->prefill_yield=std::move(yield);
 }
 
 void Exl3TextContext::append_prefill_layer_major(
     std::span<const std::int64_t> token_ids, cudaStream_t stream,
     const RetainedTapTail* retained_taps) {
+    // The L0 block loop selects the prompt tier per block (each block and
+    // row-major chunk holds its own scope), so a yield between blocks leaves
+    // the shared prompt-scale buffers to other contexts' passes.
+    std::optional<PromptTierScope> prompt_tier;
+    if (!Exl3NativeContextExtent::l0_oscar_enabled() || impl_->l0_layer_major_block)
+        prompt_tier.emplace(*this,token_ids.size(),stream);
     if (Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->l0_layer_major_block) {
         // L0 OSCAR contexts hold per-row buffers for one block of
         // kL0PrefillBlockRows: the suffix is ingested layer-major block by
@@ -8229,18 +9707,44 @@ void Exl3TextContext::append_prefill_layer_major(
                 first += static_cast<std::size_t>(take);
             }
         };
-        constexpr std::size_t block=Exl3NativeContextExtent::l0_prefill_block_rows;
+        // Long suffixes back their FP16 planes ahead of the layers.
+        std::future<void> pregrow;
+        struct PregrowJoin {
+            std::future<void>& future;
+            ~PregrowJoin() {
+                if(future.valid())try{future.get();}catch(...){}
+            }
+        } pregrow_join{pregrow};
+        if(token_ids.size()>4096)
+            pregrow=impl_->pregrow_l0_planes(position_+static_cast<int>(token_ids.size()));
+        const std::size_t block=static_cast<std::size_t>(Exl3NativeContextExtent::l0_prefill_block_rows());
         // Equal blocks of at most `block` rows: every block of a multi-block
         // suffix exceeds block / 2 rows, so the last one holds the tap tail.
         const std::size_t total=token_ids.size();
         const std::size_t count=(total+block-1)/block;
         std::vector<std::pair<std::size_t,std::size_t>> parts;
+        // The retained tap tail (2032..2063 rows) must lie in the last block;
+        // with blocks of fewer rows than 2 x tail (the 4096-row blocks of
+        // concurrent lanes) equal blocks can be shorter than it, so the last
+        // block then takes exactly the tail and the rest splits equally.
+        const std::size_t tail=retained_taps?static_cast<std::size_t>(retained_taps->rows):0;
+        if (count>1 && tail<=block && total/count<tail) {
+            std::size_t earlier=count-1;
+            while (total-tail>earlier*block) ++earlier;
+            for (std::size_t p=0,at=0;p<earlier;++p) {
+                const std::size_t rows=(total-tail-at)/(earlier-p);
+                parts.push_back({at,rows});
+                at+=rows;
+            }
+            parts.push_back({total-tail,tail});
+        } else
         for (std::size_t p=0,at=0;p<count;++p) {
             const std::size_t rows=(total-at)/(count-p);
             parts.push_back({at,rows});
             at+=rows;
         }
         for (std::size_t p = 0; p < parts.size(); ++p) {
+            if (p && impl_->prefill_yield) impl_->prefill_yield(stream);
             auto ids = token_ids.subspan(parts[p].first, parts[p].second);
             const RetainedTapTail* retained = p + 1 == parts.size() ? retained_taps : nullptr;
             if (position_ == 0 && !layer_major_from_zero()) {
@@ -8248,13 +9752,29 @@ void Exl3TextContext::append_prefill_layer_major(
                 prefill(ids.first(initial), stream);
                 ids = ids.subspan(initial);
             }
-            if (ids.size() > 1024) {
+            // The layer-major schedule reuses reconstructed projections from a
+            // bounded device cache; when concurrent lanes leave too little
+            // free memory for it the block runs row-major (same arithmetic
+            // profile as the shorter blocks, slower prefill).
+            const bool layer_major = ids.size() > 1024 && l0_layer_major_headroom();
+            static const bool trace = std::getenv("VOIDINFER_EXL3_MEMORY_TRACE") != nullptr;
+            if (trace) {
+                std::size_t free_bytes = 0, total_bytes = 0;
+                (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+                const std::size_t cached = impl_->numeric_prefill_projection_workspace ?
+                    impl_->numeric_prefill_projection_workspace->stats().cached_weight_capacity_bytes : 0;
+                std::fprintf(stderr, "L0_PREFILL_BLOCK rows=%zu position=%d route=%s free_mib=%zu cache_mib=%zu reserved_mib=%zu\n",
+                    ids.size(), position_, layer_major ? "layer-major" : "row-major", free_bytes >> 20, cached >> 20,
+                    static_cast<std::size_t>(reserved_l0_code_growth() >> 20));
+            }
+            if (layer_major) {
                 impl_->l0_layer_major_block = true;
                 try { append_prefill_layer_major(ids, stream, retained); }
                 catch (...) { impl_->l0_layer_major_block = false; throw; }
                 impl_->l0_layer_major_block = false;
             } else if (!ids.empty()) row_major(ids, retained);
         }
+        if(pregrow.valid())pregrow.get();
         return;
     }
     impl_->join_repair(stream);
@@ -8267,7 +9787,6 @@ void Exl3TextContext::append_prefill_layer_major(
             !impl_->graph_active && !impl_->graph_capture_active &&
             !impl_->layer_observer && !impl_->target_projection_timing &&
             !impl_->target_projection_observer &&
-            !impl_->native_mtp_hidden_capture_active() &&
             (!impl_->transaction ||
              (!impl_->transaction->active && !impl_->transaction->rollback_required)),
             "layer-major prefill requires an idle Fast90 ordinary device-KV context");
@@ -8303,24 +9822,49 @@ void Exl3TextContext::append_prefill_layer_major(
             "layer-major prefill rejects external graph capture");
     impl_->validate_target_projection_execution(stream);
     impl_->retain_host_kv_forward_stream(stream);
+    // Sized under the reuse lock: a concurrent release (Engine admission or
+    // memory pressure) lands before the free-memory query or caps the result.
+    auto budget_lock=impl_->numeric_prefill_projection_workspace->lock_layer_reuse_budget();
     std::size_t free_bytes=0,total_bytes=0;
     cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),
                "budget layer-major projection cache");
+    // L0 OSCAR lanes: the cache grows only beside the code growth promised to
+    // admitted lanes; within that budget it may again reach its full limit
+    // (release_prompt_projection_cache capped it under pressure).
+    const std::size_t raw_free_bytes=free_bytes;
+    if(Exl3NativeContextExtent::l0_oscar_enabled())
+        free_bytes-=std::min<std::size_t>(free_bytes,reserved_l0_code_growth());
     // The guarded device transaction has already retained its physical target
     // and draft owners. Keep a smaller, still explicit free-space reserve for
     // its bounded projection reuse; ordinary routes retain their 2 GiB floor.
     // L0 OSCAR contexts already hold their KV history in compact device codes
     // and the FP16 planes in host memory: a 1 GiB reserve covers the rest.
     const std::size_t reserve_bytes=Exl3NativeContextExtent::l0_oscar_enabled()?
-        1024ull*1024*1024:fast_device_kv_transaction_enabled()?
+        l0_layer_major_reserve_bytes():fast_device_kv_transaction_enabled()?
         1536ull*1024*1024:2ull*1024*1024*1024;
-    constexpr std::size_t cache_limit=1536ull*1024*1024;
+    // VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB (256..1536, default 1536): retained
+    // reconstructed-weight cache; concurrent Engine lanes keep it smaller so
+    // decode keeps device headroom (one layer's projections are ~0.75 GiB).
+    static const std::size_t cache_limit=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB");
+        const long mib=value?std::atol(value):1536;
+        if(mib<256 || mib>1536)
+            throw std::invalid_argument("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB must be 256..1536");
+        return static_cast<std::size_t>(mib)*1024*1024;
+    }();
     constexpr std::size_t minimum_cache=256ull*1024*1024;
     auto& workspace=*impl_->numeric_prefill_projection_workspace;
     const auto existing_cache=workspace.stats().cached_weight_capacity_bytes;
-    if(free_bytes<reserve_bytes ||
-       existing_cache>cache_limit ||
-       existing_cache+free_bytes-reserve_bytes<minimum_cache)
+    const bool growth_room=free_bytes>=reserve_bytes && existing_cache<=cache_limit &&
+        existing_cache+free_bytes-reserve_bytes>=minimum_cache;
+    // L0 OSCAR blocks without room to grow run on the retained cache, which
+    // allocates nothing (concurrent lanes hold the rest). l0_layer_major_headroom
+    // admitted the block; a release since then may have left less than the
+    // minimum, or none (every chunk then reconstructs its projections).
+    const bool reuse_only=Exl3NativeContextExtent::l0_oscar_enabled() &&
+        existing_cache<=cache_limit && !growth_room;
+    (void)raw_free_bytes;
+    if(!reuse_only && !growth_room)
         throw std::runtime_error(
             "layer-major projection cache lacks bounded device headroom: free_mib="+
             std::to_string(free_bytes/(1024*1024))+
@@ -8328,15 +9872,18 @@ void Exl3TextContext::append_prefill_layer_major(
             std::to_string(existing_cache/(1024*1024))+
             " free_reserve_mib="+
             std::to_string(reserve_bytes/(1024*1024)));
-    std::size_t cache_budget=std::min(cache_limit,existing_cache+free_bytes-reserve_bytes);
+    std::size_t cache_budget=reuse_only?existing_cache:
+        std::min(cache_limit,existing_cache+free_bytes-reserve_bytes);
     // L0 OSCAR blocks re-check the reserve before each block: cache growth
     // leaves 256 MiB of slack so later small allocations keep the reserve.
     constexpr std::size_t l0_cache_slack=256ull*1024*1024;
-    if(Exl3NativeContextExtent::l0_oscar_enabled() && cache_budget>=minimum_cache+l0_cache_slack)
+    if(!reuse_only && Exl3NativeContextExtent::l0_oscar_enabled() && cache_budget>=minimum_cache+l0_cache_slack)
         cache_budget=std::max(existing_cache,cache_budget-l0_cache_slack);
     require(workspace.stats().cached_weight_capacity_bytes<=cache_budget,
             "retained layer-major cache exceeds current device budget");
-    const char* injected_layer=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
+    workspace.set_layer_reuse_limit(cache_budget);
+    budget_lock.unlock();
+    const char* injected_layer=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_FAIL_AFTER_LAYER");
     const int fail_after_layer=injected_layer ? std::atoi(injected_layer) : -1;
     require(!injected_layer ||
             (fail_after_layer>=0 && fail_after_layer<kLayers &&
@@ -8348,7 +9895,7 @@ void Exl3TextContext::append_prefill_layer_major(
             for (auto event : events) if (event) cudaEventDestroy(event);
         }
     } layer_profile;
-    const char* profile_option=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
+    const char* profile_option=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
     if (profile_option && std::strcmp(profile_option,"1")==0) {
         layer_profile.events.resize(kLayers+1,nullptr);
         for (auto& event : layer_profile.events)
@@ -8384,8 +9931,8 @@ void Exl3TextContext::append_prefill_layer_major(
     const int chunks = static_cast<int>(chunk_offsets.size());
     const int final_offset = chunk_offsets.back();
     const int final_rows = chunk_sizes.back();
-    cuda_check(cudaMemcpyAsync(impl_->token_ids,token_ids.data(),
-                               token_ids.size_bytes(),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids,token_ids.data(),
+                               token_ids.size_bytes(),stream),
                "upload layer-major prefill IDs");
     for (int offset=0;offset<total;offset+=1024) {
         const int rows=std::min(1024,total-offset);
@@ -8394,6 +9941,8 @@ void Exl3TextContext::append_prefill_layer_major(
             impl_->hidden_a+static_cast<std::size_t>(offset)*kHidden,rows);
         cuda_check(cudaGetLastError(),"embed layer-major prefill rows");
     }
+    if (!impl_->media_spans.empty())
+        impl_->apply_media_rows(impl_->hidden_a,base_position,total,stream);
     if (impl_->capture_taps) {
         cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,
             impl_->hidden_a+static_cast<std::size_t>(final_offset)*kHidden,
@@ -8410,16 +9959,20 @@ void Exl3TextContext::append_prefill_layer_major(
     if (!layer_profile.events.empty())
         cuda_check(cudaEventRecord(layer_profile.events[0],stream),
                    "record layer-major profile start");
+    // Rows below the block hold their final values in every layer: exact
+    // history copies of those rows overlap the layers before each attention.
+    const L0HistoryWrittenScope history_written(base_position,stream);
     for (int layer=0;layer<kLayers;++layer) {
-        workspace.begin_layer_reuse(cache_budget,
-            base_position+total>=8192 ||
-            impl_->gdn_bulk_mlp_short_k5_enabled);
+        // K5 projections (attention q, MLP gate/up) reconstruct + GEMM in every
+        // layer-major pass: the direct trellis kernels they otherwise take cost
+        // 0.44 s of a 3.8 s FP16 16K prefill (reconstruct: -6%; 4K unchanged).
+        workspace.begin_layer_reuse(cache_budget,true);
         workspace.set_prefill_layer(layer);
         const auto execute_chunk=[&](int offset,int rows,
                 const Exl3GdnLayer::BulkPrefillBuffers* prepared) {
                 const int logical_position=base_position+offset;
-                cuda_check(cudaMemcpyAsync(impl_->position_device,&logical_position,
-                    sizeof(logical_position),cudaMemcpyHostToDevice,stream),
+                cuda_check(exl3_h2d_async(impl_->position_device,&logical_position,
+                    sizeof(logical_position),stream),
                     "publish layer-major causal position");
                 auto* input=(layer%2==0 ? impl_->hidden_a : impl_->hidden_b)+
                     static_cast<std::size_t>(offset)*kHidden;
@@ -8464,9 +10017,8 @@ void Exl3TextContext::append_prefill_layer_major(
                     const int relative=chunk_offsets[chunk]-block;
                     const int rows=chunk_sizes[chunk];
                     const int logical_position=base_position+block+relative;
-                    cuda_check(cudaMemcpyAsync(impl_->position_device,
-                        &logical_position,sizeof(logical_position),
-                        cudaMemcpyHostToDevice,stream),
+                    cuda_check(exl3_h2d_async(impl_->position_device,
+                        &logical_position,sizeof(logical_position),stream),
                         "publish GDN bulk MLP causal position");
                     Exl3GdnLayer::DeferredMlpBuffers slice{
                         impl_->gdn_mlp_post+
@@ -8485,13 +10037,6 @@ void Exl3TextContext::append_prefill_layer_major(
                     output_base,stream,block+count==total);
                 ++gdn_bulk_mlp_blocks;
                 gdn_bulk_mlp_rows+=static_cast<std::uint64_t>(count);
-                const int tap=impl_->tap_index(layer);
-                if(impl_->capture_taps && tap>=0 && block+count==total)
-                    cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
-                        output_base+static_cast<std::size_t>(count-final_rows)*kHidden,
-                        static_cast<std::size_t>(final_rows)*kHidden*
-                            sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-                        "capture final GDN bulk MLP hidden tap");
             });
         } else if (bulk) {
             constexpr int bulk_rows=4096;
@@ -8526,6 +10071,15 @@ void Exl3TextContext::append_prefill_layer_major(
                 execute_chunk(chunk_offsets[chunk],chunk_sizes[chunk],nullptr);
         }
         const int tap=impl_->tap_index(layer);
+        // Final-chunk taps of every tap layer (only the GDN bulk-MLP route
+        // published them before: full-attention tap layers kept an older
+        // forward's rows).
+        if (impl_->capture_taps && tap>=0)
+            cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,
+                (layer%2==0?impl_->hidden_b:impl_->hidden_a)+static_cast<std::size_t>(final_offset)*kHidden,
+                static_cast<std::size_t>(final_rows)*kHidden*sizeof(std::uint16_t),
+                cudaMemcpyDeviceToDevice,stream),
+                "capture final layer-major hidden tap");
         if (retained_taps && tap>=0) {
             const auto relative=static_cast<std::size_t>(retained_taps->first_abs-base_position);
             const auto* completed=(layer%2==0?impl_->hidden_b:impl_->hidden_a)+
@@ -8590,8 +10144,8 @@ void Exl3TextContext::append_prefill_layer_major(
         after.rows-before.rows;
 
     const int final_position=base_position+final_offset;
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&final_position,
-                               sizeof(final_position),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&final_position,
+                               sizeof(final_position),stream),
                "publish final layer-major head position");
     // The even layer count leaves the completed residual in hidden_a. The
     // existing final norm/head and tap-generation code publishes the same
@@ -8602,8 +10156,8 @@ void Exl3TextContext::append_prefill_layer_major(
         impl_->hidden_a+static_cast<std::size_t>(final_offset)*kHidden,
         nullptr,false);
     const int last_position=base_position+total-1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&last_position,
-                               sizeof(last_position),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&last_position,
+                               sizeof(last_position),stream),
                "publish completed layer-major position");
     cuda_check(cudaStreamSynchronize(stream),
                "complete layer-major layers before public position commit");
@@ -8632,7 +10186,6 @@ void Exl3TextContext::append_prefill_layer_major(
         impl_->tap_rows=0;
         impl_->embedding_rows=0;
         impl_->qkv_trace_valid=false;
-        impl_->last_hidden_source=nullptr;
         impl_->graph_active=false;
         throw;
     }
@@ -8640,6 +10193,7 @@ void Exl3TextContext::append_prefill_layer_major(
 
 void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> embeddings,
     std::span<const std::int32_t> positions_xyz,cudaStream_t stream){
+    const PromptTierScope prompt_tier(*this,embeddings.size(),stream);
     Impl::require_host_kv_retirement_admission();
     require(impl_->media_features&&impl_->media_positions&&impl_->host_kv.enabled&&impl_->capture_taps&&
         !impl_->oscar&&!impl_->graph_active&&!impl_->graph_capture_active&&!impl_->host_kv_failed&&
@@ -8658,16 +10212,16 @@ void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> emb
     if(impl_->continuation)impl_->continuation->rows=0;
     impl_->resident_exact_state_id=0;
     try {
-        cuda_check(cudaMemcpyAsync(impl_->media_features->ptr,embeddings.data(),embeddings.size_bytes(),cudaMemcpyHostToDevice,stream),"upload bounded media features");
-        cuda_check(cudaMemcpyAsync(impl_->media_positions->ptr,positions_xyz.data(),positions_xyz.size_bytes(),cudaMemcpyHostToDevice,stream),"upload bounded media positions");
+        cuda_check(exl3_h2d_async(impl_->media_features->ptr,embeddings.data(),embeddings.size_bytes(),stream),"upload bounded media features");
+        cuda_check(exl3_h2d_async(impl_->media_positions->ptr,positions_xyz.data(),positions_xyz.size_bytes(),stream),"upload bounded media positions");
         media_embedding_cast_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(static_cast<const float*>(impl_->media_features->ptr),impl_->hidden_a,rows*kHidden);
         cuda_check(cudaGetLastError(),"cast media features to ordinary FP16 L2 input");
         cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,impl_->hidden_a,std::size_t(rows)*kHidden*2,cudaMemcpyDeviceToDevice,stream),"capture injected media embeddings");
         impl_->embedding_rows=rows;impl_->tap_rows=rows;
-        cuda_check(cudaMemcpyAsync(impl_->position_device,&base,sizeof(base),cudaMemcpyHostToDevice,stream),"media logical KV position");
+        cuda_check(exl3_h2d_async(impl_->position_device,&base,sizeof(base),stream),"media logical KV position");
         impl_->process_rows(nullptr,rows,base,stream,nullptr,false,rows>1,true,true,false,static_cast<const int*>(impl_->media_positions->ptr));
         const int final_position=base+rows-1;
-        cuda_check(cudaMemcpyAsync(impl_->position_device,&final_position,sizeof(final_position),cudaMemcpyHostToDevice,stream),"media final logical position");
+        cuda_check(exl3_h2d_async(impl_->position_device,&final_position,sizeof(final_position),stream),"media final logical position");
         cuda_check(cudaStreamSynchronize(stream),"media append full completion");
         position_=base+rows;impl_->rope_offset=next_offset;++last_decode_h2d_;
     }catch(...){impl_->host_kv_failed=true;cudaStreamSynchronize(stream);throw;}
@@ -8676,8 +10230,9 @@ void Exl3TextContext::append_media_embeddings_numeric(std::span<const float> emb
 std::size_t Exl3TextContext::continuation_bytes_required(int capacity) const {
     const bool native16 = capacity == 16 && impl_->native_continuation16_enabled &&
         impl_->host_kv.enabled && !impl_->oscar && !impl_->transaction;
-    require((capacity >= 2 && capacity <= 8) || native16,
-            "P2 target continuation capacity must be 2..8 or explicit exact-host16");
+    require((capacity >= 2 && capacity <= 8) || native16 ||
+                (impl_->exact_line && capacity >= 2 && capacity <= 32),
+            "P2 target continuation capacity must be 2..8, explicit exact-host16 or an exact line's 2..32");
     require(impl_->capture_taps, "P2 target continuation requires captured taps");
     require(!impl_->graph_active && !impl_->graph_capture_active &&
                 (!impl_->oscar || impl_->oscar->graph_class() == 0),
@@ -8697,9 +10252,13 @@ std::size_t Exl3TextContext::continuation_bytes_required(int capacity) const {
         static_cast<std::size_t>(capacity)*kVocab*sizeof(std::uint16_t));
 }
 void Exl3TextContext::prepare_continuation(int capacity) {
+    (void)impl_->greedy_split_scratch();
+    (void)impl_->sampled_slice_scratch();
     prepare_continuation_impl(capacity,nullptr);
 }
 void Exl3TextContext::prepare_continuation_reserved(Exl3VeriCacheServingCoordinator& authority,int capacity,unsigned startup_fault_for_test) {
+    (void)impl_->greedy_split_scratch();
+    (void)impl_->sampled_slice_scratch();
     prepare_continuation_impl(capacity,&authority,startup_fault_for_test);
 }
 std::size_t Exl3TextContext::continuation_owner_metadata_bytes() noexcept {
@@ -9073,9 +10632,9 @@ __global__ void sibling_row_copy_kernel(const Exl3SiblingRowCopy* entries,
     const std::ptrdiff_t shift=entry.slot_elements?
         static_cast<std::ptrdiff_t>(attempt_base)*entry.slot_elements:0;
     const std::ptrdiff_t src_shift=entry.ring_mask?
-        static_cast<std::ptrdiff_t>((attempt_base+entry.src_row)&entry.ring_mask)*entry.slot_elements:shift;
+        static_cast<std::ptrdiff_t>((attempt_base+entry.src_row)%entry.ring_mask)*entry.slot_elements:shift;
     const std::ptrdiff_t dst_shift=entry.ring_mask?
-        static_cast<std::ptrdiff_t>((attempt_base+entry.dst_row)&entry.ring_mask)*entry.slot_elements:shift;
+        static_cast<std::ptrdiff_t>((attempt_base+entry.dst_row)%entry.ring_mask)*entry.slot_elements:shift;
     for(int i=static_cast<int>(blockIdx.y*blockDim.x+threadIdx.x);i<entry.count;
         i+=static_cast<int>(gridDim.y*blockDim.x)) {
         const std::ptrdiff_t offset=static_cast<std::ptrdiff_t>(i)*entry.stride;
@@ -9096,13 +10655,16 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
     const int rows=impl_->continuation->rows;
     require(destination_row>=1 && destination_row<source_row && source_row<rows,
             "sibling promotion rows");
-    auto* table=&impl_->sibling_copy_tables[0];
+    Impl::SiblingCopyTable* table=nullptr;
     for(auto& entry:impl_->sibling_copy_tables) {
         if(entry.source==source_row && entry.destination==destination_row && entry.rows==rows) {
             table=&entry;break;
         }
         if(entry.source<0) {table=&entry;break;}
     }
+    // Full cache: replace slots round robin (rewritten in stream order).
+    if(!table) table=&impl_->sibling_copy_tables[impl_->sibling_copy_next++ %
+        impl_->sibling_copy_tables.size()];
     if(table->source!=source_row || table->destination!=destination_row || table->rows!=rows) {
         Exl3SiblingRowCopies copies;
         for(int layer=0;layer<kLayers;++layer) {
@@ -9118,17 +10680,19 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
             copies.push_back({p+static_cast<std::size_t>(source_row)*kHidden,
                 p+static_cast<std::size_t>(destination_row)*kHidden,kHidden,1,0});
         };
+        require(!impl_->tap_rows.in_pool,"sibling promotion needs the private tap planes");
         for(const auto& tap:impl_->taps)hidden_row(tap->ptr);
         hidden_row(impl_->embedding_trace->ptr);
         auto* logits=static_cast<std::uint16_t*>(impl_->continuation->logits->ptr);
         copies.push_back({logits+static_cast<std::size_t>(source_row)*kVocab,
             logits+static_cast<std::size_t>(destination_row)*kVocab,kVocab,1,0});
         const auto bytes=copies.size()*sizeof(Exl3SiblingRowCopy);
-        table->device=std::make_unique<DeviceAllocation>(bytes,"sibling promotion table");
-        cuda_check(cudaMemcpy(table->device->ptr,copies.data(),bytes,cudaMemcpyHostToDevice),
-                   "upload sibling promotion table");
+        if(!table->device || table->device->bytes<bytes)
+            table->device=std::make_unique<DeviceAllocation>(bytes,"sibling promotion table");
+        table->host=std::move(copies);
+        cuda_check(exl3_h2d_async(table->device->ptr,table->host.data(),bytes,stream),"upload sibling promotion table");
         table->source=source_row;table->destination=destination_row;table->rows=rows;
-        table->count=static_cast<int>(copies.size());
+        table->count=static_cast<int>(table->host.size());
     }
     sibling_row_copy_kernel<<<dim3(table->count,8),256,0,stream>>>(
         static_cast<const Exl3SiblingRowCopy*>(table->device->ptr),impl_->position_device,rows);
@@ -9137,6 +10701,7 @@ void Exl3TextContext::promote_sibling_row(int source_row,int destination_row,
 
 void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream) {
+    const PromptTierScope prompt_tier(*this,token_ids.size(),stream);
     impl_->join_repair(stream);
     Impl::require_host_kv_retirement_admission();
     require(!impl_->host_kv_failed,"HostKV continuation requires intact transfer lineage");
@@ -9173,14 +10738,15 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     const bool arm_retained_prefix = impl_->transaction &&
         impl_->transaction->active && impl_->transaction->fresh_snapshot &&
         impl_->transaction->stream == stream;
+    if (arm_retained_prefix) impl_->live_arm_attempt(stream);
+    else impl_->live_guard_write(stream);
 
     // Validation above is mutation-free. From this point any failure leaves
     // derived all-row output invalid rather than exposing a partial result.
     impl_->retain_host_kv_forward_stream(stream);
     Impl::HostKVForwardFailureScope failure_scope{*impl_};
     impl_->continuation->rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream),
                "upload P2 target continuation token IDs");
     const auto offsets=std::move(impl_->verifier_sibling_offsets);
     impl_->verifier_sibling_offsets.clear();
@@ -9192,24 +10758,483 @@ void Exl3TextContext::continue_rows(std::span<const std::int64_t> token_ids,
     const std::array<int,3> layout{position_,chain,
         siblings?exl3_pack_sibling_offsets(offsets,chain):0};
     const int base_position = position_;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, layout.data(), sizeof(layout),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->position_device, layout.data(), sizeof(layout), stream),
                "set P2 target continuation base position");
     impl_->process_rows(impl_->token_ids, rows, base_position, stream,
                         nullptr, true, true, true);
     const std::array<int,3> final_layout{base_position + rows - 1,0,0};
-    cuda_check(cudaMemcpyAsync(impl_->position_device, final_layout.data(),
-                               sizeof(final_layout), cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->position_device, final_layout.data(),
+                               sizeof(final_layout), stream),
                "set P2 target continuation final device position");
     position_ += rows;
     impl_->continuation->rows = rows;
     if (arm_retained_prefix) {
+        for (int layer = 0; layer < kLayers; ++layer)
+            if (impl_->full_layers[layer] &&
+                !impl_->full_layers[layer]->retained_prefix_armed(rows))
+                std::fprintf(stderr, "RETAINED_PREFIX_UNARMED single layer=%d rows=%d cleared_by=%s%c",
+                    layer, rows, impl_->full_layers[layer]->retained_prefix_cleared_by(), 10);
         auto& transaction = *impl_->transaction;
         transaction.attempt_base_position = base_position;
         transaction.attempted_rows = rows;
         transaction.prefix_available = true;
     }
     ++last_decode_h2d_;
+}
+
+// Pairs every layer of a batched owner with its peers' layers of the same
+// index for the lifetime of one batched forward (eager or captured).
+struct Exl3TextContext::BatchBinding {
+    Impl& owner;
+    std::array<Exl3FullAttentionLayer::Batch,kLayers> full{};
+    std::array<Exl3GdnLayer::Batch,kLayers> gdn{};
+    BatchBinding(Impl& owner_,std::span<Impl* const> peers,std::span<const int> peer_rows,
+                 std::span<const int> peer_positions,std::span<const cudaStream_t> peer_streams,
+                 int own_rows) : owner(owner_) {
+        require(!peers.empty() && peers.size()<=Exl3FullAttentionLayer::kMaxBatchPeers &&
+                peers.size()<=Exl3GdnLayer::kMaxBatchPeers,"batched peer count");
+        static const bool fork_enabled=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_BATCH_FORK");
+            return !value || std::strcmp(value,"0")!=0;
+        }();
+        const bool fork=fork_enabled;
+        if(fork && !owner.batch_fork_event) {
+            for(auto& s:owner.batch_fork_streams)
+                cuda_check(cudaStreamCreateWithFlags(&s,cudaStreamNonBlocking),"batched peer fork stream");
+            for(auto& e:owner.batch_join_events)
+                cuda_check(cudaEventCreateWithFlags(&e,cudaEventDisableTiming),"batched peer join event");
+            cuda_check(cudaEventCreateWithFlags(&owner.batch_fork_event,cudaEventDisableTiming),
+                "batched peer fork event");
+        }
+        const auto arm=[&](auto& batch) {
+            if(!fork)return;
+            batch.fork_streams=owner.batch_fork_streams;
+            batch.fork_event=owner.batch_fork_event;
+            batch.join_events=owner.batch_join_events;
+        };
+        for(int layer=0;layer<kLayers;++layer) {
+            if(owner.full_layers[layer]) {
+                full[layer].own_rows=own_rows;
+                full[layer].peer_count=static_cast<int>(peers.size());
+                for(std::size_t p=0;p<peers.size();++p) {
+                    require(static_cast<bool>(peers[p]->full_layers[layer]),"batched layer topology");
+                    full[layer].peers[p]={peers[p]->full_layers[layer].get(),peer_rows[p],peer_positions[p],
+                        peer_streams.empty()?nullptr:peer_streams[p]};
+                }
+                arm(full[layer]);
+                owner.full_layers[layer]->set_batch(&full[layer]);
+            } else if(owner.gdn_layers[layer]) {
+                gdn[layer].own_rows=own_rows;
+                gdn[layer].peer_count=static_cast<int>(peers.size());
+                for(std::size_t p=0;p<peers.size();++p) {
+                    require(static_cast<bool>(peers[p]->gdn_layers[layer]),"batched layer topology");
+                    gdn[layer].peers[p]={peers[p]->gdn_layers[layer].get(),peer_rows[p],
+                        peer_streams.empty()?nullptr:peer_streams[p]};
+                }
+                arm(gdn[layer]);
+                owner.gdn_layers[layer]->set_batch(&gdn[layer]);
+            }
+        }
+        ++owner.batch_bound;
+    }
+    ~BatchBinding() {
+        --owner.batch_bound;
+        for(auto& layer:owner.full_layers)if(layer)layer->set_batch(nullptr);
+        for(auto& layer:owner.gdn_layers)if(layer)layer->set_batch(nullptr);
+    }
+    BatchBinding(const BatchBinding&)=delete;
+    BatchBinding& operator=(const BatchBinding&)=delete;
+};
+
+void Exl3TextContext::prepare_batched_continuation_graph(Exl3TextContext& peer,
+    int own_rows,int peer_rows) {
+    Exl3TextContext* const peers[1]={&peer};
+    const int rows[1]={peer_rows};
+    prepare_batched_continuation_graph(std::span<Exl3TextContext* const>(peers),own_rows,
+        std::span<const int>(rows));
+}
+
+void Exl3TextContext::prepare_batched_continuation_graph(std::span<Exl3TextContext* const> peers,
+    int own_rows,std::span<const int> peer_rows) {
+    require(!peers.empty() && peers.size()==peer_rows.size() &&
+            peers.size()<=kMaxBatchedPeers && own_rows>=2 && own_rows<=8,
+        "batched continuation graph shape");
+    int rows=own_rows;
+    std::vector<Exl3TextContext*> contexts{this};
+    for(std::size_t p=0;p<peers.size();++p) {
+        require(peers[p]!=this && peers[p]->impl_->model==impl_->model &&
+                peer_rows[p]>=2 && peer_rows[p]<=8 &&
+                std::count(peers.begin(),peers.end(),peers[p])==1,
+            "batched continuation graph peers");
+        rows+=peer_rows[p];
+        contexts.push_back(peers[p]);
+    }
+    for(auto* context:contexts) {
+        auto& impl=*context->impl_;
+        require(impl.capture_taps && !impl.graph_active && !impl.graph_capture_active &&
+                !impl.host_kv.enabled && !impl.oscar &&
+                (!impl.transaction || !impl.transaction->active),
+            "batched continuation graph capture requires idle device-KV contexts");
+    }
+    require(impl_->prefill_capacity>=rows && rows<=exl3_batch_rows(),"batched continuation exceeds the owner's row capacity");
+    // Captured launches read the live positions from each context's
+    // position_device; capture at the end of each context like the per-layer
+    // graphs so capacity-sized grids cover every replay position. The owner's
+    // attention geometry covers all rows of the launch.
+    const int own_position=impl_->max_context-rows;
+    auto graph=std::make_unique<Impl::BatchedGraph>();
+    graph->own_rows=own_rows;
+    std::vector<Impl*> peer_impls;
+    std::vector<int> peer_positions;
+    for(std::size_t p=0;p<peers.size();++p) {
+        peer_impls.push_back(peers[p]->impl_.get());
+        peer_positions.push_back(peers[p]->impl_->max_context-peer_rows[p]);
+        graph->peers.push_back(peers[p]->impl_.get());
+        graph->peer_rows.push_back(peer_rows[p]);
+    }
+    cudaStream_t capture_stream=nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&capture_stream,cudaStreamNonBlocking),
+        "create batched continuation capture stream");
+    const auto set_capture=[&](bool active) {
+        for(auto* context:contexts) {
+            auto& impl=*context->impl_;
+            for(auto& layer:impl.full_layers)if(layer) {
+                layer->set_capture_active(active);
+                layer->set_ordinary_full_layer_graph_capture(active);
+            }
+            for(auto& layer:impl.gdn_layers)if(layer)layer->set_capture_active(active);
+        }
+        impl_->graph_capture_active=active;
+    };
+    try {
+        BatchBinding binding(*impl_,peer_impls,peer_rows,peer_positions,{},own_rows);
+        struct RoundNumerics {
+            RoundNumerics(){exl3_set_batched_round_numerics(true);}
+            ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
+        } round_numerics;
+        set_capture(true);
+        graph->definition.capture(capture_stream,[&] {
+            const BatchTierScope batch_tier(*impl_,rows,capture_stream,false);
+            impl_->process_rows(impl_->token_ids,rows,own_position,capture_stream,nullptr,true,true,true,
+                false,false,nullptr,0,kLayers,nullptr,nullptr,true);
+        });
+        set_capture(false);
+        graph->stack_output=impl_->last_stack_output;
+        std::size_t free_before=0,free_after=0,total=0;
+        static const bool graph_stats=std::getenv("VOIDINFER_EXL3_BATCHED_STATS")!=nullptr;
+        if(graph_stats)(void)cudaMemGetInfo(&free_before,&total);
+        graph->executable.instantiate(graph->definition);
+        graph->executable.upload(capture_stream);
+        cuda_check(cudaStreamSynchronize(capture_stream),"prepare batched continuation graph");
+        if(graph_stats) {
+            (void)cudaMemGetInfo(&free_after,&total);
+            std::fprintf(stderr,"BATCHED_GRAPH members=%zu rows=%d nodes=%zu device_mib=%.1f\n",peers.size()+1,rows,
+                graph->definition.node_count(),(static_cast<double>(free_before)-static_cast<double>(free_after))/1048576.0);
+        }
+    } catch(...) {
+        set_capture(false);
+        (void)cudaStreamSynchronize(capture_stream);
+        (void)cudaStreamDestroy(capture_stream);
+        throw;
+    }
+    cuda_check(cudaStreamDestroy(capture_stream),"destroy batched continuation capture stream");
+    impl_->batched_graphs.push_back(std::move(graph));
+}
+
+void Exl3TextContext::continue_rows_batched(Exl3TextContext& peer,
+    std::span<const std::int64_t> own_tokens,std::span<const std::int64_t> peer_tokens,
+    cudaStream_t stream,cudaStream_t peer_stream) {
+    const BatchedPeer peers[1]={{&peer,peer_tokens,peer_stream}};
+    continue_rows_batched(std::span<const BatchedPeer>(peers),own_tokens,stream);
+}
+
+void Exl3TextContext::continue_rows_batched(std::span<const BatchedPeer> peers,
+    std::span<const std::int64_t> own_tokens,cudaStream_t stream) {
+    require(!peers.empty() && peers.size()<=kMaxBatchedPeers,"batched continuation peer count");
+    const std::size_t count_contexts=peers.size()+1;
+    std::array<Exl3TextContext*,kMaxBatchedPeers+1> contexts{};
+    std::array<std::span<const std::int64_t>,kMaxBatchedPeers+1> tokens{};
+    std::array<cudaStream_t,kMaxBatchedPeers+1> state_streams{};
+    contexts[0]=this;tokens[0]=own_tokens;state_streams[0]=stream;
+    for(std::size_t p=0;p<peers.size();++p) {
+        require(peers[p].context && peers[p].context!=this &&
+                peers[p].context->impl_->model==impl_->model,
+            "batched continuation needs distinct contexts of the same model");
+        for(std::size_t q=0;q<p;++q)
+            require(peers[q].context!=peers[p].context,"batched continuation peers repeat");
+        contexts[p+1]=peers[p].context;
+        tokens[p+1]=peers[p].tokens;
+        state_streams[p+1]=peers[p].stream?peers[p].stream:stream;
+    }
+    int rows=0;
+    std::array<bool,kMaxBatchedPeers+1> arm_retained_prefix{};
+    for(std::size_t c=0;c<count_contexts;++c) {
+        auto& context=*contexts[c];
+        auto& impl=*context.impl_;
+        const int count=static_cast<int>(tokens[c].size());
+        rows+=count;
+        impl.join_repair(stream);
+        require(!impl.host_kv.enabled && !impl.host_kv_failed && !impl.oscar &&
+                (!impl.transaction || !impl.transaction->rollback_required),
+            "batched continuation requires device-KV contexts outside failed transactions");
+        require(impl.continuation && count<=impl.continuation->capacity &&
+                (impl.exact_line ? count>=2 && count<=24 : count>=2 && count<=8),
+            "batched continuation rows are outside each context's prepared capacity");
+        require(std::all_of(tokens[c].begin(),tokens[c].end(),[](std::int64_t token) {
+                return token>=0 && token<kVocab; }),
+            "batched continuation token ID is outside the vocabulary");
+        require(context.position_>0 && impl.last_rows>0 &&
+                context.position_<=impl.max_context-count,
+            "batched continuation requires a nonempty prefix and capacity");
+        require(impl.capture_taps && !impl.graph_active && !impl.graph_capture_active,
+            "batched continuation requires eager target execution");
+        arm_retained_prefix[c]=impl.transaction && impl.transaction->active &&
+            impl.transaction->fresh_snapshot && impl.transaction->stream==state_streams[c];
+    }
+    cudaStreamCaptureStatus capture_status=cudaStreamCaptureStatusNone;
+    cuda_check(cudaStreamIsCapturing(stream,&capture_status),
+        "query batched continuation stream capture state");
+    require(capture_status==cudaStreamCaptureStatusNone,
+        "batched continuation is unavailable during external stream capture");
+    require(impl_->prefill_capacity>=rows && rows<=exl3_batch_rows(),"batched continuation exceeds the owner's row capacity");
+    // Owner: rows [0, own_rows); each peer's rows follow in order.
+    std::array<std::int64_t,64> ids{};
+    std::array<int,kMaxBatchedPeers+1> first_row{};
+    for(std::size_t c=0,offset=0;c<count_contexts;++c) {
+        first_row[c]=static_cast<int>(offset);
+        std::copy(tokens[c].begin(),tokens[c].end(),ids.begin()+static_cast<std::ptrdiff_t>(offset));
+        offset+=tokens[c].size();
+    }
+    cuda_check(exl3_h2d_async(impl_->token_ids,ids.data(),static_cast<std::size_t>(rows)*sizeof(std::int64_t),stream),"upload batched continuation token IDs");
+    std::array<int,kMaxBatchedPeers+1> base_positions{};
+    for(std::size_t c=0;c<count_contexts;++c) {
+        auto& context=*contexts[c];
+        auto& impl=*context.impl_;
+        impl.retain_host_kv_forward_stream(stream);
+        impl.continuation->rows=0;
+        const auto offsets=std::move(impl.verifier_sibling_offsets);
+        impl.verifier_sibling_offsets.clear();
+        const int count=static_cast<int>(tokens[c].size());
+        const int siblings=static_cast<int>(offsets.size());
+        require(siblings==0 || count-siblings>=2,"verifier sibling layout needs two chain rows");
+        const int chain=siblings?count-siblings:0;
+        const std::array<int,3> layout{context.position_,chain,
+            siblings?exl3_pack_sibling_offsets(offsets,chain):0};
+        base_positions[c]=context.position_;
+        cuda_check(exl3_h2d_async(impl.position_device,layout.data(),sizeof(layout),stream),"set batched continuation base position");
+        if(arm_retained_prefix[c]) impl.live_arm_attempt(stream);
+        else impl.live_guard_write(stream);
+        if(impl.transaction && impl.transaction->active) {
+            impl.transaction->fresh_snapshot=false;
+            impl.transaction->prefix_available=false;
+        }
+        for(auto& layer:impl.full_layers)if(layer)layer->invalidate_retained_prefix();
+    }
+    const int own_rows=static_cast<int>(own_tokens.size());
+    Impl::BatchedGraph* graph=nullptr;
+    for(auto& candidate:impl_->batched_graphs) {
+        if(candidate->own_rows!=own_rows || candidate->peers.size()!=peers.size() ||
+           !candidate->executable.ready())continue;
+        bool match=true;
+        for(std::size_t p=0;p<peers.size() && match;++p)
+            match=candidate->peers[p]==peers[p].context->impl_.get() &&
+                candidate->peer_rows[p]==static_cast<int>(peers[p].tokens.size());
+        if(match){graph=candidate.get();break;}
+    }
+    if(graph) {
+        // Replay bypasses the host-side retained-prefix arming of the eager
+        // forwards; reproduce it per agent exactly as the per-layer graphs do.
+        for(std::size_t c=0;c<count_contexts;++c)
+            contexts[c]->impl_->ensure_l0_rows(base_positions[c]+static_cast<int>(tokens[c].size()));
+        {
+            const BatchTierScope batch_tier(*impl_,rows,stream,true);
+            graph->executable.launch(stream);
+        }
+        ++batched_graph_replays_;
+        impl_->last_stack_output=graph->stack_output;
+        for(std::size_t c=0;c<count_contexts;++c) {
+            if(!arm_retained_prefix[c])continue;
+            auto& impl=*contexts[c]->impl_;
+            const int count=static_cast<int>(tokens[c].size());
+            for(int layer=0;layer<kLayers;++layer) {
+                if(impl.full_layers[layer])
+                    impl.full_layers[layer]->arm_captured_retained_prefix(
+                        count,base_positions[c],state_streams[c]);
+                else if(impl.gdn_layers[layer])
+                    impl.gdn_layers[layer]->arm_captured_retained_prefix(
+                        impl.transaction->gdn_checkpoints[layer],count,state_streams[c]);
+            }
+        }
+    } else {
+        ++batched_eager_forwards_;
+        std::array<Impl*,kMaxBatchedPeers> peer_impls{};
+        std::array<int,kMaxBatchedPeers> peer_rows{},peer_positions{};
+        std::array<cudaStream_t,kMaxBatchedPeers> peer_streams{};
+        for(std::size_t p=0;p<peers.size();++p) {
+            peer_impls[p]=peers[p].context->impl_.get();
+            peer_rows[p]=static_cast<int>(peers[p].tokens.size());
+            peer_positions[p]=base_positions[p+1];
+            peer_streams[p]=state_streams[p+1];
+        }
+        BatchBinding binding(*impl_,std::span<Impl* const>(peer_impls.data(),peers.size()),
+            std::span<const int>(peer_rows.data(),peers.size()),
+            std::span<const int>(peer_positions.data(),peers.size()),
+            std::span<const cudaStream_t>(peer_streams.data(),peers.size()),own_rows);
+        struct RoundNumerics {
+            RoundNumerics(){exl3_set_batched_round_numerics(true);}
+            ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
+        } round_numerics;
+        const BatchTierScope batch_tier(*impl_,rows,stream,true);
+        impl_->process_rows(impl_->token_ids,rows,base_positions[0],stream,nullptr,true,true,true,
+            false,false,nullptr,0,kLayers,nullptr,nullptr,true);
+    }
+    // The owner's taps hold every row; each peer's rows move to its own taps
+    // (batched copy launches instead of one copy per tap and peer).
+    {
+        require(!impl_->tap_rows.in_pool,"batched round taps outside the private tier");
+        Exl3SegmentCopies copies;
+        const auto flush=[&] {
+            cuda_check(exl3_launch_segment_copies(copies,stream),"move batched peer taps");
+            copies=Exl3SegmentCopies{};
+        };
+        for(std::size_t p=0;p<peers.size();++p) {
+            auto& peer=*peers[p].context->impl_;
+            const auto row=static_cast<std::size_t>(first_row[p+1]);
+            const auto count=peers[p].tokens.size();
+            const auto bytes=count*kHidden*sizeof(std::uint16_t);
+            for(std::size_t tap=0;tap<impl_->taps.size();++tap) {
+                if(copies.count==kSegmentCopyMax)flush();
+                copies.add(peer.taps[tap]->ptr,
+                    static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr)+row*kHidden,bytes);
+            }
+            if(copies.count==kSegmentCopyMax)flush();
+            copies.add(peer.embedding_trace->ptr,
+                static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+row*kHidden,bytes);
+            peer.embedding_rows=peer.tap_rows=static_cast<int>(count);
+            peer.last_stack_output=impl_->last_stack_output+row*kHidden;
+            if(peer.exact_line) {
+                // Scored after the round (exact_row_scores): keep the rows in
+                // the line's own buffer, not the owner's (rewritten by replays).
+                if(copies.count==kSegmentCopyMax)flush();
+                copies.add(peer.hidden_a,impl_->last_stack_output+row*kHidden,bytes);
+                peer.last_stack_output=peer.hidden_a;
+            }
+        }
+        flush();
+    }
+    impl_->embedding_rows=impl_->tap_rows=own_rows;
+    // One H6 head pass over every agent's rows (16-row single-split tiles)
+    // instead of one 8-row pass per agent: the head weights stream once per
+    // tile. Each agent's rows are contiguous in the owner's stack output.
+    // More than 16 rows: one 32-row coherent pass (the head weights stream
+    // once); VOIDINFER_EXL3_BATCHED_HEAD_TILE=16 keeps 16-row native tiles.
+    constexpr int kHeadTile=16;
+    static const bool head32=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_HEAD_TILE");
+        return !value || std::atoi(value)!=16;
+    }();
+    static const bool batched_head=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_HEAD");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!batched_head) {
+        impl_->finish_batched_continuation(impl_->last_stack_output,own_rows,base_positions[0],stream);
+        for(std::size_t p=0;p<peers.size();++p) {
+            auto& peer=*peers[p].context->impl_;
+            peer.finish_batched_continuation(peer.last_stack_output,
+                static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream);
+        }
+    } else {
+    const auto& model=*impl_->model;
+    Exl3TextModel::Impl::BatchedHeadSlot* slot=nullptr;
+    {
+        std::lock_guard lock(model.batched_head_mutex);
+        for(auto& candidate:model.batched_head_slots)
+            if(!candidate->busy){slot=candidate.get();break;}
+        if(!slot) {
+            auto created=std::make_unique<Exl3TextModel::Impl::BatchedHeadSlot>();
+            constexpr std::size_t capacity=static_cast<std::size_t>(8)*(kMaxBatchedPeers+1);
+            created->norm=std::make_unique<DeviceAllocation>(capacity*kHidden*sizeof(std::uint16_t),
+                "allocate batched head norm rows");
+            created->logits=std::make_unique<DeviceAllocation>(capacity*kVocab*sizeof(std::uint16_t),
+                "allocate batched head logits");
+            created->workspace16=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,kHeadTile);
+            created->workspace16->set_native_continuation16(true);
+            cuda_check(cudaEventCreateWithFlags(&created->done,cudaEventDisableTiming),"batched head slot event");
+            slot=created.get();
+            model.batched_head_slots.push_back(std::move(created));
+        }
+        slot->busy=true;
+    }
+    struct SlotRelease {
+        const Exl3TextModel::Impl& model;Exl3TextModel::Impl::BatchedHeadSlot& slot;cudaStream_t stream;
+        ~SlotRelease() {
+            slot.recorded=cudaEventRecord(slot.done,stream)==cudaSuccess;
+            std::lock_guard lock(model.batched_head_mutex);
+            slot.busy=false;
+        }
+    } slot_release{model,*slot,stream};
+    if(slot->recorded)cuda_check(cudaStreamWaitEvent(stream,slot->done,0),"order batched head slot");
+    auto* head_norm=static_cast<std::uint16_t*>(slot->norm->ptr);
+    auto* head_logits=static_cast<std::uint16_t*>(slot->logits->ptr);
+    final_rms_norm_kernel<<<rows,512,0,stream>>>(impl_->last_stack_output,impl_->model->final_norm,head_norm);
+    cuda_check(cudaGetLastError(),"launch batched head final RMSNorm");
+    if(head32 && rows>kHeadTile) {
+        if(!slot->workspace32) {
+            slot->workspace32=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,2*kHeadTile);
+            slot->workspace32->enable_draft_batched();
+        }
+        // Eight-lane rounds (33..64 rows): 32-row passes (the head workspace
+        // and its accumulation planes stay 32 rows).
+        for(int first=0;first<rows;first+=2*kHeadTile)
+            slot->workspace32->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+                head_norm+static_cast<std::size_t>(first)*kHidden,
+                head_logits+static_cast<std::size_t>(first)*kVocab,std::min(2*kHeadTile,rows-first),stream);
+    } else
+    for(int first=0;first<rows;first+=kHeadTile) {
+        const int n=std::min(kHeadTile,rows-first);
+        slot->workspace16->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+            head_norm+static_cast<std::size_t>(first)*kHidden,
+            head_logits+static_cast<std::size_t>(first)*kVocab,n,stream);
+    }
+    cuda_check(cudaGetLastError(),"launch batched head");
+    impl_->finish_batched_continuation(impl_->last_stack_output,own_rows,base_positions[0],stream,
+        head_norm,head_logits);
+    for(std::size_t p=0;p<peers.size();++p) {
+        auto& peer=*peers[p].context->impl_;
+        const auto row=static_cast<std::size_t>(first_row[p+1]);
+        peer.finish_batched_continuation(peer.last_stack_output,
+            static_cast<int>(peers[p].tokens.size()),base_positions[p+1],stream,
+            head_norm+row*kHidden,head_logits+row*kVocab);
+    }
+    }
+    for(std::size_t c=0;c<count_contexts;++c) {
+        auto& context=*contexts[c];
+        auto& impl=*context.impl_;
+        const int count=static_cast<int>(tokens[c].size());
+        const std::array<int,3> final_layout{base_positions[c]+count-1,0,0};
+        cuda_check(exl3_h2d_async(impl.position_device,final_layout.data(),sizeof(final_layout),stream),"set batched continuation final device position");
+        context.position_+=count;
+        impl.continuation->rows=count;
+        impl.trace_members=static_cast<int>(count_contexts);
+        impl.trace_graph=graph?1:0;
+        impl.trace_member=static_cast<int>(c);
+        if(arm_retained_prefix[c]) {
+            for(int layer=0;layer<kLayers;++layer)
+                if(impl.full_layers[layer] && !impl.full_layers[layer]->retained_prefix_armed(count))
+                    std::fprintf(stderr,"RETAINED_PREFIX_UNARMED batched member=%zu layer=%d rows=%d graph=%d cleared_by=%s%c",
+                        c,layer,count,graph?1:0,impl.full_layers[layer]->retained_prefix_cleared_by(),10);
+            auto& transaction=*impl.transaction;
+            transaction.attempt_base_position=base_positions[c];
+            transaction.attempted_rows=count;
+            transaction.prefix_available=true;
+        }
+        ++context.last_decode_h2d_;
+    }
+}
+
+void Exl3TextContext::set_gdn_repair_overlap(bool enabled) noexcept {
+    impl_->gdn_repair_overlap=enabled;
 }
 
 void Exl3TextContext::bind_request_compatibility(std::string contract) {
@@ -9258,7 +11283,7 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     // Request reuse composes default-stream target work, optional copy streams
     // and graph/explicit execution streams. T011 narrows only its proven graph
     // mutation subset; this whole-context fallback remains device-wide.
-    cuda_check(cudaDeviceSynchronize(),"drain prior request work before context reuse");
+    cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),"drain prior request work before context reuse");
     if(impl_->host_kv_copy_stream) {
         const auto finish_copies=[&] {
             cuda_check(cudaStreamSynchronize(impl_->host_kv_copy_stream),
@@ -9288,7 +11313,12 @@ Exl3RequestResetStats Exl3TextContext::reset_for_request_impl(std::string_view c
     reset_impl(nullptr,preserve);
     if(std::exchange(impl_->fail_request_reset_completion_for_test,false))
         throw std::runtime_error("injected request reset completion failure");
-    cuda_check(cudaDeviceSynchronize(),"complete request context reset");
+    cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),"complete request context reset");
+    // Growable L0 codes and planes return backing beyond the retained
+    // frontier; the host planes keep kL0RetainedBackingRows rows so ordinary
+    // requests on this lane do not re-create pinned pages (~0.1 s per 4K
+    // prompt otherwise).
+    impl_->release_l0_rows_beyond(position_,std::max(position_,Impl::kL0RetainedBackingRows));
     const auto complete=std::chrono::steady_clock::now();
     ++impl_->request_generation;
     return Exl3RequestResetStats{
@@ -9391,12 +11421,22 @@ __global__ void __launch_bounds__(1024) exact_row_score_kernel(const std::uint16
 }
 } // namespace
 
-void Exl3TextContext::save_verified_root(cudaStream_t stream) {
+void Exl3TextContext::save_verified_root(cudaStream_t stream) {save_root_slot(false,stream);}
+void Exl3TextContext::save_verified_root_pending(cudaStream_t stream) {save_root_slot(true,stream);}
+void Exl3TextContext::promote_verified_root_pending() {
+    require(impl_->verified_root_pending && impl_->verified_root_pending->position>0,
+        "pending verified root missing");
+    std::swap(impl_->verified_root,impl_->verified_root_pending);
+}
+void Exl3TextContext::save_root_slot(bool pending,cudaStream_t stream) {
+    save_root(pending?impl_->verified_root_pending:impl_->verified_root,stream);
+}
+void Exl3TextContext::save_root(std::unique_ptr<VerifiedRoot>& slot,cudaStream_t stream) const {
     require(position_>0 && impl_->last_rows>0 && !impl_->graph_capture_active &&
             (!impl_->transaction || !impl_->transaction->active),
             "verified root needs a completed forward outside a transaction");
-    if(!impl_->verified_root) {
-        auto root=std::make_unique<Impl::VerifiedRoot>();
+    if(!slot) {
+        auto root=std::make_unique<VerifiedRoot>();
         std::size_t recurrent_bytes=0,conv_bytes=0;
         for(const auto& layer:impl_->gdn_layers) if(layer) {
             recurrent_bytes+=layer->recurrent_state_bytes();
@@ -9419,13 +11459,18 @@ void Exl3TextContext::save_verified_root(cudaStream_t stream) {
             recurrent+=recurrent_size;
             conv+=conv_size;
         }
-        impl_->verified_root=std::move(root);
+        slot=std::move(root);
     }
-    auto& root=*impl_->verified_root;
+    auto& root=*slot;
     impl_->join_repair(stream);
+    // One launch for every layer's checkpoint copies (was two cudaMemcpyAsync
+    // per GDN layer, ~30 us of host time each on every verified block).
+    Exl3GdnRootCopies copies;
     for(int layer=0;layer<kLayers;++layer)
         if(impl_->gdn_layers[layer])
-            impl_->gdn_layers[layer]->save_checkpoint(root.checkpoints[layer],position_,stream);
+            copies.layer[copies.count++]=impl_->gdn_layers[layer]->save_checkpoint_copies(
+                root.checkpoints[layer],position_,stream);
+    exl3_gdn_launch_root_copies(copies,stream);
     root.position=position_;
     root.last_rows=impl_->last_rows;
     root.tap_rows=impl_->tap_rows;
@@ -9433,23 +11478,31 @@ void Exl3TextContext::save_verified_root(cudaStream_t stream) {
 }
 
 void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
-    require(impl_->verified_root && impl_->verified_root->position>0 && !impl_->graph_capture_active &&
+    require(impl_->verified_root && impl_->verified_root->position>0,
+            "verified root restore needs a saved root");
+    restore_root(*impl_->verified_root,stream);
+}
+void Exl3TextContext::restore_root(const VerifiedRoot& root,cudaStream_t stream) {
+    require(root.position>0 && !impl_->graph_capture_active &&
             (!impl_->transaction || !impl_->transaction->active),
             "verified root restore needs a saved root outside a transaction");
-    auto& root=*impl_->verified_root;
     impl_->join_repair(stream);
+    impl_->kv_rows_rewritten_from(root.position);
+    Exl3GdnRootCopies copies;
     for(int layer=0;layer<kLayers;++layer)
         if(impl_->gdn_layers[layer]) {
             impl_->gdn_layers[layer]->validate_saved_checkpoint(root.checkpoints[layer],root.position);
-            impl_->gdn_layers[layer]->restore_checkpoint(root.checkpoints[layer],stream);
+            copies.layer[copies.count++]=impl_->gdn_layers[layer]->restore_checkpoint_copies(
+                root.checkpoints[layer]);
         }
+    exl3_gdn_launch_root_copies(copies,stream);
     for(auto& layer:impl_->full_layers)
         if(layer) {
             layer->invalidate_retained_prefix();
             layer->l0_rewind(root.position,stream);
         }
     const std::array<int,3> layout{root.position-1,0,0};
-    cuda_check(cudaMemcpyAsync(impl_->position_device,layout.data(),sizeof(layout),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,layout.data(),sizeof(layout),stream),
         "restore verified root device position");
     position_=root.position;
     impl_->last_rows=root.last_rows;
@@ -9458,7 +11511,37 @@ void Exl3TextContext::restore_verified_root(cudaStream_t stream) {
     if(impl_->continuation) impl_->continuation->rows=0;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->qkv_trace_valid=false;
-    impl_->invalidate_native_mtp_hidden_capture();
+}
+
+void Exl3TextContext::rewind_l0_to(int position,cudaStream_t stream) {
+    require(!impl_->exact_line && position>0 && position<=position_ && !impl_->graph_capture_active &&
+            (!impl_->transaction || !impl_->transaction->active),
+            "L0 rewind needs a drafting context outside a transaction");
+    impl_->join_repair(stream);
+    impl_->kv_rows_rewritten_from(position);
+    for(auto& layer:impl_->full_layers)
+        if(layer) {
+            layer->invalidate_retained_prefix();
+            layer->l0_rewind(position,stream);
+        }
+}
+
+void Exl3TextContext::save_exact_line_root(Exl3ExactLineSlot& slot,cudaStream_t stream) const {
+    require(impl_->exact_line,"exact line root needs an exact line");
+    save_root(slot.state_->root,stream);
+}
+
+void Exl3TextContext::restore_exact_line_root(const Exl3ExactLineSlot& slot,bool rebuild_window,
+    cudaStream_t stream) {
+    require(impl_->exact_line && slot.state_->root && slot.state_->root->position>0,
+        "exact line restore needs an exact line and a saved slot");
+    const auto& root=*slot.state_->root;
+    // After another lane: sink and window rows from this lane's FP16 planes
+    // (restore_root's l0_rewind refills a small window ring).
+    if(rebuild_window)
+        for(auto& layer:impl_->full_layers)
+            if(layer)layer->l0_rebind(root.position,stream);
+    restore_root(root,stream);
 }
 
 int Exl3TextContext::verified_root_position() const noexcept {
@@ -9466,38 +11549,181 @@ int Exl3TextContext::verified_root_position() const noexcept {
 }
 
 void Exl3TextContext::set_l0_exact_history(bool exact) noexcept {
-    for(auto& layer:impl_->full_layers) if(layer) layer->set_l0_exact_history(exact);
+    for(auto& layer:impl_->full_layers) if(layer) layer->set_l0_exact_history(exact || impl_->exact_line);
+}
+
+void Exl3TextContext::make_exact_line(Exl3TextContext& drafting) {
+    require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled,
+        "exact line needs L0 OSCAR contexts");
+    require(impl_->exact_line_storage,"exact line needs a context constructed as one (create_context_reserved exact_line)");
+    // The line never exports exact state: no lane-backed page source.
+    impl_->kv_source.reset();
+    impl_->exact_line=true;
+    for(auto& layer:impl_->full_layers)
+        if(layer)layer->set_l0_exact_only(true);
+    bind_exact_line(drafting);
+}
+
+void Exl3TextContext::bind_exact_line(Exl3TextContext& drafting) {
+    require(impl_->exact_line && &drafting!=this && drafting.impl_->model==impl_->model &&
+            !drafting.impl_->exact_line,"exact line binding needs a drafting context of its model");
+    require(impl_->max_context==drafting.impl_->max_context,"exact line needs the drafting context's capacity");
+    for(int layer=0;layer<kLayers;++layer) {
+        if(!impl_->full_layers[layer])continue;
+        require(drafting.impl_->cache_k[layer] && drafting.impl_->cache_v[layer],
+            "exact line needs the drafting context's FP16 planes");
+        impl_->cache_k[layer]=drafting.impl_->cache_k[layer];
+        impl_->cache_v[layer]=drafting.impl_->cache_v[layer];
+        impl_->full_layers[layer]->set_kv_cache(static_cast<std::uint16_t*>(impl_->cache_k[layer]->ptr),
+            static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr),impl_->max_context);
+        impl_->full_layers[layer]->set_rope_map(drafting.impl_->position_device+4);
+    }
+    // FP8 history of the asynchronous line (VOIDINFER_EXL3_VERICACHE_LINE_FP8=1; default
+    // off: the line verifies against the exact FP16 planes): half the PCIe bytes per
+    // pass, 128K -4%, 254K -6% per round, but history past the window rounds to e4m3
+    // (per row/head scale; KL 0.005 against FP16 history), so verification is inexact.
+    // Each drafting context owns its mirror (created on its first binding).
+    static const bool line_fp8=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_LINE_FP8");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    if(line_fp8) {
+        auto& owner=*drafting.impl_;
+        const std::size_t capacity=static_cast<std::size_t>(owner.max_context)*Impl::kLineFp8RowBytes;
+        bool created=false;
+        for(int layer=0;layer<kLayers;++layer) {
+            if(!impl_->full_layers[layer])continue;
+            if(!owner.line_fp8_k[layer]) {
+                for(auto* region:{&owner.line_fp8_k[layer],&owner.line_fp8_v[layer]}) {
+                    *region=std::make_unique<Exl3GrowableDeviceRegion>();
+                    (*region)->reserve(capacity,true);
+                }
+                owner.line_fp8_valid[layer].store(0);
+                created=true;
+            }
+            auto* k=owner.line_fp8_k[layer]->data<std::uint8_t>();
+            auto* v=owner.line_fp8_v[layer]->data<std::uint8_t>();
+            owner.full_layers[layer]->set_l0_fp8_mirror(k,v,&owner.line_fp8_valid[layer],false);
+            impl_->full_layers[layer]->set_l0_fp8_mirror(k,v,&owner.line_fp8_valid[layer],true);
+        }
+        if(created)owner.ensure_l0_rows(std::max(drafting.position_,0));
+    }
+}
+
+bool Exl3TextContext::exact_line() const noexcept {return impl_->exact_line;}
+
+void Exl3TextContext::sync_exact_line_from(Exl3TextContext& source,cudaStream_t stream,bool outputs) {
+    require(&source!=this && (impl_->exact_line || source.impl_->exact_line) &&
+            source.impl_->model==impl_->model && source.position_>0 &&
+            source.impl_->last_rows>0 && !impl_->graph_capture_active &&
+            (!impl_->transaction || !impl_->transaction->active),
+        "exact line sync needs a forwarded exact-line peer of the same model");
+    impl_->join_repair(stream);
+    source.impl_->join_repair(stream);
+    Exl3GdnRootCopies copies;
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->gdn_layers[layer])
+            copies.layer[copies.count++]=impl_->gdn_layers[layer]->live_state_copies_from(
+                *source.impl_->gdn_layers[layer]);
+    exl3_gdn_launch_root_copies(copies,stream);
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->full_layers[layer])
+            impl_->full_layers[layer]->copy_l0_window_from(*source.impl_->full_layers[layer],stream,
+                impl_->exact_line);
+    cuda_check(cudaMemcpyAsync(impl_->position_device,source.impl_->position_device,3*sizeof(int),
+        cudaMemcpyDeviceToDevice,stream),"exact line device position");
+    if(outputs) {
+        auto& from=*source.impl_;
+        cuda_check(cudaMemcpyAsync(impl_->logits,from.logits,kVocab*sizeof(std::uint16_t),
+            cudaMemcpyDeviceToDevice,stream),"exact line logits");
+        const auto rows_bytes=[](int rows){return static_cast<std::size_t>(rows)*kHidden*sizeof(std::uint16_t);};
+        if(impl_->shared_taps || from.shared_taps) {
+            // Rows the source still holds, as many as this context's planes take.
+            const int rows=from.tap_rows;
+            int first=rows;
+            if(rows>0 && impl_->taps[0] && from.taps[0])
+                first=from.read_held_tap_rows(impl_->tap_write_first(rows),stream,
+                    [&](int held,const std::array<const std::uint16_t*,6>& planes) {
+                        for(std::size_t plane=0;plane<planes.size();++plane)
+                            cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(plane,held),planes[plane],
+                                rows_bytes(rows-held),cudaMemcpyDeviceToDevice,stream),"exact line taps");
+                    });
+            impl_->publish_tap_rows(rows,std::min(first,rows));
+            // Rows below the private tier stay in the shared pool under the
+            // source's claim (a line pass of more rows than the tier): this
+            // context takes the claim over, so readers of the whole pass (the
+            // draft ring's re-commit) still find [pool_first,first).
+            if(impl_->shared_taps && impl_->shared_taps==from.shared_taps && !impl_->tap_rows.in_pool &&
+               !from.tap_rows.in_pool && first>0) {
+                auto& pool=*impl_->shared_taps;
+                std::lock_guard lock(pool.mutex);
+                if(pool.owner==&from && from.tap_rows.claim==pool.claims && from.tap_rows.pool_rows==rows &&
+                   !pool.owner_in_pass) {
+                    pool.owner=impl_.get();
+                    impl_->tap_rows.claim=pool.claims;
+                    impl_->tap_rows.pool_first=from.tap_rows.pool_first;
+                    impl_->tap_rows.pool_rows=rows;
+                    from.trace_tap_pool("handover",rows,from.tap_rows.pool_first);
+                }
+            }
+        } else {
+        for(std::size_t tap=0;tap<kTapLayers.size();++tap)
+            if(impl_->taps[tap] && from.taps[tap] && from.tap_rows>0)
+                cuda_check(cudaMemcpyAsync(impl_->taps[tap]->ptr,from.taps[tap]->ptr,rows_bytes(from.tap_rows),
+                    cudaMemcpyDeviceToDevice,stream),"exact line taps");
+        if(impl_->embedding_trace && from.embedding_trace && from.embedding_rows>0)
+            cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,from.embedding_trace->ptr,
+                rows_bytes(from.embedding_rows),cudaMemcpyDeviceToDevice,stream),"exact line embedding rows");
+        impl_->tap_rows=source.impl_->tap_rows;
+        }
+    }
+    position_=source.position_;
+    impl_->last_rows=source.impl_->last_rows;
+    if(!outputs)impl_->tap_rows=source.impl_->tap_rows;
+    impl_->embedding_rows=source.impl_->embedding_rows;
+    if(impl_->continuation)impl_->continuation->rows=0;
+    impl_->tap_generation.fetch_add(1,std::memory_order_release);
+    impl_->qkv_trace_valid=false;
+}
+
+void Exl3TextContext::set_fold_peer(Exl3TextContext* line,std::span<const std::int64_t> tokens,
+    cudaStream_t line_stream) {
+    require(!line || (line!=this && line->impl_->exact_line && !tokens.empty() && tokens.size()<=24),
+        "fold peer must be an exact line verifying 1..24 rows");
+    fold_peer_=line;
+    fold_tokens_.assign(tokens.begin(),tokens.end());
+    fold_stream_=line_stream;
 }
 
 std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
-    std::span<const std::int64_t> next,cudaStream_t stream) {
+    std::span<const std::int64_t> next,cudaStream_t stream,float tolerance) {
     const int rows=impl_->last_rows;
     require(impl_->continuation && impl_->continuation->capacity>0 && impl_->last_stack_output &&
             rows>0 && next.size()==static_cast<std::size_t>(rows) &&
             !impl_->graph_active && !impl_->graph_capture_active,
             "exact row scores need a completed eager forward and prepared continuation head");
-    auto& scratch=*impl_->continuation;
-    // Private 16-row native head (the continuation head holds 8 rows): half
-    // the head weight streams per verified block. Never freed (process-lived,
-    // like the row buffers).
+    // Private 32-row head (the batched multi-agent head route): the head
+    // weights stream once per 32 verified rows (16-row H6 tiles: 45 -> ~20 ms
+    // per 1024-row block). Never freed (process-lived, like the row buffers).
     struct Buffers {
         std::int64_t* next=nullptr; std::int64_t* greedy=nullptr; float* gap=nullptr; int rows=0;
-        Exl3CudaLinearWorkspace* head=nullptr; std::uint16_t* norm=nullptr; std::uint16_t* logits=nullptr;
-        bool head_tried=false;
+        std::unique_ptr<Exl3CudaLinearWorkspace> head; std::uint16_t* norm=nullptr; std::uint16_t* logits=nullptr;
     };
-    static thread_local Buffers buffers;
-    constexpr int kScoreRows=16;
-    if(!buffers.head_tried) {
-        buffers.head_tried=true;
-        auto* head=new Exl3CudaLinearWorkspace(kHidden,kVocab,kScoreRows);
-        head->set_native_continuation16(true);
-        if(std::strcmp(head->dispatch_name(impl_->model->lm_head_metadata,kScoreRows),"h6_small_m_single_split")==0) {
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.norm),
-                static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),"row score head rows");
-            cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.logits),
-                static_cast<std::size_t>(kScoreRows)*kVocab*sizeof(std::uint16_t)),"row score head logits");
-            buffers.head=head;
-        } else delete head;
+    // Process-wide: exact row scores run inside exclusive verifier passes
+    // (one lane at a time), so the 32-row head workspace is shared.
+    static Buffers buffers;
+    static std::mutex buffers_mutex;
+    const std::lock_guard buffers_lock(buffers_mutex);
+    constexpr int kScoreRows=32;
+    if(!buffers.head) {
+        buffers.head=std::make_unique<Exl3CudaLinearWorkspace>(kHidden,kVocab,kScoreRows);
+        buffers.head->enable_draft_batched();
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.norm),
+            static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),"row score head rows");
+        cuda_check(cudaMemset(buffers.norm,0,static_cast<std::size_t>(kScoreRows)*kHidden*sizeof(std::uint16_t)),
+            "row score head rows");
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.logits),
+            static_cast<std::size_t>(kScoreRows)*kVocab*sizeof(std::uint16_t)),"row score head logits");
     }
     if(buffers.rows<rows) {
         cudaFree(buffers.next); cudaFree(buffers.greedy); cudaFree(buffers.gap);
@@ -9507,34 +11733,31 @@ std::vector<Exl3TextContext::RowScore> Exl3TextContext::exact_row_scores(
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&buffers.gap),capacity*sizeof(float)),"row score buffers");
         buffers.rows=capacity;
     }
-    cuda_check(cudaMemcpyAsync(buffers.next,next.data(),next.size_bytes(),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(buffers.next,next.data(),next.size_bytes(),stream),
         "upload row score next tokens");
-    auto* norm=buffers.head?buffers.norm:static_cast<std::uint16_t*>(scratch.final_norm->ptr);
-    auto* all_logits=buffers.head?buffers.logits:static_cast<std::uint16_t*>(scratch.logits->ptr);
-    auto& head_workspace=buffers.head?*buffers.head:*scratch.head_workspace;
-    const int chunk=buffers.head?kScoreRows:scratch.capacity;
-    for(int first=0;first<rows;first+=chunk) {
-        const int count=std::min(chunk,rows-first);
-        for(int row=0;row<count;++row) {
-            final_rms_norm_kernel<<<1,512,0,stream>>>(
-                impl_->last_stack_output+static_cast<std::size_t>(first+row)*kHidden,
-                impl_->model->final_norm,norm+static_cast<std::size_t>(row)*kHidden);
-        }
-        const char* dispatch=head_workspace.dispatch_name(impl_->model->lm_head_metadata,count);
-        if(std::strcmp(dispatch,"h6_small_m_single_split")==0)
-            head_workspace.forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
-                norm,all_logits,count,stream);
-        else for(int row=0;row<count;++row)
-            impl_->head_workspace->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
-                norm+static_cast<std::size_t>(row)*kHidden,all_logits+static_cast<std::size_t>(row)*kVocab,1,stream);
-        exact_row_score_kernel<<<count,1024,0,stream>>>(all_logits,buffers.next+first,
+    for(int first=0;first<rows;first+=kScoreRows) {
+        const int count=std::min(kScoreRows,rows-first);
+        final_rms_norm_kernel<<<count,512,0,stream>>>(
+            impl_->last_stack_output+static_cast<std::size_t>(first)*kHidden,
+            impl_->model->final_norm,buffers.norm);
+        // The batched head route takes more than 8 rows; a short tail block
+        // also scores rows it ignores (row-independent logits).
+        buffers.head->forward(impl_->model->lm_head,impl_->model->lm_head_metadata,
+            buffers.norm,buffers.logits,std::max(count,9),stream);
+        if(impl_->sampling.active())
+            exl3_sampled_score_kernel<<<count,kSampledThreads,0,stream>>>(buffers.logits,kVocab,
+                impl_->sampling,position_-rows+first+1,tolerance,buffers.next+first,
+                buffers.greedy+first,buffers.gap+first);
+        else
+        exact_row_score_kernel<<<count,1024,0,stream>>>(buffers.logits,buffers.next+first,
             buffers.greedy+first,buffers.gap+first);
         cuda_check(cudaGetLastError(),"launch exact row scores");
     }
     std::vector<std::int64_t> greedy(rows);
     std::vector<float> gap(rows);
-    cuda_check(cudaMemcpyAsync(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),cudaMemcpyDeviceToHost,stream),"row score greedy");
-    cuda_check(cudaMemcpyAsync(gap.data(),buffers.gap,rows*sizeof(float),cudaMemcpyDeviceToHost,stream),"row score gaps");
+    cuda_check(voidinfer::cuda_poll_stream(stream),"row scores poll");
+    cuda_check(exl3_d2h_async(greedy.data(),buffers.greedy,rows*sizeof(std::int64_t),stream),"row score greedy");
+    cuda_check(exl3_d2h_async(gap.data(),buffers.gap,rows*sizeof(float),stream),"row score gaps");
     cuda_check(cudaStreamSynchronize(stream),"row scores");
     std::vector<RowScore> result(rows);
     for(int i=0;i<rows;++i) result[i]={greedy[i],gap[i]};
@@ -9555,17 +11778,15 @@ void Exl3TextContext::canonicalize_exact_rows(cudaStream_t stream) {
         "exact final-row canonicalization requires intact ordinary output");
     impl_->validate_target_projection_execution(stream);
     const int rows=impl_->tap_rows;
-    if(rows>1) {
-        for(const auto& tap:impl_->taps)
-            cuda_check(cudaMemcpyAsync(tap->ptr,
-                static_cast<const std::uint16_t*>(tap->ptr)+(rows-1)*kHidden,
-                kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-                "retain exact continuation final tap");
-        cuda_check(cudaMemcpyAsync(impl_->embedding_trace->ptr,
-            static_cast<const std::uint16_t*>(impl_->embedding_trace->ptr)+(rows-1)*kHidden,
-            kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
-            "retain exact continuation final embedding");
-    }
+    if(rows>1)
+        impl_->read_tap_rows(rows-1,1,stream,"retain exact continuation final row",
+            [&](const std::array<const std::uint16_t*,6>& planes) {
+                for(std::size_t plane=0;plane<planes.size();++plane)
+                    if(impl_->tap_write_plane(plane,0)!=planes[plane])
+                        cuda_check(cudaMemcpyAsync(impl_->tap_write_plane(plane,0),planes[plane],
+                            kHidden*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,stream),
+                            "retain exact continuation final tap");
+            });
     impl_->tap_rows=1; impl_->embedding_rows=1; impl_->last_rows=1;
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
 }
@@ -9645,6 +11866,8 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     if (retained_rows == attempted_rows) {
         for (auto& layer : impl_->full_layers)
             if (layer) layer->invalidate_retained_prefix();
+        impl_->live_repair_all(stream);
+        impl_->live_release(stream);
         return;
     }
 
@@ -9661,11 +11884,11 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     if (!host_kv && !device_kv)
         impl_->oscar->restore_checkpoint(transaction.oscar_checkpoint, stream);
     static const bool repair_graph=[] {
-        const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_GRAPH");
+        const char* value=std::getenv("VOIDINFER_EXL3_GDN_REPAIR_GRAPH");
         if(!value)return true;  // measured default; "0" keeps eager per-layer repair
         if(std::strcmp(value,"0")==0)return false;
         if(std::strcmp(value,"1")==0)return true;
-        throw std::invalid_argument("NINFER_EXL3_GDN_REPAIR_GRAPH must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GDN_REPAIR_GRAPH must be 0 or 1");
     }();
     if (repair_graph && device_kv && fail_after_model_layer < 0 &&
         attempted_rows >= 2 && attempted_rows <= 8) {
@@ -9725,10 +11948,10 @@ void Exl3TextContext::retain_transaction_prefix_impl(
             graph.ready=true;
         }
         static const bool overlap=[] {
-            const char* value=std::getenv("NINFER_EXL3_GDN_REPAIR_OVERLAP");
+            const char* value=std::getenv("VOIDINFER_EXL3_GDN_REPAIR_OVERLAP");
             return !value || std::strcmp(value,"0")!=0;
         }();
-        if(overlap) {
+        if(overlap && impl_->gdn_repair_overlap) {
             if(!impl_->repair_stream) {
                 cuda_check(cudaStreamCreateWithFlags(&impl_->repair_stream,
                     cudaStreamNonBlocking),"create overlapped GDN repair stream");
@@ -9769,8 +11992,8 @@ void Exl3TextContext::retain_transaction_prefix_impl(
         kVocab * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream),
         "select P2 retained-prefix logits");
     const int device_position = base_position + retained_rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &device_position,
-                               sizeof(device_position), cudaMemcpyHostToDevice,
+    cuda_check(exl3_h2d_async(impl_->position_device, &device_position,
+                               sizeof(device_position),
                                stream),
                "set P2 retained-prefix device position");
 
@@ -9802,13 +12025,14 @@ void Exl3TextContext::retain_transaction_prefix_impl(
     // Attempt taps and embedding already contain the exact prefix. Publish
     // their shorter logical extent only after all repair work and final device
     // metadata copies were enqueued successfully.
+    impl_->kv_rows_rewritten_from(base_position + retained_rows);
     position_ = base_position + retained_rows;
     impl_->tap_rows = retained_rows;
     impl_->embedding_rows = retained_rows;
     impl_->last_rows = retained_rows;
     impl_->continuation->rows = retained_rows;
     impl_->qkv_trace_valid = false;
-    impl_->invalidate_native_mtp_hidden_capture();
+    impl_->live_release(stream);
     transaction.rollback_required = false;
 }
 
@@ -9844,8 +12068,8 @@ std::vector<std::uint16_t> Exl3TextContext::continuation_logits_bits_host(
             "P2 target continuation logits are invalid");
     const std::size_t count = static_cast<std::size_t>(impl_->continuation->rows) * kVocab;
     std::vector<std::uint16_t> raw(count);
-    cuda_check(cudaMemcpyAsync(raw.data(), impl_->continuation->logits->ptr,
-                               count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(raw.data(), impl_->continuation->logits->ptr,
+                               count * sizeof(std::uint16_t), stream),
                "download P2 target continuation logits");
     cuda_check(cudaStreamSynchronize(stream), "synchronize P2 target continuation logits");
     const auto rows=impl_->continuation->rows;
@@ -9911,6 +12135,55 @@ void Exl3TextContext::prepare_greedy_packet() {
         impl_->persistent_bytes=next_impl;persistent_bytes_=next_public;
     }
 }
+namespace {
+constexpr int kPresenceChunk=64;
+struct PresenceChunk {int first,count;int token[kPresenceChunk];};
+__global__ void exl3_presence_truncate_kernel(std::int32_t* table,int vocabulary,int from) {
+    const int v=static_cast<int>(blockIdx.x*blockDim.x+threadIdx.x);
+    if(v<vocabulary && table[v]>=from) table[v]=kExl3AbsentOccurrence;
+}
+__global__ void exl3_presence_record_kernel(std::int32_t* table,PresenceChunk chunk) {
+    const int i=static_cast<int>(threadIdx.x);
+    if(i<chunk.count) atomicMin(table+chunk.token[i],chunk.first+i);
+}
+} // namespace
+
+void exl3_presence_reset(std::int32_t* table,cudaStream_t stream) {
+    cuda_check(cudaMemsetAsync(table,0x7f,static_cast<std::size_t>(kVocab)*sizeof(std::int32_t),stream),
+        "presence table reset");
+}
+void exl3_presence_truncate(std::int32_t* table,int from,cudaStream_t stream) {
+    exl3_presence_truncate_kernel<<<(kVocab+255)/256,256,0,stream>>>(table,kVocab,from);
+    cuda_check(cudaGetLastError(),"presence table truncate");
+}
+void exl3_presence_record(std::int32_t* table,int first,const std::int64_t* tokens,std::size_t count,
+    cudaStream_t stream) {
+    for(std::size_t at=0;at<count;at+=kPresenceChunk) {
+        PresenceChunk chunk{};
+        chunk.first=first+static_cast<int>(at);
+        chunk.count=static_cast<int>(std::min<std::size_t>(kPresenceChunk,count-at));
+        for(int i=0;i<chunk.count;++i) {
+            const auto token=tokens[at+static_cast<std::size_t>(i)];
+            require(token>=0 && token<kVocab,"presence token outside the vocabulary");
+            chunk.token[i]=static_cast<int>(token);
+        }
+        exl3_presence_record_kernel<<<1,kPresenceChunk,0,stream>>>(table,chunk);
+        cuda_check(cudaGetLastError(),"presence table record");
+    }
+}
+
+void Exl3TextContext::set_device_sampling(const Exl3DeviceSampling& sampling) noexcept {
+    impl_->sampling=sampling;
+}
+const Exl3DeviceSampling& Exl3TextContext::device_sampling() const noexcept {
+    return impl_->sampling;
+}
+void Exl3TextContext::set_sampling_row_depths(std::span<const int> depths) {
+    impl_->sampling_row_depths.assign(depths.begin(),depths.end());
+}
+void Exl3TextContext::set_sampling_row_inputs(std::span<const std::int64_t> inputs) {
+    impl_->sampling_row_inputs.assign(inputs.begin(),inputs.end());
+}
 Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t stream) {
     const auto* source=continuation ? continuation_logits_device() : logits_device();
     const int rows=continuation ? continuation_rows() : 1;
@@ -9923,13 +12196,19 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet(bool continuation, cudaStream_t 
     result.serial=++impl_->greedy_serial;
     auto* output=static_cast<Exl3GreedyRow*>(impl_->greedy_rows->ptr);
     try {
-        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output);
+        if(impl_->sampling.active()) {
+            exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
+                position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,result.serial,output,
+                impl_->sampled_slice_scratch());
+        }
+        else
+        exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,result.serial,output,impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"greedy packet reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         // Context-owned destination survives exceptions/partial transfers. No
         // stack packet escapes or is reused after a failed completion fence.
-        cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),
-            cudaMemcpyDeviceToHost,stream),"greedy packet download");
+        cuda_check(voidinfer::cuda_poll_stream(stream),"greedy packet poll");
+        cuda_check(exl3_d2h_async(impl_->greedy_host_rows.data(),output,rows*sizeof(Exl3GreedyRow),stream),"greedy packet download");
         cuda_check(cudaStreamSynchronize(stream),"greedy packet readiness");
         if(continuation)
             require(impl_->complete_continuation_graph_use(rows,stream),
@@ -9981,16 +12260,22 @@ Exl3PendingGreedyPacket Exl3TextContext::submit_greedy_packet(
         acquisition,execution,reinterpret_cast<std::uintptr_t>(
             defer_host_readback?transfer->consumer_event:transfer->event));
     try {
+        if(impl_->sampling.active()) {
+            exl3_launch_sampled_packet(rows,stream,source,kVocab,kVocab,impl_->sampling,
+                position_-rows+1,impl_->sampling_row_depths,impl_->sampling_row_inputs,pending.serial_,
+                static_cast<Exl3GreedyRow*>(transfer->device->ptr),impl_->sampled_slice_scratch());
+        }
+        else
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,source,kVocab,kVocab,
-            pending.serial_,static_cast<Exl3GreedyRow*>(transfer->device->ptr));
+            pending.serial_,static_cast<Exl3GreedyRow*>(transfer->device->ptr),impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"pending greedy packet reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
         cuda_check(cudaEventRecord(transfer->device_event,stream),
             "pending greedy packet device readiness event");
         if(!defer_host_readback) {
             transfer->host_readback_submitted=true;
-            cuda_check(cudaMemcpyAsync(transfer->host,transfer->device->ptr,
-                rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,stream),
+            cuda_check(exl3_d2h_async(transfer->host,transfer->device->ptr,
+                rows*sizeof(Exl3GreedyRow),stream),
                 "pending greedy packet download");
             cuda_check(cudaEventRecord(transfer->event,stream),
                 "pending greedy packet readiness event");
@@ -10183,11 +12468,11 @@ Exl3GreedyPacket Exl3TextContext::greedy_packet_from_scores_for_test(
     try {
         exl3_launch_greedy_packet(impl_->gaming[Gopt::GreedyWarp],rows,stream,
             static_cast<const std::uint16_t*>(represented.ptr),vocabulary,stride,
-            result.serial,output);
+            result.serial,output,impl_->greedy_split_scratch());
         cuda_check(cudaGetLastError(),"greedy packet fixture reduction");
         if(impl_->gaming[Gopt::GreedyWarp])gopt_record(impl_->gaming_submissions,Gopt::GreedyWarp);
-        cuda_check(cudaMemcpyAsync(impl_->greedy_host_rows.data(),output,
-            rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,stream),
+        cuda_check(exl3_d2h_async(impl_->greedy_host_rows.data(),output,
+            rows*sizeof(Exl3GreedyRow),stream),
             "greedy packet fixture download");
         cuda_check(cudaStreamSynchronize(stream),"greedy packet fixture readiness");
     } catch(...) {impl_->greedy_readback_failed=true;throw;}
@@ -10246,10 +12531,10 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
             numerical_assessment.reason)));
     if (position_ <= 0 || position_ > impl_->max_context - 8)
         return fail("fixed-B8 continuation graph position extent");
-    const int split_class = ninfer::ops::detail::
+    const int split_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
     for (int row = 1; row < 8; ++row) {
-        if (ninfer::ops::detail::
+        if (voidinfer::ops::detail::
                 oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     position_ + row + 1) != split_class)
             return fail("fixed-B8 continuation crosses an OSCAR split-class boundary");
@@ -10285,7 +12570,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
             "active: compatible fixed-B8 graph reused after context reset";
         return true;
     }
-    const int saved_tap_rows = impl_->tap_rows;
+    const Impl::TapRows saved_tap_rows = impl_->tap_rows;
     const int saved_embedding_rows = impl_->embedding_rows;
     const int saved_last_rows = impl_->last_rows;
     const bool saved_qkv_trace_valid = impl_->qkv_trace_valid;
@@ -10302,7 +12587,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         // instantiate() destroys its executable.
         if(continuation.graph_definition.ready() ||
             continuation.graph_executable.ready()) {
-            cuda_check(cudaDeviceSynchronize(),
+            cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),
                 "drain incompatible fixed-B8 graph before recapture");
             if(continuation.graph_lifecycle.pending())
                 require(impl_->complete_continuation_graph_use(
@@ -10314,7 +12599,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         cuda_check(cudaStreamSynchronize(stream),
                    "synchronize before fixed-B8 continuation capture");
         impl_->bind_graph_device();
-        const auto retired=ninfer::detail::retire_decode_graph_pair(
+        const auto retired=voidinfer::detail::retire_decode_graph_pair(
             continuation.graph_executable,continuation.graph_definition);
         if(retired!=cudaSuccess) {
             continuation.graph_active=false;
@@ -10394,7 +12679,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
         impl_->qkv_trace_valid = saved_qkv_trace_valid;
         continuation.rows = 0;
         if(impl_->graph_retirement_error)throw; // Never retry a failed native destroy.
-        const auto retirement=cudaDeviceSynchronize();
+        const auto retirement=voidinfer::cuda_device_synchronize_outside_capture();
         if(retirement!=cudaSuccess) {
             continuation.graph_active=false;
             continuation.projection_binding.invalidate();
@@ -10408,7 +12693,7 @@ bool Exl3TextContext::capture_continuation_graph(cudaStream_t stream) {
             (void)impl_->complete_continuation_graph_use(
                 8,continuation.graph_origin_stream);
         continuation.graph_lifecycle.invalidate("fixed-B8 capture failed");
-        const auto destroyed=ninfer::detail::retire_decode_graph_pair(
+        const auto destroyed=voidinfer::detail::retire_decode_graph_pair(
             continuation.graph_executable,continuation.graph_definition);
         if(destroyed!=cudaSuccess) {
             continuation.graph_active=false;
@@ -10474,10 +12759,10 @@ bool Exl3TextContext::capture_continuation_graph_rows(
             numerical_assessment.reason)));
     if (position_ <= 0 || position_ > impl_->max_context - rows)
         return fail("multi-depth continuation graph position extent");
-    const int split_class = ninfer::ops::detail::
+    const int split_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
     for (int row = 1; row < rows; ++row) {
-        if (ninfer::ops::detail::
+        if (voidinfer::ops::detail::
                 oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     position_ + row + 1) != split_class)
             return fail("multi-depth continuation crosses an OSCAR split-class boundary");
@@ -10508,7 +12793,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         continuation.graph_active = true;
         return true;
     }
-    const int saved_tap_rows = impl_->tap_rows;
+    const Impl::TapRows saved_tap_rows = impl_->tap_rows;
     const int saved_embedding_rows = impl_->embedding_rows;
     const int saved_last_rows = impl_->last_rows;
     const bool saved_qkv_trace_valid = impl_->qkv_trace_valid;
@@ -10520,7 +12805,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
     };
     try {
         if (graph.definition.ready() || graph.executable.ready()) {
-            cuda_check(cudaDeviceSynchronize(),
+            cuda_check(voidinfer::cuda_device_synchronize_outside_capture(),
                        "drain incompatible multi-depth graph before recapture");
             if(graph.lifecycle.pending())
                 require(impl_->complete_continuation_graph_use(
@@ -10531,7 +12816,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         cuda_check(cudaStreamSynchronize(stream),
                    "synchronize before multi-depth continuation capture");
         impl_->bind_graph_device();
-        const auto retired=ninfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
+        const auto retired=voidinfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
         if(retired!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
@@ -10609,7 +12894,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         impl_->qkv_trace_valid = saved_qkv_trace_valid;
         continuation.rows = 0;
         if(impl_->graph_retirement_error)throw; // Preserve uncertain handles without retry.
-        const auto retirement=cudaDeviceSynchronize();
+        const auto retirement=voidinfer::cuda_device_synchronize_outside_capture();
         if(retirement!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
@@ -10622,7 +12907,7 @@ bool Exl3TextContext::capture_continuation_graph_rows(
         if(graph.lifecycle.pending())
             (void)impl_->complete_continuation_graph_use(rows,graph.origin_stream);
         graph.lifecycle.invalidate("multi-depth capture failed");
-        const auto destroyed=ninfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
+        const auto destroyed=voidinfer::detail::retire_decode_graph_pair(graph.executable,graph.definition);
         if(destroyed!=cudaSuccess) {
             graph.active=false;
             continuation.graph_active=false;
@@ -10684,10 +12969,10 @@ void Exl3TextContext::continue_rows_graph(
     require(std::all_of(token_ids.begin(),token_ids.end(),[](std::int64_t token) {
                 return token >= 0 && token < kVocab;
             }),"continuation graph token extent");
-    const int split_class = ninfer::ops::detail::
+    const int split_class = voidinfer::ops::detail::
         oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
     for (int row = 1; row < rows; ++row)
-        require(ninfer::ops::detail::
+        require(voidinfer::ops::detail::
                     oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                         position_ + row + 1) == split_class,
                 "continuation graph replay crosses OSCAR split class");
@@ -10712,14 +12997,13 @@ void Exl3TextContext::continue_rows_graph(
                 impl_->transaction->gdn_checkpoints[layer],base_position);
     for (auto& layer : impl_->full_layers)
         if (layer) layer->invalidate_retained_prefix();
-    cuda_check(cudaMemcpyAsync(impl_->token_ids,token_ids.data(),token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids,token_ids.data(),token_ids.size_bytes(),stream),
                "upload fixed-B8 continuation token IDs");
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&base_position,sizeof(base_position),
-                               cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&base_position,sizeof(base_position),stream),
                "upload fixed-B8 continuation base position");
     impl_->publish_continuation_graph_roles(
         static_cast<unsigned>(rows),stream,false);
+    impl_->live_arm_attempt(stream);
     const auto replay_serial=selected_lifecycle.begin_replay(
         selected_generation,stream);
     auto* selected_roles=impl_->continuation_graph_roles(
@@ -10727,6 +13011,7 @@ void Exl3TextContext::continue_rows_graph(
     try {
         require(selected_roles,"selected continuation graph roles disappeared");
         selected_roles->begin_use(selected_roles->generation(),replay_serial);
+        impl_->ensure_l0_rows(position_+rows);
         if (rows == 8) continuation.graph_executable.launch(stream);
         else additional->executable.launch(stream);
         ++continuation.graph_stats.replay_submissions;
@@ -10742,8 +13027,8 @@ void Exl3TextContext::continue_rows_graph(
     // checkpoint before any eager reappend; full commit must not advance twice.
     impl_->oscar->note_graph_replay(rows);
     const int final_device_position = base_position + rows - 1;
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&final_device_position,
-                               sizeof(final_device_position),cudaMemcpyHostToDevice,stream),
+    cuda_check(exl3_h2d_async(impl_->position_device,&final_device_position,
+                               sizeof(final_device_position),stream),
                "publish fixed-B8 continuation final device position");
 
     auto& transaction = *impl_->transaction;
@@ -10798,7 +13083,7 @@ Exl3TextContext::continuation_graph_admission() const noexcept {
         position_ > impl_->max_context - result.capacity)
         return result;
     for (int row = 0; row < result.capacity; ++row) {
-        if (ninfer::ops::detail::
+        if (voidinfer::ops::detail::
                 oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(
                     position_ + row + 1) != result.oscar_split_class)
             return result;
@@ -10970,19 +13255,18 @@ void Exl3TextContext::decode_graph(std::int64_t token_id, cudaStream_t stream) {
     require(position_ < impl_->max_context, "E4B2 graph context capacity exhausted");
     if (impl_->continuation) impl_->continuation->rows = 0;
     if (impl_->oscar && impl_->oscar->graph_class() != 0) {
-        const int need = ninfer::ops::detail::
+        const int need = voidinfer::ops::detail::
             oscar_int2_g128_mixed_attention_decode_split_count_for_tokens(position_ + 1);
         if (need != impl_->oscar->graph_class()) {
             throw std::invalid_argument("E4C1 OSCAR split-class transition: recapture the graph");
         }
     }
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, &token_id, sizeof(token_id),
-                               cudaMemcpyHostToDevice, stream), "upload E4B2 graph token ID");
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &position_, sizeof(position_),
-                               cudaMemcpyHostToDevice, stream), "upload E4B2 graph position");
+    cuda_check(exl3_h2d_async(impl_->token_ids, &token_id, sizeof(token_id), stream), "upload E4B2 graph token ID");
+    cuda_check(exl3_h2d_async(impl_->position_device, &position_, sizeof(position_), stream), "upload E4B2 graph position");
     embedding_lookup_kernel<<<(kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 1);
     cuda_check(cudaGetLastError(), "launch E4B2 graph embedding lookup");
+    impl_->ensure_l0_rows(position_+1);
     impl_->graph_executable.launch(stream);
     impl_->last_rows = 1;
     impl_->qkv_trace_valid = true;
@@ -11011,8 +13295,7 @@ Exl3TextDecodeAttribution Exl3TextContext::profile_decode(std::int64_t token_id,
     try {
         events.create();
         Impl::record(events.total_start, stream, "record E4B1 total start");
-        cuda_check(cudaMemcpyAsync(impl_->token_ids, &token_id, sizeof(token_id),
-                                   cudaMemcpyHostToDevice, stream), "upload E4B1 profile token ID");
+        cuda_check(exl3_h2d_async(impl_->token_ids, &token_id, sizeof(token_id), stream), "upload E4B1 profile token ID");
         Impl::record(events.token_end, stream, "record E4B1 token end");
         impl_->process_rows(impl_->token_ids, 1, position_, stream,
                             &events, true, false, true);
@@ -11056,8 +13339,7 @@ std::vector<float> Exl3TextContext::logits_host(cudaStream_t stream) const {
     require(!impl_->transaction || !impl_->transaction->rollback_required,
             "P2 target logits are invalid until transaction rollback");
     std::vector<std::uint16_t> raw(kVocab);
-    cuda_check(cudaMemcpyAsync(raw.data(), logits_, raw.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4A logits");
+    cuda_check(exl3_d2h_async(raw.data(), logits_, raw.size() * sizeof(std::uint16_t), stream), "download E4A logits");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A logits");
     impl_->greedy_readback.full_score_bytes+=raw.size()*sizeof(std::uint16_t);
     std::vector<float> result;
@@ -11071,8 +13353,10 @@ std::vector<float> Exl3TextContext::hidden_host(int layer, cudaStream_t stream) 
     require(tap >= 0, "E4A hidden layer is not one of the retained tap locations");
     require(impl_->capture_taps && impl_->tap_rows > 0, "E4A hidden taps were not captured");
     std::vector<std::uint16_t> raw(static_cast<std::size_t>(impl_->tap_rows) * kHidden);
-    cuda_check(cudaMemcpyAsync(raw.data(), impl_->taps[tap]->ptr, raw.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4A hidden tap");
+    impl_->read_tap_rows(0,impl_->tap_rows,stream,"E4A hidden tap rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(exl3_d2h_async(raw.data(), planes[tap], raw.size() * sizeof(std::uint16_t), stream), "download E4A hidden tap");
+        });
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A hidden tap");
     std::vector<float> result;
     result.reserve(raw.size());
@@ -11080,6 +13364,11 @@ std::vector<float> Exl3TextContext::hidden_host(int layer, cudaStream_t stream) 
     return result;
 }
 
+
+// Every lane-backed page of `state` is filled (readers of page values).
+static void require_state_kv_payload(const std::vector<std::shared_ptr<const Exl3ExactKVPage>>& pages) {
+    for(const auto& page:pages)if(page)exl3_require_kv_payload(*page);
+}
 std::size_t Exl3ExactHostState::payload_bytes() const noexcept {
     std::size_t bytes = logits_.size() * 2 + embedding_.size() * 2;
     for(const auto& page:kv_pages_) {
@@ -11097,6 +13386,7 @@ std::size_t Exl3ExactHostState::payload_bytes() const noexcept {
 void Exl3ExactHostState::visit_kv_for_test(const std::function<void(
     int, int, int, std::span<const std::uint16_t>,
     std::span<const std::uint16_t>)>& visitor) const {
+    require_state_kv_payload(kv_pages_);
     require(static_cast<bool>(visitor), "KV visitor missing");
     require(!l2_fp8_, "KV visitor requires FP16 pages");
     int first = 0;
@@ -11125,6 +13415,7 @@ bool Exl3ExactHostState::native_extent_valid(const int maximum_position) const n
         if(page->fp8!=l2_fp8_)return false;
         const auto elements=static_cast<std::size_t>(page->rows)*
             (l2_fp8_?l0_l2_fp8::kRowWords:1024);
+        if(!page->payload_deferred() || !page->source_id.load())
         for(int bank=0;bank<16;++bank)
             if(page->k[bank].size()!=elements || page->v[bank].size()!=elements)return false;
         first+=page->rows;
@@ -11133,6 +13424,7 @@ bool Exl3ExactHostState::native_extent_valid(const int maximum_position) const n
 }
 
 std::shared_ptr<const Exl3ExactHostState> Exl3ExactHostState::detached_payload_for_test() const {
+    require_state_kv_payload(kv_pages_);
     auto copy=create();
     copy->position_=position_;copy->device_position_=device_position_;
     copy->rope_offset_=rope_offset_;copy->tap_rows_=tap_rows_;
@@ -11152,6 +13444,7 @@ bool Exl3ExactHostState::same_payload(const Exl3ExactHostState& x) const {
     return model_identity_==x.model_identity_ && same_represented_payload_for_test(x);
 }
 bool Exl3ExactHostState::same_represented_payload_for_test(const Exl3ExactHostState& x) const {
+    require_state_kv_payload(kv_pages_);require_state_kv_payload(x.kv_pages_);
     if (position_ != x.position_ || rope_offset_ != x.rope_offset_ || device_position_ != x.device_position_ ||
         tap_rows_ != x.tap_rows_ || embedding_rows_ != x.embedding_rows_ || last_rows_ != x.last_rows_ ||
         kv_pages_.size()!=x.kv_pages_.size() || convolution_ != x.convolution_ || logits_ != x.logits_ ||
@@ -11169,6 +13462,7 @@ bool Exl3ExactHostState::same_represented_payload_for_test(const Exl3ExactHostSt
 }
 std::string Exl3ExactHostState::represented_first_difference_for_test(
     const Exl3ExactHostState& x) const {
+    require_state_kv_payload(kv_pages_);require_state_kv_payload(x.kv_pages_);
     const auto scalar=[&](const char* name,auto a,auto b)->std::string {
         if(a==b)return {};
         return std::string(name)+" expected="+std::to_string(a)+
@@ -11217,6 +13511,7 @@ std::string Exl3ExactHostState::represented_first_difference_for_test(
     return "equal";
 }
 std::uint64_t Exl3ExactHostState::represented_payload_hash_for_test() const noexcept {
+    require_state_kv_payload(kv_pages_);
     std::uint64_t hash=1469598103934665603ull;
     const auto bytes=[&](const void* data,std::size_t size) {
         const auto* p=static_cast<const std::uint8_t*>(data);
@@ -11302,6 +13597,12 @@ bool Exl3ExactHostState::is_prefix_of(const Exl3ExactHostState& x) const {
         const int rows=std::min(a.rows,position_-a.first);
         if(rows<=0 || b.rows<rows) return false;
         if(kv_pages_[page_index]==x.kv_pages_[page_index]) continue;
+        // Two pages still backed by the same lane read the same plane rows.
+        if(a.source_id.load() && a.source_id.load()==b.source_id.load() &&
+           a.payload_deferred() && b.payload_deferred() && !a.spilled() && !b.spilled() &&
+           !a.packed_in_ram() && !b.packed_in_ram()) continue;
+        exl3_require_kv_payload(a);exl3_require_kv_payload(b);
+        std::shared_lock payload(exl3_page_payload_mutex());
         const std::size_t elements=static_cast<std::size_t>(rows)*1024;
         for(int bank=0;bank<16;++bank) {
             if(a.k[bank].size()<elements || b.k[bank].size()<elements ||
@@ -11445,7 +13746,9 @@ void Exl3ExactHostState::visit_host_allocations(
     };
     for(const auto& state:requests) {
         if(!images.insert(state.get()).second) continue;
-        for(const auto& page:state->kv_pages_) if(pages.insert(page.get()).second) {
+        // Lane-backed pages (lane_kv_source.h) are skipped whether or not they
+        // were filled: a fill between two visits must not change the ranges.
+        for(const auto& page:state->kv_pages_) if(!page->source_id.load() && pages.insert(page.get()).second) {
             for(const auto& plane:page->k) visit(plane);
             for(const auto& plane:page->v) visit(plane);
         }
@@ -11457,6 +13760,24 @@ void Exl3ExactHostState::visit_host_allocations(
         for(const auto& plane:state->taps_) visit(plane);
         visit(state->logits_);visit(state->embedding_);
     }
+}
+
+std::uint64_t Exl3ExactHostState::lane_backed_kv_bytes(
+    std::span<const std::shared_ptr<const Exl3ExactHostState>> requests) {
+    std::unordered_set<const Exl3ExactHostState*> images;
+    std::unordered_set<const Exl3ExactKVPage*> pages;
+    std::uint64_t bytes=0;
+    for(const auto& state:requests) {
+        if(!state || !images.insert(state.get()).second) continue;
+        for(const auto& page:state->kv_pages_) {
+            if(!page->source_id.load() || !pages.insert(page.get()).second) continue;
+            // K and V banks of every full-attention layer: FP16 [4][256] rows,
+            // or L2 FP8 rows of 516 words.
+            const std::uint64_t row_words=page->fp8?516:static_cast<std::uint64_t>(kKVHeads)*kHeadDim;
+            bytes+=static_cast<std::uint64_t>(page->rows)*row_words*sizeof(std::uint16_t)*2*page->k.size();
+        }
+    }
+    return bytes;
 }
 
 Exl3RecurrentExportStats Exl3TextContext::recurrent_export_stats() const {return impl_->recurrent_export.snapshot();}
@@ -11498,6 +13819,23 @@ void Exl3TextContext::fail_export_copy_for_test(unsigned submission) {
     impl_->export_copy_fault_for_test=submission;
 }
 
+
+namespace {
+// Pinned host window for copies between the GPU-addressed growable L0 FP16
+// planes and pageable exact pages (export/restore). Per host thread: lanes
+// export and restore concurrently.
+constexpr int kL0PlaneStageRows = 8192;
+struct L0PlaneStage {
+    std::uint16_t* host = nullptr;
+    L0PlaneStage() {
+        cuda_check(cudaMallocHost(reinterpret_cast<void**>(&host),
+            static_cast<std::size_t>(kL0PlaneStageRows) * 1024 * sizeof(std::uint16_t)),
+            "L0 plane staging");
+    }
+    ~L0PlaneStage() { if (host) cudaFreeHost(host); }
+};
+L0PlaneStage& l0_plane_stage() { thread_local L0PlaneStage value; return value; }
+}  // namespace
 std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_state(cudaStream_t stream,bool share_prefix,
     bool fail_after_recurrent_plan_for_test) const {
     impl_->join_repair(stream);
@@ -11564,14 +13902,39 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
     state->embedding_rows_ = impl_->embedding_rows;
     state->last_rows_ = impl_->last_rows;
     const int prefix_position=share_prefix?impl_->exact_prefix_position:0;
-    require(prefix_position>=impl_->l0_planes_valid_from,
-        "L0 OSCAR sparse-restored planes need the restored prefix pages");
     const std::vector<std::shared_ptr<const Exl3ExactKVPage>> empty_prefix;
     const auto& prefix_pages=share_prefix?impl_->exact_prefix_pages:empty_prefix;
     // L0 OSCAR FP8 L2: fresh pages hold FP8 rows (prefix pages must match).
     const bool l2_fp8=Exl3NativeContextExtent::l0_oscar_enabled() && l0_l2_fp8::enabled();
+    // L0 OSCAR keeps the FP16 planes in mapped host memory: the page snapshot
+    // is a host copy, run in parallel after one stream fence, each task
+    // allocating and filling its own bank (no zero fill; previously one
+    // synchronized cudaMemcpyAsync per 64-row page and bank, ~90 ms at 4K).
+    bool host_planes=!l2_fp8,staged_planes=!l2_fp8;
+    for(int layer=0;layer<kLayers;++layer)
+        if(impl_->full_layers[layer]) {
+            const auto& k=*impl_->cache_k[layer];
+            const auto& v=*impl_->cache_v[layer];
+            host_planes=host_planes && k.host_mapped && v.host_mapped && k.cpu_visible() && v.cpu_visible();
+            // Growable planes: GPU-addressed host memory, copied out through a
+            // pinned window (one DMA per window and plane, pages filled in parallel).
+            staged_planes=staged_planes && k.host_mapped && v.host_mapped &&
+                !k.cpu_visible() && !v.cpu_visible();
+        }
+    // L0 contexts publish lane-backed pages: no KV copy at export, the
+    // planes keep the rows (VOIDINFER_EXL3_L0_DEFERRED_ROOT_KV=0 copies).
+    static const bool deferred_root_kv=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_L0_DEFERRED_ROOT_KV");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    const bool defer_kv=deferred_root_kv && !l2_fp8 && (host_planes || staged_planes) &&
+        Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->host_kv.enabled;
+    if(defer_kv)impl_->ensure_kv_source();
     auto extension=extend_exact_pages(prefix_pages,prefix_position,position_,false,nullptr,0,
-        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024);
+        impl_->request_metadata_reservation,l2_fp8?l0_l2_fp8::kRowWords:1024,
+        !host_planes && !staged_planes && !defer_kv);
+    if(defer_kv)
+        for(const auto& page:extension.fresh)impl_->kv_source->defer(page);
     for(const auto& page:extension.all)
         require(page->fp8==l2_fp8 || std::find(extension.fresh.begin(),extension.fresh.end(),page)!=extension.fresh.end(),
                 "L0 L2 FP8 prefix page format");
@@ -11585,7 +13948,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         snapshot_credit.reset();
     }
     const auto& fresh_pages=extension.fresh;
-    const auto* batched_kv_option=std::getenv("NINFER_EXL3_EXACT_KV_EXPORT_BATCHED_FENCE");
+    const auto* batched_kv_option=std::getenv("VOIDINFER_EXL3_EXACT_KV_EXPORT_BATCHED_FENCE");
     if(batched_kv_option && std::string_view(batched_kv_option)!="0" &&
        std::string_view(batched_kv_option)!="1")
         throw std::invalid_argument("exact KV export batched fence must be0 or1");
@@ -11599,8 +13962,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             batched_kv_capacity/(2*full_layer_count);
     const auto download = [&](auto& out, const void* src, std::size_t elements) {
         out.resize(elements);
-        cuda_check(cudaMemcpyAsync(out.data(), src, elements * sizeof(out[0]),
-                                  cudaMemcpyDeviceToHost, stream), "export exact host plane");
+        cuda_check(exl3_d2h_async(out.data(), src, elements * sizeof(out[0]), stream), "export exact host plane");
         // Pageable vector lifetime is bounded by this blocking API, including failure.
         cuda_check(cudaStreamSynchronize(stream), "complete exact host plane");
     };
@@ -11641,8 +14003,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         const auto submitted=plan.submit([&](const auto& segment) noexcept {
             if(++export_copy_submission==export_copy_fault)
                 return static_cast<int>(cudaErrorUnknown);
-            return static_cast<int>(cudaMemcpyAsync(segment.destination,
-                segment.source,segment.bytes,cudaMemcpyDeviceToHost,stream));
+            return static_cast<int>(exl3_d2h_async(segment.destination,
+                segment.source,segment.bytes,stream));
         });
         add_counter(export_stats.planned_copy_ranges,plan.logical_ranges());
         add_counter(export_stats.coalesced_copy_ranges,plan.coalesced_ranges());
@@ -11662,7 +14024,7 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                     for(const auto& layer:impl_->gdn_layers)if(layer){
                         require(plan.add(slab->data+slab->offsets[index],
                             layer->recurrent_state_device(),recurrent_sizes[index]*4,
-                            Exl3ExportPrecision::fp32),
+                            Exl3ExportPrecision::fp32,false,false),
                             "recurrent export copy plan capacity");
                         ++index;
                     }
@@ -11676,8 +14038,26 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         }
     }
     int full = 0, gdn = 0;
-    Exl3ExportCopyPlan<48> pageable_recurrent_plan;
-    Exl3ExportCopyPlan<48> convolution_plan;
+    struct HostKvCopy { std::vector<std::uint16_t>* output; std::size_t kept; const std::uint16_t* source; std::size_t elements; };
+    std::vector<HostKvCopy> host_kv_copies;
+    // Host planes that are not slab-backed (recurrent planes once retained
+    // roots hold the pinned slab pool, convolution states, logits, embedding
+    // and taps): DMA into a bounded pinned stage, one fence per stage fill,
+    // then the vectors fill in parallel with one copy each (previously a
+    // zero-filled resize and one staged pageable copy or bounce per plane:
+    // ~35 ms per pageable recurrent export, ~10 ms of taps after a prefill).
+    struct StagedDownload {
+        const void* device; std::size_t bytes; bool fp32;
+        std::function<void(const void*)> fill;
+    };
+    std::vector<StagedDownload> staged;
+    const auto stage_vector=[&](auto& output,const void* device,std::size_t elements,bool fp32) {
+        using T=typename std::remove_reference_t<decltype(output)>::value_type;
+        staged.push_back({device,elements*sizeof(T),fp32,[&output,elements](const void* host) {
+            const auto* first=static_cast<const T*>(host);
+            output.assign(first,first+elements);
+        }});
+    };
     Exl3ExportCopyPlan<batched_kv_capacity> batched_kv_plan;
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer] && state->l2_fp8_) {
@@ -11697,9 +14077,8 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                         l0_l2_fp8::pack_kernel<<<(count*4*32+255)/256,256,0,stream>>>(
                             source,staging.device,count);
                         cuda_check(cudaGetLastError(),"L0 L2 FP8 pack");
-                        cuda_check(cudaMemcpyAsync(staging.host,staging.device,
-                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,
-                            cudaMemcpyDeviceToHost,stream),"L0 L2 FP8 export");
+                        cuda_check(exl3_d2h_async(staging.host,staging.device,
+                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,stream),"L0 L2 FP8 export");
                         cuda_check(cudaStreamSynchronize(stream),"L0 L2 FP8 export");
                         // Page scatter is host memcpy bound: run the pages in parallel.
                         std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
@@ -11719,21 +14098,59 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
                 }
             }
             ++full;
+        } else if (impl_->full_layers[layer] && defer_kv) {
+            ++full;
+        } else if (impl_->full_layers[layer] && staged_planes) {
+            if(!fresh_pages.empty()) {
+                const int range_first=std::max(prefix_position,fresh_pages.front()->first);
+                auto& stage=l0_plane_stage();
+                for(int plane=0;plane<2;++plane) {
+                    const auto* source_plane=static_cast<const std::uint16_t*>(
+                        plane?impl_->cache_v[layer]->ptr:impl_->cache_k[layer]->ptr);
+                    for(int lo=range_first;lo<position_;) {
+                        const int hi=std::min(position_,(lo/64)*64+kL0PlaneStageRows);
+                        const int count=hi-lo;
+                        cuda_check(cudaMemcpyAsync(stage.host,source_plane+static_cast<std::size_t>(lo)*1024,
+                            static_cast<std::size_t>(count)*1024*sizeof(std::uint16_t),cudaMemcpyDefault,stream),
+                            "export L0 plane window");
+                        cuda_check(cudaStreamSynchronize(stream),"export L0 plane window");
+                        std::for_each(std::execution::par,fresh_pages.begin(),fresh_pages.end(),[&](const auto& page) {
+                            const int from=std::max(lo,page->first);
+                            const int to=std::min(hi,page->first+page->rows);
+                            if(to<=from) return;
+                            auto& output=plane?page->v[full]:page->k[full];
+                            // Earlier rows (cloned prefix or previous window) are present.
+                            output.reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*1024);
+                            output.resize(static_cast<std::size_t>(from-page->first)*1024);
+                            const auto* words=stage.host+static_cast<std::size_t>(from-lo)*1024;
+                            output.insert(output.end(),words,words+static_cast<std::size_t>(to-from)*1024);
+                        });
+                        state->kv_export_bytes_+=static_cast<std::size_t>(count)*1024*sizeof(std::uint16_t);
+                        lo=hi;
+                    }
+                }
+            }
+            ++full;
         } else if (impl_->full_layers[layer]) {
             for(const auto& page:fresh_pages) {
                 const int skip=std::clamp(prefix_position-page->first,0,page->rows);
                 const std::size_t elements=static_cast<std::size_t>(page->rows-skip)*1024;
                 const auto copy=[&](auto& output,const void* source) {
-                    auto* destination=output.data()+skip*1024;
                     const auto* source_first=static_cast<const std::uint16_t*>(source)+
                         static_cast<std::size_t>(page->first+skip)*1024;
+                    if(host_planes) {
+                        host_kv_copies.push_back({&output,static_cast<std::size_t>(skip)*1024,
+                            source_first,elements});
+                        state->kv_export_bytes_+=elements*2;
+                        return;
+                    }
+                    auto* destination=output.data()+skip*1024;
                     if(batched_kv_export) {
                         require(batched_kv_plan.add(destination,source_first,elements*2,
                             Exl3ExportPrecision::fp16),
                             "exact KV export batched plan capacity");
                     } else {
-                        cuda_check(cudaMemcpyAsync(destination,source_first,elements*2,
-                            cudaMemcpyDeviceToHost,stream),"export exact KV page suffix");
+                        cuda_check(exl3_d2h_async(destination,source_first,elements*2,stream),"export exact KV page suffix");
                         cuda_check(cudaStreamSynchronize(stream),"complete exact KV page suffix");
                     }
                     state->kv_export_bytes_+=elements*2;
@@ -11745,27 +14162,29 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         } else {
             const auto& l = impl_->gdn_layers[layer];
             export_stats.recurrent_bytes+=l->recurrent_state_bytes();
-            if(!state->recurrent_slab_) {
-                auto& output=state->recurrent_[gdn];
-                output.resize(l->recurrent_state_bytes()/sizeof(output[0]));
-                require(pageable_recurrent_plan.add(output.data(),
-                    l->recurrent_state_device(),l->recurrent_state_bytes(),
-                    Exl3ExportPrecision::fp32),
-                    "pageable recurrent export copy plan capacity");
-            }
-            auto& convolution=state->convolution_[gdn];
-            convolution.resize(l->physical_conv_state_bytes()/sizeof(convolution[0]));
-            require(convolution_plan.add(convolution.data(),
-                l->physical_conv_state_device(),l->physical_conv_state_bytes(),
-                Exl3ExportPrecision::fp16),
-                "convolution export copy plan capacity");
+            if(!state->recurrent_slab_)
+                stage_vector(state->recurrent_[gdn],l->recurrent_state_device(),
+                    l->recurrent_state_bytes()/sizeof(float),true);
+            stage_vector(state->convolution_[gdn],l->physical_conv_state_device(),
+                l->physical_conv_state_bytes()/sizeof(std::uint16_t),false);
             ++gdn;
         }
     }
+    if(!host_kv_copies.empty()) {
+        cuda_check(cudaStreamSynchronize(stream),"complete exact KV host plane writes");
+        std::for_each(std::execution::par,host_kv_copies.begin(),host_kv_copies.end(),
+            [](const HostKvCopy& copy) {
+                // Fresh banks are empty; a cloned partial page keeps its prefix rows.
+                auto& output=*copy.output;
+                output.reserve(static_cast<std::size_t>(Exl3ExactKVPage::token_capacity)*1024);
+                output.resize(copy.kept);
+                output.insert(output.end(),copy.source,copy.source+copy.elements);
+            });
+    }
     if(batched_kv_plan.size()) {
         const auto submitted=batched_kv_plan.submit([&](const auto& segment) noexcept {
-            return static_cast<int>(cudaMemcpyAsync(segment.destination,segment.source,
-                segment.bytes,cudaMemcpyDeviceToHost,stream));
+            return static_cast<int>(exl3_d2h_async(segment.destination,segment.source,
+                segment.bytes,stream));
         });
         if(!submitted)cuda_check(static_cast<cudaError_t>(submitted.status),
             "submit exact KV export batched plan");
@@ -11777,25 +14196,78 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
         impl_->host_kv.exact_kv_export_saved_fences+=
             batched_kv_plan.logical_ranges()-1;
     }
-    if(pageable_recurrent_plan.size()) {
-        Timing recurrent_timing{export_stats.recurrent_ms};
-        submit_export_plan(pageable_recurrent_plan,Exl3ExportPrecision::fp32,
-            "pageable recurrent export copy");
-        cuda_check(cudaStreamSynchronize(stream),
-            "complete pageable recurrent export copy plan");
-    }
-    if(convolution_plan.size()) {
-        submit_export_plan(convolution_plan,Exl3ExportPrecision::fp16,
-            "convolution export copy");
-        cuda_check(cudaStreamSynchronize(stream),
-            "complete convolution export copy plan");
-    }
-    download(state->logits_, impl_->logits, kVocab);
-    download(state->embedding_, impl_->embedding_trace->ptr,
-             static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
+    stage_vector(state->logits_,impl_->logits,kVocab,false);
+    if(impl_->shared_taps) {
+        // Rows no longer held (an older pass's, after another context claimed
+        // the shared tap pool) export as zeros: only the draft reads taps, and
+        // only right after the forward that wrote them.
+        require(impl_->embedding_rows==impl_->tap_rows,"shared tap export needs matching embedding rows");
+        const auto elements=static_cast<std::size_t>(impl_->tap_rows)*kHidden;
+        state->embedding_.assign(elements,0);
+        for(auto& plane:state->taps_)plane.assign(elements,0);
+        impl_->read_held_tap_rows(0,stream,[&](int first,const std::array<const std::uint16_t*,6>& planes) {
+            const auto offset=static_cast<std::size_t>(first)*kHidden;
+            const auto bytes=static_cast<std::size_t>(impl_->tap_rows-first)*Impl::tap_row_bytes;
+            for(std::size_t tap=0;tap<kTapLayers.size();++tap)
+                cuda_check(exl3_d2h_async(state->taps_[tap].data()+offset,planes[tap],bytes,stream),"export held tap rows");
+            cuda_check(exl3_d2h_async(state->embedding_.data()+offset,planes[5],bytes,stream),"export held embedding rows");
+        });
+        cuda_check(cudaStreamSynchronize(stream),"complete held tap row export");
+    } else {
+    stage_vector(state->embedding_,impl_->embedding_trace->ptr,
+        static_cast<std::size_t>(impl_->embedding_rows)*kHidden,false);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap)
-        download(state->taps_[tap], impl_->taps[tap]->ptr,
-                 static_cast<std::size_t>(impl_->tap_rows) * kHidden);
+        stage_vector(state->taps_[tap],impl_->taps[tap]->ptr,
+            static_cast<std::size_t>(impl_->tap_rows)*kHidden,false);
+    }
+    {
+        Timing staged_timing{export_stats.recurrent_ms};
+        struct Stage {
+            std::uint8_t* host=nullptr; std::size_t bytes=0;
+            ~Stage(){if(host)cudaFreeHost(host);}
+        };
+        thread_local Stage stage;
+        constexpr std::size_t kStageBytes=std::size_t{64}<<20;
+        if(!stage.host) {
+            void* host=nullptr;
+            cuda_check(cudaHostAlloc(&host,kStageBytes,cudaHostAllocDefault),"exact export stage");
+            stage.host=static_cast<std::uint8_t*>(host);stage.bytes=kStageBytes;
+        }
+        // Pool threads see their own thread_locals: bind this thread's stage.
+        std::uint8_t* const stage_host=stage.host;
+        for(std::size_t begin=0;begin<staged.size();) {
+            std::size_t end=begin,used=0;
+            std::vector<std::size_t> offsets;
+            while(end<staged.size() && (end==begin || used+staged[end].bytes<=kStageBytes)) {
+                require(staged[end].bytes<=kStageBytes,"exact export plane exceeds stage");
+                offsets.push_back(used);
+                add_counter(export_stats.planned_copy_ranges,1);
+                add_counter(export_stats.copy_submissions,1);
+                add_counter(staged[end].fp32?export_stats.fp32_copy_submissions:
+                    export_stats.fp16_copy_submissions,1);
+                const auto submitted=++export_copy_submission==export_copy_fault?cudaErrorUnknown:
+                    (staged[end].bytes?cudaMemcpyAsync(stage_host+used,staged[end].device,staged[end].bytes,
+                        cudaMemcpyDeviceToHost,stream):cudaSuccess);
+                if(submitted!=cudaSuccess) {
+                    // The stage must not be reused while a submitted copy may still land.
+                    (void)cudaStreamSynchronize(stream);
+                    cuda_check(submitted,"exact export copy");
+                }
+                used+=(staged[end].bytes+255)/256*256;
+                ++end;
+            }
+            cuda_check(cudaStreamSynchronize(stream),"complete exact export copies");
+            std::atomic<bool> fill_failed{false};
+            std::vector<std::size_t> indices(end-begin);
+            for(std::size_t i=0;i<indices.size();++i)indices[i]=i;
+            std::for_each(std::execution::par,indices.begin(),indices.end(),[&](std::size_t index) {
+                try {staged[begin+index].fill(stage_host+offsets[index]);}
+                catch(...) {fill_failed.store(true,std::memory_order_relaxed);}
+            });
+            if(fill_failed.load(std::memory_order_relaxed))throw std::bad_alloc();
+            begin=end;
+        }
+    }
     if(Exl3NativeContextExtent::l0_oscar_enabled()) {
         // Complete chunks already exported or restored in this lineage are shared.
         std::size_t full=0;
@@ -11825,6 +14297,35 @@ std::shared_ptr<const Exl3ExactHostState> Exl3TextContext::export_exact_host_sta
             for(const auto& chunk:state->l0_chunks_[layer])
                 if(chunk->rows==Exl3ExactHostState::kL0ChunkRows) prefix.push_back(chunk);
         }
+        // Lane-backed pages wholly inside the encoded rows get their codes:
+        // a later fill packs them losslessly against these chunks
+        // (l0_kv_pack.cuh); pages the planes no longer hold keep theirs.
+        if(impl_->kv_source && l0_kv_pack::enabled()) {
+            const std::size_t code_row=l0_oscar_format::row_code_bytes()/2;
+            constexpr std::size_t meta_row=l0_oscar_format::kRowMetaBytes/4;
+            for(const auto& page:state->kv_pages_) {
+                std::shared_ptr<Exl3PageCodes> codes;
+                if(page->first>=l0_oscar::kSinkRows && page->first+page->rows<=state->l0_rows_) {
+                    codes=std::make_shared<Exl3PageCodes>();
+                    for(std::size_t layer=0;layer<full && codes;++layer) {
+                        const auto index=static_cast<std::size_t>(page->first/Exl3ExactHostState::kL0ChunkRows);
+                        const auto& chunks=state->l0_chunks_[layer];
+                        if(index>=chunks.size() || chunks[index]->first>page->first ||
+                           chunks[index]->first+chunks[index]->rows<page->first+page->rows) {codes.reset();break;}
+                        const auto& chunk=chunks[index];
+                        const std::size_t row=static_cast<std::size_t>(page->first-chunk->first);
+                        const std::size_t rows=static_cast<std::size_t>(chunk->rows);
+                        codes->owners[layer]=chunk;
+                        codes->k_codes[layer]=chunk->codes()+row*code_row;
+                        codes->v_codes[layer]=chunk->codes()+(rows+row)*code_row;
+                        codes->k_meta[layer]=chunk->meta()+row*meta_row;
+                        codes->v_meta[layer]=chunk->meta()+(rows+row)*meta_row;
+                    }
+                    if(codes)codes->banks=static_cast<int>(full);
+                }
+                impl_->kv_source->assign_codes(*page,std::move(codes));
+            }
+        }
     }
     if(share_prefix) {
         impl_->exact_prefix_pages=state->kv_pages_;
@@ -11848,6 +14349,96 @@ bool Exl3TextContext::restore_exact_host_state_if_needed(const Exl3ExactHostStat
     require(state.rope_offset_==0||impl_->media_features,"nonzero media offset requires research context");
     if(exact_host_state_resident(state))return false;
     restore_exact_host_state(state,stream);return true;
+}
+
+std::size_t Exl3TextContext::l0_code_device_bytes() const noexcept {
+    std::size_t bytes=0;
+    for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_device_bytes();
+    return bytes;
+}
+
+std::size_t Exl3TextContext::prompt_projection_cache_bytes() const noexcept {
+    return impl_->numeric_prefill_projection_workspace?
+        impl_->numeric_prefill_projection_workspace->layer_reuse_bytes():0;
+}
+
+std::size_t Exl3TextContext::release_prompt_projection_cache(std::size_t keep_bytes) {
+    return impl_->numeric_prefill_projection_workspace?
+        impl_->numeric_prefill_projection_workspace->release_layer_reuse(keep_bytes):0;
+}
+
+namespace {
+std::atomic<std::uint64_t> reserved_l0_code_growth_bytes{0};
+}
+void Exl3TextContext::set_reserved_l0_code_growth(std::uint64_t bytes) noexcept {
+    reserved_l0_code_growth_bytes.store(bytes,std::memory_order_relaxed);
+}
+std::uint64_t Exl3TextContext::reserved_l0_code_growth() noexcept {
+    return reserved_l0_code_growth_bytes.load(std::memory_order_relaxed);
+}
+
+std::size_t Exl3TextContext::suspend_l0_codes(cudaStream_t stream) {
+    require(Exl3NativeContextExtent::l0_oscar_enabled() && !impl_->exact_line && impl_->suspended_code_rows<0 &&
+            !impl_->graph_capture_active && impl_->prompt_tier_depth==0,
+        "L0 code suspension needs an idle L0 context between rounds");
+    impl_->join_repair(stream);
+    const int rows=position_;
+    std::size_t bytes=0;
+    for(const auto& layer:impl_->full_layers)if(layer)bytes+=layer->l0_code_bytes(rows);
+    if(bytes>impl_->suspended_code_capacity) {
+        impl_->free_suspended_codes();
+        // When the driver refuses page-locked memory, a pageable stage only
+        // makes these copies synchronous: it replaces the stage instead of
+        // failing the engine.
+        if(cudaHostAlloc(reinterpret_cast<void**>(&impl_->suspended_codes),bytes,cudaHostAllocDefault)==cudaSuccess)
+            impl_->suspended_codes_pinned=true;
+        else {
+            (void)cudaGetLastError();
+            impl_->suspended_codes=static_cast<std::byte*>(::operator new(bytes));
+            impl_->suspended_codes_pinned=false;
+        }
+        impl_->suspended_code_capacity=bytes;
+        Exl3HostMemoryLedger::get().suspended_bytes+=static_cast<std::int64_t>(bytes);
+    }
+    auto* host=impl_->suspended_codes;
+    for(auto& layer:impl_->full_layers)if(layer) {
+        layer->copy_l0_codes(host,rows,true,stream);
+        host+=layer->l0_code_bytes(rows);
+    }
+    cuda_check(cudaStreamSynchronize(stream),"complete L0 code suspension copies");
+    const auto released=l0_code_device_bytes();
+    for(auto& layer:impl_->full_layers)if(layer)layer->release_l0_codes();
+    impl_->suspended_code_rows=rows;
+    return released;
+}
+
+void Exl3TextContext::resume_l0_codes(cudaStream_t stream) {
+    require(impl_->suspended_code_rows>=0,"L0 codes are not suspended");
+    const int rows=impl_->suspended_code_rows;
+    for(auto& layer:impl_->full_layers)if(layer)layer->ensure_l0_rows(rows);
+    auto* host=impl_->suspended_codes;
+    for(auto& layer:impl_->full_layers)if(layer) {
+        layer->copy_l0_codes(host,rows,false,stream);
+        host+=layer->l0_code_bytes(rows);
+    }
+    cuda_check(cudaStreamSynchronize(stream),"complete L0 code resumption copies");
+    impl_->suspended_code_rows=-1;
+}
+
+bool Exl3TextContext::l0_codes_suspended() const noexcept {return impl_->suspended_code_rows>=0;}
+
+void Exl3TextContext::park_l0_codes() noexcept {
+    if(!Exl3NativeContextExtent::l0_oscar_enabled())return;
+    impl_->resident_exact_state_id=0;
+    for(auto& layer:impl_->full_layers)if(layer)layer->release_l0_rows_beyond(0);
+}
+
+bool Exl3TextContext::kv_lane_resident(const Exl3ExactHostState& state) const noexcept {
+    // A rewrite of rows >= r fills every page reaching past r, the last one
+    // included: a still-deferred last page proves all earlier rows intact.
+    return impl_->kv_source && !state.kv_pages_.empty() &&
+        impl_->kv_source->holds(*state.kv_pages_.back()) &&
+        state.model_identity_==impl_->model->host_state_identity;
 }
 
 bool Exl3TextContext::exact_host_state_resident(const Exl3ExactHostState& state) const noexcept {
@@ -11909,6 +14500,7 @@ std::shared_ptr<const Exl3TurboAngleWarmPages> Exl3TextContext::make_turboangle_
     std::shared_ptr<const Exl3ExactHostState> source,int rows) {
     require(source && rows>0 && rows<=source->position_,"TurboAngle page extent");
     require(!source->l2_fp8_,"TurboAngle pages require FP16 L2");
+    require_state_kv_payload(source->kv_pages_);
     auto warm=std::shared_ptr<Exl3TurboAngleWarmPages>(new Exl3TurboAngleWarmPages);
     warm->source_=std::move(source); warm->rows_=rows; warm->first_=warm->source_->position_-rows;
     for(int bank=0;bank<16;++bank) {
@@ -11946,8 +14538,7 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
         "TurboAngle L1 delta rebase identity/lineage/state");
     const int first=old_root.position_,rows=new_root.position_-first;
     const auto upload=[&](void* destination,const auto& source,const char* label) {
-        cuda_check(cudaMemcpyAsync(destination,source.data(),source.size()*sizeof(source[0]),
-            cudaMemcpyHostToDevice,stream),label);
+        cuda_check(exl3_h2d_async(destination,source.data(),source.size()*sizeof(source[0]),stream),label);
         cuda_check(cudaStreamSynchronize(stream),"complete TurboAngle L1 delta upload");
     };
     int full=0,gdn=0;
@@ -11981,21 +14572,21 @@ void Exl3TextContext::rebase_oscar_host_state_delta(const Exl3ExactHostState& ol
         }
     }
     upload(impl_->logits,new_root.logits_,"upload TurboAngle L1 delta logits");
+    int tap_first=0;
+    if(impl_->shared_taps)
+        tap_first=impl_->upload_tap_rows({&new_root.taps_[0],&new_root.taps_[1],&new_root.taps_[2],
+            &new_root.taps_[3],&new_root.taps_[4],&new_root.embedding_},new_root.tap_rows_,stream,
+            "upload TurboAngle L1 delta taps");
+    else {
     upload(impl_->embedding_trace->ptr,new_root.embedding_,"upload TurboAngle L1 delta embedding");
     for(std::size_t tap=0;tap<kTapLayers.size();++tap)
         upload(impl_->taps[tap]->ptr,new_root.taps_[tap],"upload TurboAngle L1 delta tap");
-    cuda_check(cudaMemcpyAsync(impl_->position_device,&new_root.device_position_,sizeof(int),
-        cudaMemcpyHostToDevice,stream),"upload TurboAngle L1 delta position");
+    }
+    cuda_check(exl3_h2d_async(impl_->position_device,&new_root.device_position_,sizeof(int),stream),"upload TurboAngle L1 delta position");
     cuda_check(cudaStreamSynchronize(stream),"complete TurboAngle L1 delta rebase");
-    position_=new_root.position_;impl_->tap_rows=new_root.tap_rows_;
+    impl_->kv_rows_rewritten_from(0);
+    position_=new_root.position_;impl_->publish_tap_rows(new_root.tap_rows_,tap_first);
     impl_->embedding_rows=new_root.embedding_rows_;impl_->last_rows=new_root.last_rows_;
-    impl_->last_hidden_source=nullptr;
-    impl_->last_hidden_source_rows=0;
-    impl_->last_hidden_source_first_row=0;
-    impl_->last_hidden_source_position=0;
-    if(++impl_->last_hidden_generation==0)
-        throw std::overflow_error("native MTP hidden generation exhausted");
-    impl_->invalidate_native_mtp_hidden_capture();
     impl_->qkv_trace_valid=false;if(impl_->continuation) impl_->continuation->rows=0;
 }
 
@@ -12039,25 +14630,158 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         impl_->host_kv_restore_device=device;
         impl_->host_kv_failed=true;
     }
+    // The restored pages stay pinned (no pressure spill or foreign re-home of
+    // their payload) until the restore has read them.
+    const Exl3PagePins restore_pins(state.kv_pages_);
+    // VOIDINFER_EXL3_VERICACHE_STATS: one KV_RESTORE line per restore (phase ms).
+    using RestoreClock=std::chrono::steady_clock;
+    const auto restore_begin=RestoreClock::now();
+    auto restore_mark=restore_begin;
+    std::array<double,5> restore_ms{};
+    const auto restore_phase=[&](int phase) {
+        const auto now=RestoreClock::now();
+        restore_ms[phase]+=std::chrono::duration<double,std::milli>(now-restore_mark).count();
+        restore_mark=now;
+    };
+    // Lane-backed pages: this lane's deferred pages outside the restored
+    // history are filled before the planes change; the restored state's own
+    // still-deferred pages already sit in these planes. Pages backed by
+    // another lane are filled from that lane's planes.
+    impl_->kv_rewrite_pending=-1;   // the handover below is exact
+    impl_->line_fp8_rewritten_from(0);
+    impl_->ensure_kv_source();
+    impl_->adopt_plane_set_of(state);
+    // The set also holds more of another retained history (a conversation
+    // that extended this prefix) than the restored rows: copying the restored
+    // rows into a fresh set is cheaper than packing that history out of these
+    // planes; its set stays idle and intact.
+    if(impl_->kv_source && impl_->kv_source->backing() && !impl_->exact_line &&
+       impl_->kv_source->deferred_outside(state.kv_pages_)>state.kv_pages_.size())
+        impl_->bind_fresh_plane_set();
+    impl_->ensure_l0_rows(state.position_);
+    const bool all_lane_resident=kv_lane_resident(state);
+    // Filled pages of the restored history trade places with this lane's
+    // outgoing pages (no second host copy during the handover).
+    if(impl_->kv_source && !all_lane_resident)impl_->kv_source->exchange(state.kv_pages_);
+    restore_phase(0);
+    if(impl_->kv_source)impl_->kv_source->materialize_except(state.kv_pages_);
+    restore_phase(1);
+    // Pages these planes already hold (own lane-backed pages; pages of other
+    // lanes copied plane to plane, one DMA per bank and contiguous run) are
+    // not copied from values; other lane-backed pages are filled first.
+    std::vector<const Exl3ExactKVPage*> resident_pages;
+    std::vector<std::shared_ptr<const Exl3ExactKVPage>> adoptable;
+    if(impl_->kv_source && !all_lane_resident) {
+        // Deferred pages of other lanes and packed or spilled pages (any lane, this one
+        // included): rows copied straight into these planes.
+        std::vector<std::pair<std::shared_ptr<const Exl3ExactKVPage>,std::shared_ptr<Exl3LaneKvSource>>> foreign;
+        {
+            std::shared_lock payload(exl3_page_payload_mutex());
+            for(const auto& page:state.kv_pages_) {
+                if(impl_->kv_source->holds(*page)) {resident_pages.push_back(page.get());continue;}
+                if(page->payload_deferred() && page->source)foreign.emplace_back(page,page->source);
+            }
+        }
+        std::vector<const Exl3ExactKVPage*> run;
+        std::vector<std::shared_ptr<const Exl3ExactKVPage>> run_spilled;
+        Exl3LaneKvSource* run_source=nullptr;
+        const auto flush=[&] {
+            if(run.empty())return;
+            if(run_source->copy_run_to(run,impl_->kv_source->planes(),stream)) {
+                resident_pages.insert(resident_pages.end(),run.begin(),run.end());
+                // Spilled and packed pages now live in these planes: re-homed below.
+                adoptable.insert(adoptable.end(),run_spilled.begin(),run_spilled.end());
+            }
+            run.clear();
+            run_spilled.clear();
+        };
+        for(const auto& [page,owner]:foreign) {
+            if(!run.empty() && (owner.get()!=run_source ||
+               run.back()->first+run.back()->rows!=page->first)) flush();
+            run_source=owner.get();
+            run.push_back(page.get());
+            if(page->spilled() || page->packed_in_ram())run_spilled.push_back(page);
+        }
+        flush();
+        std::sort(resident_pages.begin(),resident_pages.end());
+        for(const auto& page:state.kv_pages_)
+            if(!std::binary_search(resident_pages.begin(),resident_pages.end(),page.get())) {
+                exl3_require_kv_payload(*page);
+                if(page->source_id.load())adoptable.push_back(page);
+            }
+    }
+    restore_phase(2);
+    const auto lane_resident_page=[&](const std::shared_ptr<const Exl3ExactKVPage>& page) {
+        return all_lane_resident ||
+            std::binary_search(resident_pages.begin(),resident_pages.end(),page.get());
+    };
     impl_->resident_exact_state_id=0;
     impl_->exact_prefix_pages.clear();
     impl_->exact_prefix_position=0;
-    impl_->l0_planes_valid_from=0;
     for(auto& chunks:impl_->l0_prefix_chunks) chunks.clear();
     if(oscar) impl_->oscar->reset();
     // State is immutable and constructible only by export; no untrusted plane shapes.
     const auto upload = [&](void* dst, const auto& src) {
-        cuda_check(cudaMemcpyAsync(dst, src.data(), src.size() * sizeof(src[0]),
-                                  cudaMemcpyHostToDevice, stream), "restore exact host plane");
+        cuda_check(exl3_h2d_async(dst, src.data(), src.size() * sizeof(src[0]), stream), "restore exact host plane");
         cuda_check(cudaStreamSynchronize(stream), "complete exact host plane restore");
         if(std::exchange(impl_->host_kv_restore_failure_for_test,false))
             throw std::runtime_error("injected HostKV failure after restore upload");
     };
+    // Back the growable planes (and codes) for every restored row first.
+    impl_->ensure_l0_rows(state.position_);
+    std::shared_lock payload_read(exl3_page_payload_mutex());
+    // A page spilled after its fill above but before the pins took effect is
+    // brought back (pinned pages cannot be spilled again).
+    for(bool ready=false;!ready;) {
+        ready=true;
+        for(const auto& page:state.kv_pages_)
+            if(page->payload_deferred() && !lane_resident_page(page)) {ready=false;break;}
+        if(ready)break;
+        payload_read.unlock();
+        for(const auto& page:state.kv_pages_)
+            if(!lane_resident_page(page))exl3_require_kv_payload(*page);
+        payload_read.lock();
+    }
     int full = 0, gdn = 0;
     for (int layer = 0; layer < kLayers; ++layer) {
         if (impl_->full_layers[layer]) {
             impl_->full_layers[layer]->invalidate_retained_prefix();
             const auto restore_kv=[&](void* destination,bool key,int first,int rows) {
+                const auto& owner=key?*impl_->cache_k[layer]:*impl_->cache_v[layer];
+                if(!state.l2_fp8_ && !warm && owner.host_mapped && !owner.cpu_visible() &&
+                   destination>=owner.ptr &&
+                   destination<static_cast<const std::uint8_t*>(owner.ptr)+owner.bytes) {
+                    // Growable plane: runs of contiguous pages (skipping pages
+                    // still resident in this lane) gathered into the pinned
+                    // stage in parallel, one DMA per run.
+                    auto& stage=l0_plane_stage();
+                    std::vector<const Exl3ExactKVPage*> pending;
+                    const auto flush=[&] {
+                        if(pending.empty()) return;
+                        const int lo=pending.front()->first;
+                        const int hi=pending.back()->first+pending.back()->rows;
+                        std::for_each(std::execution::par,pending.begin(),pending.end(),[&](const Exl3ExactKVPage* page) {
+                            const auto& original=key?page->k[full]:page->v[full];
+                            std::memcpy(stage.host+static_cast<std::size_t>(page->first-lo)*1024,
+                                original.data(),static_cast<std::size_t>(page->rows)*1024*sizeof(std::uint16_t));
+                        });
+                        cuda_check(cudaMemcpyAsync(static_cast<std::uint16_t*>(destination)+
+                            static_cast<std::size_t>(lo-first)*1024,stage.host,
+                            static_cast<std::size_t>(hi-lo)*1024*sizeof(std::uint16_t),cudaMemcpyDefault,stream),
+                            "restore L0 plane run");
+                        cuda_check(cudaStreamSynchronize(stream),"restore L0 plane run");
+                        pending.clear();
+                    };
+                    for(const auto& page:state.kv_pages_) {
+                        if(page->first<first || page->first+page->rows>first+rows) continue;
+                        if(lane_resident_page(page)) {flush();continue;}
+                        if(!pending.empty() && (pending.back()->first+pending.back()->rows!=page->first ||
+                           page->first+page->rows-pending.front()->first>kL0PlaneStageRows)) flush();
+                        pending.push_back(page.get());
+                    }
+                    flush();
+                    return;
+                }
                 if(state.l2_fp8_) {
                     require(!warm,"L0 L2 FP8 pages have no TurboAngle warm tail");
                     auto& staging=l0_l2_fp8::staging();
@@ -12072,8 +14796,8 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                             std::memcpy(staging.host+static_cast<std::size_t>(page->first-lo)*l0_l2_fp8::kRowBytes,
                                 packed.data(),static_cast<std::size_t>(page->rows)*l0_l2_fp8::kRowBytes);
                         });
-                        cuda_check(cudaMemcpyAsync(staging.device,staging.host,
-                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,cudaMemcpyHostToDevice,stream),
+                        cuda_check(exl3_h2d_async(staging.device,staging.host,
+                            static_cast<std::size_t>(count)*l0_l2_fp8::kRowBytes,stream),
                             "L0 L2 FP8 restore");
                         l0_l2_fp8::unpack_kernel<<<(count*4*32+255)/256,256,0,stream>>>(staging.device,
                             static_cast<std::uint16_t*>(destination)+static_cast<std::size_t>(lo-first)*1024,count);
@@ -12084,6 +14808,7 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                 }
                 for(const auto& page:state.kv_pages_) {
                     if(page->first<first || page->first>=first+rows) continue;
+                    if(!warm && lane_resident_page(page)) continue;
                     const auto& original=key?page->k[full]:page->v[full];
                     auto* dst=static_cast<std::uint16_t*>(destination)+static_cast<std::size_t>(page->first-first)*1024;
                     if(!warm || page->first+page->rows<=warm->first_) {upload(dst,original);continue;}
@@ -12117,27 +14842,13 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
                     cuda_check(cudaStreamSynchronize(stream),"complete bounded OSCAR restore chunk");
                 }
             } else if(!impl_->host_kv.enabled) {
-                if(state.l0_rows_>0) {
-                    // Parked INT2 history: the FP16 planes are read only for the
-                    // sink, the exact window and rows not yet encoded; older rows
-                    // stay stale (export shares the restored pages for them).
-                    // l0_oscar::history_end: sink 64, exact recent window, 64-row alignment.
-                    const int history_end=std::max(64,((state.position_-exl3_l0_recent_rows())/64)*64);
-                    const int window=std::min(state.l0_rows_,history_end);
-                    const int first=(window/Exl3ExactKVPage::token_capacity)*Exl3ExactKVPage::token_capacity;
-                    constexpr std::size_t row=1024;
-                    const int sink=std::min(first,Exl3ExactKVPage::token_capacity);
-                    if(sink>0) {
-                        restore_kv(impl_->cache_k[layer]->ptr,true,0,sink);
-                        restore_kv(impl_->cache_v[layer]->ptr,false,0,sink);
-                    }
-                    restore_kv(static_cast<std::uint16_t*>(impl_->cache_k[layer]->ptr)+first*row,true,first,state.position_-first);
-                    restore_kv(static_cast<std::uint16_t*>(impl_->cache_v[layer]->ptr)+first*row,false,first,state.position_-first);
-                    impl_->l0_planes_valid_from=std::max(impl_->l0_planes_valid_from,first);
-                } else {
-                    restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);
-                    restore_kv(impl_->cache_v[layer]->ptr,false,0,state.position_);
-                }
+                // The FP16 planes are the exact L2 record: VeriCache passes,
+                // exact prefill history and hot-row fills read every history
+                // row, so a restore (parked INT4 history included) writes all
+                // of them; leaving encoded rows stale fed those readers the
+                // lane's previous conversation.
+                restore_kv(impl_->cache_k[layer]->ptr,true,0,state.position_);
+                restore_kv(impl_->cache_v[layer]->ptr,false,0,state.position_);
                 impl_->full_layers[layer]->l0_refresh_window(state.position_,stream);
                 if(state.l0_rows_>0) {
                     auto& prefix=impl_->l0_prefix_chunks[full];prefix.clear();
@@ -12159,23 +14870,33 @@ void Exl3TextContext::restore_host_state_impl(const Exl3ExactHostState& state,
         }
         if(restore_layer_observer)restore_layer_observer(layer);
     }
+    payload_read.unlock();
+    restore_phase(3);
+    // Restored filled lane-backed pages now live in these planes: re-home them.
+    if(impl_->kv_source && !adoptable.empty())impl_->kv_source->adopt(adoptable);
+    restore_phase(4);
+    if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+        std::fprintf(stderr,"KV_RESTORE rows=%d pages=%zu lane_resident=%zu all_resident=%d exchange_ms=%.1f fill_ms=%.1f "
+            "foreign_ms=%.1f layers_ms=%.1f adopt_ms=%.1f total_ms=%.1f\n",state.position_,state.kv_pages_.size(),
+            resident_pages.size(),all_lane_resident?1:0,restore_ms[0],restore_ms[1],restore_ms[2],restore_ms[3],
+            restore_ms[4],std::chrono::duration<double,std::milli>(RestoreClock::now()-restore_begin).count());
+    // Backing beyond the restored rows stays mapped: the suffix that follows a
+    // restore grows into it, and the next request reset returns what is left.
     upload(impl_->logits, state.logits_);
+    int tap_first=0;
+    if(impl_->shared_taps)
+        tap_first=impl_->upload_tap_rows({&state.taps_[0],&state.taps_[1],&state.taps_[2],&state.taps_[3],
+            &state.taps_[4],&state.embedding_},state.tap_rows_,stream,"restore exact host taps");
+    else {
     upload(impl_->embedding_trace->ptr, state.embedding_);
     for (std::size_t tap = 0; tap < kTapLayers.size(); ++tap) upload(impl_->taps[tap]->ptr, state.taps_[tap]);
-    cuda_check(cudaMemcpyAsync(impl_->position_device, &state.device_position_, sizeof(int),
-                              cudaMemcpyHostToDevice, stream), "restore exact host position");
+    }
+    cuda_check(exl3_h2d_async(impl_->position_device, &state.device_position_, sizeof(int), stream), "restore exact host position");
     cuda_check(cudaStreamSynchronize(stream), "complete exact host restore");
     position_ = state.position_;
-    impl_->tap_rows = state.tap_rows_;
+    impl_->publish_tap_rows(state.tap_rows_,tap_first);
     impl_->embedding_rows = state.embedding_rows_;
     impl_->last_rows = state.last_rows_;
-    impl_->last_hidden_source = nullptr;
-    impl_->last_hidden_source_rows = 0;
-    impl_->last_hidden_source_first_row = 0;
-    impl_->last_hidden_source_position = 0;
-    if (++impl_->last_hidden_generation == 0)
-        throw std::overflow_error("native MTP hidden generation exhausted");
-    impl_->invalidate_native_mtp_hidden_capture();
     impl_->tap_generation.fetch_add(1,std::memory_order_release);
     impl_->rope_offset=state.rope_offset_;
     impl_->qkv_trace_valid = false;
@@ -12196,8 +14917,8 @@ std::vector<float> Exl3TextContext::gdn_state_host(int layer, cudaStream_t strea
             "E4B2 requested state from a non-GDN layer");
     const auto* gdn = impl_->gdn_layers[layer].get();
     std::vector<float> result(gdn->recurrent_state_bytes() / sizeof(float));
-    cuda_check(cudaMemcpyAsync(result.data(), gdn->recurrent_state_device(),
-                               gdn->recurrent_state_bytes(), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.data(), gdn->recurrent_state_device(),
+                               gdn->recurrent_state_bytes(), stream),
                "download E4B2 GDN state");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4B2 GDN state");
     return result;
@@ -12243,8 +14964,7 @@ std::vector<std::uint16_t> Exl3TextContext::gdn_layer0_serial_for_test(
     impl_->transaction->prefix_available = false;
     impl_->transaction->rollback_required = true;
     impl_->transaction->attempted_rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream),
                "upload staged GDN T0a token IDs");
     embedding_lookup_kernel<<<(8 * kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 8);
@@ -12252,9 +14972,8 @@ std::vector<std::uint16_t> Exl3TextContext::gdn_layer0_serial_for_test(
     impl_->gdn_layers[0]->forward(impl_->hidden_a, impl_->hidden_b, 8, stream,
                                   false, true, false);
     std::vector<std::uint16_t> output(8ULL * kHidden);
-    cuda_check(cudaMemcpyAsync(output.data(), impl_->hidden_b,
-                               output.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(output.data(), impl_->hidden_b,
+                               output.size() * sizeof(std::uint16_t), stream),
                "download serial GDN T0a output");
     cuda_check(cudaStreamSynchronize(stream), "synchronize serial GDN T0a output");
     return output;
@@ -12301,11 +15020,10 @@ Exl3TextContext::gdn_layer0_pair_staged_serial_for_test(
     peer.impl_->transaction->prefix_available = false;
     peer.impl_->transaction->rollback_required = true;
     peer.impl_->transaction->attempted_rows = 0;
-    cuda_check(cudaMemcpyAsync(impl_->token_ids, token_ids.data(), token_ids.size_bytes(),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->token_ids, token_ids.data(), token_ids.size_bytes(), stream),
                "upload staged GDN T0a first token IDs");
-    cuda_check(cudaMemcpyAsync(peer.impl_->token_ids, peer_token_ids.data(),
-                               peer_token_ids.size_bytes(), cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(peer.impl_->token_ids, peer_token_ids.data(),
+                               peer_token_ids.size_bytes(), stream),
                "upload staged GDN T0a peer token IDs");
     embedding_lookup_kernel<<<(8 * kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->token_ids, impl_->model->embedding, impl_->hidden_a, 8);
@@ -12328,13 +15046,11 @@ Exl3TextContext::gdn_layer0_pair_staged_serial_for_test(
     std::array<std::vector<std::uint16_t>, 2> outputs;
     outputs[0].resize(8ULL * kHidden);
     outputs[1].resize(8ULL * kHidden);
-    cuda_check(cudaMemcpyAsync(outputs[0].data(), impl_->hidden_b,
-                               outputs[0].size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(outputs[0].data(), impl_->hidden_b,
+                               outputs[0].size() * sizeof(std::uint16_t), stream),
                "download staged GDN T0a first output");
-    cuda_check(cudaMemcpyAsync(outputs[1].data(), peer.impl_->hidden_b,
-                               outputs[1].size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(outputs[1].data(), peer.impl_->hidden_b,
+                               outputs[1].size() * sizeof(std::uint16_t), stream),
                "download staged GDN T0a peer output");
     cuda_check(cudaStreamSynchronize(stream), "synchronize staged GDN T0a outputs");
     return outputs;
@@ -12349,25 +15065,24 @@ std::vector<std::uint16_t> Exl3TextContext::full_attention_k_host(
     std::vector<std::uint16_t> result(kKvValues);
     const auto* source = static_cast<const std::uint16_t*>(impl_->cache_k[layer]->ptr) +
         static_cast<std::size_t>(position) * kKvValues;
-    cuda_check(cudaMemcpyAsync(result.data(), source, result.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4B2 KV entry");
+    cuda_check(exl3_d2h_async(result.data(), source, result.size() * sizeof(std::uint16_t), stream), "download E4B2 KV entry");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4B2 KV entry");
     return result;
 }
 
 bool Exl3TextContext::try_enable_oscar_from_environment() {
-    const char* flag = std::getenv("NINFER_OSCAR_EXL3");
+    const char* flag = std::getenv("VOIDINFER_OSCAR_EXL3");
     if (flag == nullptr || std::string(flag) != "1") return false;
     require(!impl_->host_kv.enabled,"authoritative host KV context cannot enable approximate OSCAR");
     require(!impl_->oscar,"OSCAR context strategy is already enabled");
     require(!impl_->transaction || !impl_->transaction->active,
             "P2 cannot replace OSCAR during an active target transaction");
     if (impl_->continuation) impl_->continuation->rows = 0;
-    const char* asset = std::getenv("NINFER_OSCAR_ROTATION_ASSET_DIR");
+    const char* asset = std::getenv("VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
     if (asset == nullptr || asset[0] == 0) {
-        throw std::invalid_argument("E4C1 OSCAR enabled without NINFER_OSCAR_ROTATION_ASSET_DIR");
+        throw std::invalid_argument("E4C1 OSCAR enabled without VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
     }
-    const char* manifest = std::getenv("NINFER_OSCAR_COMPAT_MANIFEST");
+    const char* manifest = std::getenv("VOIDINFER_OSCAR_COMPAT_MANIFEST");
     const std::string manifest_path = (manifest != nullptr && manifest[0] != 0)
                                         ? manifest
                                         : "results/oscar/E4C1_EXL3_COMPATIBILITY_MANIFEST.json";
@@ -12447,14 +15162,14 @@ Exl3FullAttentionQKVHost Exl3TextContext::full_attention_qkv_host(
     result.q_rope.resize(q_values);
     result.k_rope.resize(kv_values);
     result.v_projection.resize(kv_values);
-    cuda_check(cudaMemcpyAsync(result.q_rope.data(), trace.q_rope,
-                               q_values * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.q_rope.data(), trace.q_rope,
+                               q_values * sizeof(std::uint16_t), stream),
                "download E4C1 EXL3 Q trace");
-    cuda_check(cudaMemcpyAsync(result.k_rope.data(), trace.k_rope,
-                               kv_values * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.k_rope.data(), trace.k_rope,
+                               kv_values * sizeof(std::uint16_t), stream),
                "download E4C1 EXL3 K trace");
-    cuda_check(cudaMemcpyAsync(result.v_projection.data(), trace.v_projection,
-                               kv_values * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.v_projection.data(), trace.v_projection,
+                               kv_values * sizeof(std::uint16_t), stream),
                "download E4C1 EXL3 V trace");
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4C1 EXL3 QKV capture");
     return result;
@@ -12467,11 +15182,12 @@ void Exl3TextContext::copy_tap_row_to_device(int layer, std::uint16_t* dst,
     require(impl_->capture_taps && impl_->tap_rows > 0 && impl_->taps[tap] != nullptr,
             "E5A2 tap rows were not captured");
     require(dst != nullptr, "E5A2 tap copy needs a device destination");
-    const auto* source = static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr) +
-        static_cast<std::size_t>(impl_->tap_rows - 1) * kHidden;
-    cuda_check(cudaMemcpyAsync(dst, source, kHidden * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToDevice, stream),
-               "E5A2 copy tap row");
+    impl_->read_tap_rows(impl_->tap_rows-1,1,stream,"E5A2 tap row",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(cudaMemcpyAsync(dst, planes[tap], kHidden * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "E5A2 copy tap row");
+        });
 }
 
 int Exl3TextContext::captured_tap_rows() const noexcept {
@@ -12488,8 +15204,7 @@ int Exl3TextContext::last_forward_rows() const noexcept {
 
 int Exl3TextContext::device_position_host(cudaStream_t stream) const {
     int result = -1;
-    cuda_check(cudaMemcpyAsync(&result, impl_->position_device, sizeof(result),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(&result, impl_->position_device, sizeof(result), stream),
                "download P2 target device position");
     cuda_check(cudaStreamSynchronize(stream), "synchronize P2 target device position");
     return result;
@@ -12502,9 +15217,8 @@ std::vector<std::uint16_t> Exl3TextContext::gdn_physical_conv_host(
     const auto* gdn = impl_->gdn_layers[layer].get();
     std::vector<std::uint16_t> result(
         gdn->physical_conv_state_bytes() / sizeof(std::uint16_t));
-    cuda_check(cudaMemcpyAsync(result.data(), gdn->physical_conv_state_device(),
-                               gdn->physical_conv_state_bytes(),
-                               cudaMemcpyDeviceToHost, stream),
+    cuda_check(exl3_d2h_async(result.data(), gdn->physical_conv_state_device(),
+                               gdn->physical_conv_state_bytes(), stream),
                "download P2 GDN physical convolution state");
     cuda_check(cudaStreamSynchronize(stream),
                "synchronize P2 GDN physical convolution state");
@@ -12553,12 +15267,15 @@ std::array<std::vector<std::uint16_t>,5> Exl3TextContext::exact_tap_rows_host(cu
             "authoritative tap export requires ordinary eager captured state");
     require(!impl_->host_kv_failed,"authoritative tap export after failed host KV forward");
     std::array<std::vector<std::uint16_t>,5> result;
-    for(int tap=0;tap<5;++tap) {
-        result[tap].resize(static_cast<std::size_t>(impl_->tap_rows)*kHidden);
-        cuda_check(cudaMemcpyAsync(result[tap].data(),impl_->taps[tap]->ptr,
-            result[tap].size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost,stream),
-            "export authoritative tap rows");
-    }
+    impl_->read_tap_rows(0,impl_->tap_rows,stream,"authoritative tap rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            for(int tap=0;tap<5;++tap) {
+                result[tap].resize(static_cast<std::size_t>(impl_->tap_rows)*kHidden);
+                cuda_check(exl3_d2h_async(result[tap].data(),planes[tap],
+                    result[tap].size()*sizeof(std::uint16_t),stream),
+                    "export authoritative tap rows");
+            }
+        });
     cuda_check(cudaStreamSynchronize(stream),"complete authoritative tap rows");
     return result;
 }
@@ -12596,7 +15313,7 @@ Exl3CommittedTapSegment Exl3TextContext::committed_tap_segment(
                 transaction_taps && !impl_->graph_active && !impl_->graph_capture_active &&
                 !impl_->host_kv_failed && impl_->capture_taps &&
                 impl_->tap_rows>0 && source_first>=0 && rows>0 &&
-                source_first<=impl_->tap_rows-rows,
+                source_first<=impl_->tap_rows-rows && impl_->tap_rows_identity(),
             "committed tap segment source owner/range");
     Exl3CommittedTapSegment result;
     result.owner=binding.context_owner;result.model_identity=model_identity();
@@ -12625,12 +15342,13 @@ void Exl3TextContext::copy_tap_rows_to_device(int layer, int first_row, std::uin
     require(impl_->capture_taps && impl_->taps[tap] != nullptr &&
             impl_->tap_rows >= first_row + rows,
             "E5A2 tap range was not captured");
-    const auto* source = static_cast<const std::uint16_t*>(impl_->taps[tap]->ptr) +
-        static_cast<std::size_t>(first_row) * kHidden;
-    cuda_check(cudaMemcpyAsync(dst, source,
-                               static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToDevice, stream),
-               "E5A2 copy tap rows");
+    impl_->read_tap_rows(first_row,rows,stream,"E5A2 tap range",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(cudaMemcpyAsync(dst, planes[tap],
+                                       static_cast<std::size_t>(rows) * kHidden * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "E5A2 copy tap rows");
+        });
 }
 
 void Exl3TextContext::embed_token_to_device(std::int64_t token_id, std::uint16_t* dst,
@@ -12640,8 +15358,7 @@ void Exl3TextContext::embed_token_to_device(std::int64_t token_id, std::uint16_t
             "E5A2 embed needs a device destination");
     require(impl_->model != nullptr && impl_->model->embedding != nullptr,
             "E5A2 target embeddings are unavailable");
-    cuda_check(cudaMemcpyAsync(impl_->draft_token_id, &token_id, sizeof(token_id),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(impl_->draft_token_id, &token_id, sizeof(token_id), stream),
                "E5A2 upload draft token id");
     embedding_lookup_kernel<<<(kHidden + 255) / 256, 256, 0, stream>>>(
         impl_->draft_token_id, impl_->model->embedding,
@@ -12672,234 +15389,14 @@ const std::uint16_t* Exl3TextContext::target_embedding() const noexcept {
     return impl_->model == nullptr ? nullptr : impl_->model->embedding;
 }
 
-void Exl3TextContext::prepare_native_mtp_hidden_capture(int capacity) {
-    require(impl_->model != nullptr && impl_->model->final_norm != nullptr,
-        "native MTP hidden capture needs a loaded target model");
-    require(capacity > 0 && capacity <= impl_->max_context,
-        "native MTP hidden capture capacity is outside the target context");
-    require(position_ == 0 && impl_->last_rows == 0,
-        "native MTP hidden capture must be prepared before target inference");
-    require(!impl_->graph_active && !impl_->graph_capture_active &&
-                (!impl_->transaction || !impl_->transaction->active),
-        "native MTP hidden capture setup requires a pristine eager context");
-    if (impl_->native_mtp_hidden_capture) {
-        require(impl_->native_mtp_hidden_capture_capacity == capacity,
-            "native MTP hidden capture capacity cannot change after preparation");
-        require(impl_->native_mtp_hidden_capture_valid_rows == 0,
-            "native MTP hidden capture already contains rows");
-        return;
-    }
-    const std::size_t bytes = static_cast<std::size_t>(capacity) * kHidden *
-        sizeof(std::uint16_t);
-    const auto next_impl = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-        impl_->persistent_bytes, bytes);
-    const auto next_public = Exl3LinearWorkspaceRequirements::append_owned_bytes(
-        persistent_bytes_, bytes);
-    auto capture = impl_->make_private_allocation(bytes,
-        "allocate native MTP target hidden capture");
-    require(capture && capture->ptr && capture->bytes == bytes,
-        "native MTP hidden capture allocation extent mismatch");
-    impl_->native_mtp_hidden_capture = std::move(capture);
-    impl_->native_mtp_hidden_capture_model_identity =
-        impl_->model->host_state_identity;
-    impl_->native_mtp_hidden_capture_capacity = capacity;
-    impl_->native_mtp_hidden_capture_first_position = -1;
-    impl_->native_mtp_hidden_capture_valid_rows = 0;
-    if (++impl_->native_mtp_hidden_capture_generation == 0)
-        throw std::overflow_error("native MTP hidden capture generation exhausted");
-    impl_->persistent_bytes = next_impl;
-    persistent_bytes_ = next_public;
-}
-
-bool Exl3TextContext::native_mtp_hidden_capture_prepared() const noexcept {
-    return impl_->native_mtp_hidden_capture_active();
-}
-
-int Exl3TextContext::native_mtp_hidden_capture_capacity() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_capacity : 0;
-}
-
-int Exl3TextContext::native_mtp_hidden_capture_rows() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_valid_rows : 0;
-}
-
-int Exl3TextContext::native_mtp_hidden_capture_first_position() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_first_position : -1;
-}
-
-std::uint64_t Exl3TextContext::native_mtp_hidden_capture_generation() const noexcept {
-    return impl_->native_mtp_hidden_capture_active()
-        ? impl_->native_mtp_hidden_capture_generation : 0;
-}
-
-Exl3MtpTargetHiddenHandoff Exl3TextContext::target_hidden_handoff(
-    int row, cudaStream_t stream) const {
-    const bool use_capture = impl_->native_mtp_hidden_capture_active() &&
-        row >= 0 && row < impl_->native_mtp_hidden_capture_valid_rows;
-    const std::uint16_t* source = nullptr;
-    int source_position = 0;
-    std::uint64_t source_generation = 0;
-    std::shared_ptr<const void> source_identity;
-    if (use_capture) {
-        source = static_cast<const std::uint16_t*>(
-            impl_->native_mtp_hidden_capture->ptr) +
-            static_cast<std::size_t>(row) * kHidden;
-        source_position = impl_->native_mtp_hidden_capture_first_position + row;
-        source_generation = impl_->native_mtp_hidden_capture_generation;
-        source_identity = impl_->native_mtp_hidden_capture_model_identity;
-    } else {
-        require(impl_->model != nullptr && impl_->last_hidden_source != nullptr &&
-                    impl_->last_hidden_source_rows > 0 &&
-                    row >= 0 && row < impl_->last_hidden_source_rows &&
-                    impl_->last_hidden_generation != 0,
-                "native MTP target hidden is unavailable until a target forward completes");
-        require(impl_->last_hidden_source_position >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row + row >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row + row <
-                        impl_->last_hidden_source_position + impl_->last_rows,
-                "native MTP target hidden position is invalid");
-        source = impl_->last_hidden_source + static_cast<std::size_t>(row) * kHidden;
-        source_position = impl_->last_hidden_source_position +
-            impl_->last_hidden_source_first_row + row;
-        source_generation = impl_->last_hidden_generation;
-        source_identity = model_identity();
-    }
-
-    // Do not expose hidden_a/hidden_b directly: the next target forward is
-    // allowed to reuse either ping-pong buffer. The copied allocation is
-    // independently owned until every stream-ordered MTP consumer releases
-    // its handoff owner.
-    auto* mutable_impl = const_cast<Impl*>(impl_.get());
-    const std::size_t bytes = static_cast<std::size_t>(kHidden) *
-                              sizeof(std::uint16_t);
-    auto allocation = std::shared_ptr<DeviceAllocation>(
-        mutable_impl->make_private_allocation(bytes,
-                                              "allocate native MTP target hidden")
-            .release(),
-        [](DeviceAllocation* value) noexcept { delete value; });
-    cuda_check(cudaMemcpyAsync(
-                   allocation->ptr,
-                   source,
-                   bytes, cudaMemcpyDeviceToDevice, stream),
-               "copy native MTP target hidden handoff");
-
-    Exl3MtpTargetHiddenHandoff result;
-    result.owner = std::shared_ptr<const void>(allocation,
-                                               static_cast<const void*>(allocation.get()));
-    result.model_identity = std::move(source_identity);
-    result.hidden = {reinterpret_cast<std::uintptr_t>(allocation->ptr), bytes,
-                     kExl3MtpHiddenWidth, 1};
-    result.hidden_generation = source_generation;
-    result.position = static_cast<std::int64_t>(source_position);
-    return result;
-}
-
-std::vector<Exl3MtpTargetHiddenHandoff> Exl3TextContext::target_hidden_handoffs(
-    int first_row, int rows, cudaStream_t stream) const {
-    const bool use_capture = impl_->native_mtp_hidden_capture_active() &&
-        rows > 0 && first_row >= 0 &&
-        first_row <= impl_->native_mtp_hidden_capture_valid_rows - rows;
-    const std::uint16_t* source = nullptr;
-    int source_position = 0;
-    std::uint64_t source_generation = 0;
-    std::shared_ptr<const void> source_identity;
-    if (use_capture) {
-        source = static_cast<const std::uint16_t*>(
-            impl_->native_mtp_hidden_capture->ptr) +
-            static_cast<std::size_t>(first_row) * kHidden;
-        source_position = impl_->native_mtp_hidden_capture_first_position + first_row;
-        source_generation = impl_->native_mtp_hidden_capture_generation;
-        source_identity = impl_->native_mtp_hidden_capture_model_identity;
-    } else {
-        require(impl_->model != nullptr && impl_->last_hidden_source != nullptr &&
-                    impl_->last_hidden_source_rows > 0 && rows > 0 && first_row >= 0 &&
-                    first_row + rows <= impl_->last_hidden_source_rows &&
-                    impl_->last_hidden_generation != 0,
-                "native MTP target hidden range is unavailable until a target forward completes");
-        require(impl_->last_hidden_source_position >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row +
-                            first_row >= 0 &&
-                    impl_->last_hidden_source_position + impl_->last_hidden_source_first_row +
-                            first_row + rows <= impl_->last_hidden_source_position + impl_->last_rows,
-                "native MTP target hidden range position is invalid");
-        source = impl_->last_hidden_source + static_cast<std::size_t>(first_row) * kHidden;
-        source_position = impl_->last_hidden_source_position +
-            impl_->last_hidden_source_first_row + first_row;
-        source_generation = impl_->last_hidden_generation;
-        source_identity = model_identity();
-    }
-
-    auto* mutable_impl = const_cast<Impl*>(impl_.get());
-    const std::size_t row_bytes = static_cast<std::size_t>(kHidden) * sizeof(std::uint16_t);
-    const std::size_t bytes = static_cast<std::size_t>(rows) * row_bytes;
-    auto allocation = std::shared_ptr<DeviceAllocation>(
-        mutable_impl->make_private_allocation(bytes, "allocate native MTP target hidden rows")
-            .release(),
-        [](DeviceAllocation* value) noexcept { delete value; });
-    cuda_check(cudaMemcpyAsync(
-                   allocation->ptr,
-                   source,
-                   bytes, cudaMemcpyDeviceToDevice, stream),
-               "copy native MTP target hidden rows");
-    const auto owner = std::shared_ptr<const void>(
-        allocation, static_cast<const void*>(allocation.get()));
-    const auto target_identity = std::move(source_identity);
-    std::vector<Exl3MtpTargetHiddenHandoff> result;
-    result.reserve(static_cast<std::size_t>(rows));
-    for (int row = 0; row < rows; ++row) {
-        auto* data = static_cast<std::uint16_t*>(allocation->ptr) +
-                     static_cast<std::size_t>(row) * kHidden;
-        result.push_back({
-            owner,
-            target_identity,
-            {reinterpret_cast<std::uintptr_t>(data), row_bytes,
-             kExl3MtpHiddenWidth, 1},
-            source_generation,
-            static_cast<std::int64_t>(source_position + row)});
-    }
-    return result;
-}
-
-std::shared_ptr<Exl3MtpPrefixState> Exl3TextContext::create_native_mtp_prefix_state(
-    std::uint32_t kv_capacity) const {
-    require(impl_->model != nullptr && impl_->model->embedding != nullptr &&
-                impl_->model->lm_head.trellis != nullptr,
-            "native MTP target shared weights are unavailable");
-    const auto target_owner = model_identity();
-    require(target_owner != nullptr, "native MTP target model identity is unavailable");
-    const auto model_owner = std::shared_ptr<const void>(
-        impl_->model, static_cast<const void*>(impl_->model.get()));
-    Exl3MtpSharedTargetBinding shared_target;
-    shared_target.token_embedding = {
-        reinterpret_cast<std::uintptr_t>(impl_->model->embedding),
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kHidden) *
-            sizeof(std::uint16_t),
-        kVocab, kHidden};
-    // The descriptor is a lifetime witness; the actual H6 payload is bound by
-    // lm_head_weights below because EXL3 stores trellis/scales in four planes.
-    shared_target.lm_head = {
-        reinterpret_cast<std::uintptr_t>(impl_->model->lm_head.trellis), sizeof(std::uint16_t),
-        1, 1};
-    shared_target.owner = model_owner;
-    shared_target.model_identity = target_owner;
-    shared_target.lm_head_weights = impl_->model->lm_head;
-    shared_target.lm_head_metadata = impl_->model->lm_head_metadata;
-    const auto numeric_identity = static_cast<std::uint64_t>(
-        reinterpret_cast<std::uintptr_t>(target_owner.get()));
-    return Exl3MtpPrefixState::materialize(impl_->model->collection,
-                                            std::move(shared_target), numeric_identity,
-                                            kv_capacity);
-}
-
 std::vector<float> Exl3TextContext::embedding_host(cudaStream_t stream) const {
     require(impl_->capture_taps && impl_->embedding_rows > 0, "E4A embedding trace was not captured");
     std::vector<std::uint16_t> raw(static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    cuda_check(cudaMemcpyAsync(raw.data(), impl_->embedding_trace->ptr,
-                               raw.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream), "download E4A embedding output");
+    impl_->read_tap_rows(0,impl_->embedding_rows,stream,"E4A embedding rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(exl3_d2h_async(raw.data(), planes[5],
+                                       raw.size() * sizeof(std::uint16_t), stream), "download E4A embedding output");
+        });
     cuda_check(cudaStreamSynchronize(stream), "synchronize E4A embedding output");
     std::vector<float> result;
     result.reserve(raw.size());
@@ -12913,14 +15410,16 @@ std::vector<std::uint16_t> Exl3TextContext::embedding_bits_host_for_test(
             "P2 embedding bits were not captured");
     std::vector<std::uint16_t> result(
         static_cast<std::size_t>(impl_->embedding_rows) * kHidden);
-    cuda_check(cudaMemcpyAsync(result.data(), impl_->embedding_trace->ptr,
-                               result.size() * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost, stream),
-               "download P2 embedding bits");
+    impl_->read_tap_rows(0,impl_->embedding_rows,stream,"P2 embedding rows",
+        [&](const std::array<const std::uint16_t*,6>& planes) {
+            cuda_check(exl3_d2h_async(result.data(), planes[5],
+                                       result.size() * sizeof(std::uint16_t), stream),
+                       "download P2 embedding bits");
+        });
     cuda_check(cudaStreamSynchronize(stream),
                "synchronize P2 embedding bits");
     return result;
 }
 
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

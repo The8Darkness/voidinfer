@@ -1,12 +1,14 @@
 # Known issues
 
-Updated: 2026-08-26 UTC.
+Updated: 2026-10-12.
 
-- Five real-model CTest entries are skipped because Qwen3.6/35B artifacts and fixtures are not installed locally. The existing opt-in prefix/resource test now covers the Qwen3.8 NVFP4 Engine route, Host State/KV restore, multimodal reuse, cancellation/eviction, and concurrent MTP settlement; the Qwen3.6 thinking-preservation fixture has Qwen3.8-specific reuse-path expectations and is not a Qwen3.8 gate.
-- `tools/smoke/serve_contract.py` exercises media and therefore requires a server started with `--vision`; the documented startup path must not be treated as a multimodal smoke by omission.
-- Windows-aware defaults are fixed for the serving corpus, concurrency, thinking-preservation smoke, and native benchmark matrix. The local Qwen3.8 NVFP4 text/Vision smokes, 43-case core matrix, and separate C1/C2/C4/C8 decode-saturation points pass; closed-loop corpus/task coverage remains outstanding.
-- Existing MSVC builds emit module-dependency-file and signed/unsigned-comparison warnings. They are baseline warnings, not silently classified as clean.
-- Canonical `Neroued/ninfer` `dev` is a large coupled runtime/resource cutover. The current integration tree builds and passes the unit/Op suite, but it remains uncommitted and requires independent review before becoming the rollback point. Partial cherry-picks are unsafe.
-- Local DSpark-named artifact identifies as `qwen3.8-27b/groupwise-int`; its role as a DSpark drafter/speculator is unverified and must not be assumed from its filename.
-- Context-cost transfer calibration is intentionally rejecting the current single roofline fit on this GPU: D2H/D2D/H2D held-out p95 error is unstable across fragmented geometries. The compiled conservative defaults remain active; do not publish measured transfer presets until the fit is improved or a negative-result disposition is recorded.
-- Overlay, q27, vLLM, FlashInfer, and published benchmark claims are external evidence until matched local artifacts/configuration and native Windows measurements exist.
+- The Engine rejects requests with a thinking budget, stop strings or penalties, while the CLI
+  (`--thinking-budget`, `--stop`, `--reasoning-stop`) and server (`--default-thinking-budget`,
+  OpenAI `stop`, penalty fields) still parse them.
+- Startup prints kernel-dispatch diagnostics (`FA2_PREFILL_DISPATCH`, `EXL3_GENERIC_NARROW`) to stderr
+  during warmup.
+- The resident (pre-L0) OSCAR runtime (`src/exl3/oscar_runtime.*`, `VOIDINFER_OSCAR_EXL3`) is refused
+  by the Engine but still compiled; it shares the exact host-state restore path with the live route.
+- `voidinfer_media_client_loopback_test` is disabled in CTest.
+- MSVC builds emit module-dependency-file and signed/unsigned-comparison warnings; they are baseline
+  warnings, not a clean build.

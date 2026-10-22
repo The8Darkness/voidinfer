@@ -4,7 +4,7 @@
 #include "exl3/reconstruction_control_allocator.h"
 #include <array>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3AttentionStageRoute {
     bool enabled=false,owners=false,host_kv=false,copy_stream=false;
     bool private_prefix=false,shared_attention=false,shared_copy=false,media=false;

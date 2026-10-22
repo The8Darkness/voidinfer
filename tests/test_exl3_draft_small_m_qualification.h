@@ -3,8 +3,8 @@
 // the opt-in K5 M2..8 route against the unchanged same-workspace M1 topology.
 
 struct DraftSmallCapturedProjection {
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::vector<std::uint16_t> input;
     int layer = -1;
     std::string name;
@@ -48,7 +48,7 @@ struct DraftSmallGraph {
 // request/ring/publication ownership coverage separately.
 void check_draft_shared_projection_m16(const DraftSmallCapturedProjection& a,
     const DraftSmallCapturedProjection& b) {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     const bool kv=a.name=="k" || a.name=="v";
     const bool is_output=a.name=="o";
     const bool is_down=a.name=="down";
@@ -62,11 +62,11 @@ void check_draft_shared_projection_m16(const DraftSmallCapturedProjection& a,
     require((a.name=="q" || a.name=="k" || a.name=="v" || a.name=="o" || is_down || is_gateup) && b.name==a.name && a.layer==b.layer && a.metadata.K==5 &&
         a.weights.trellis==b.weights.trellis && a.weights.suh==b.weights.suh &&
         a.weights.svh==b.weights.svh && a.weights.mul1==b.weights.mul1,"draft M16 weight identity");
-    const auto previous=env("NINFER_EXL3_DRAFT_SMALL_M");
-    _putenv_s("NINFER_EXL3_DRAFT_SMALL_M","1");
+    const auto previous=env("VOIDINFER_EXL3_DRAFT_SMALL_M");
+    _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M","1");
     Exl3CudaLinearWorkspace control(input_columns,output_columns,8,!is_gateup),combined(input_columns,output_columns,16,true),
         single_row(input_columns,output_columns,1,!is_gateup);
-    _putenv_s("NINFER_EXL3_DRAFT_SMALL_M",previous.c_str());
+    _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M",previous.c_str());
     if(!is_gateup) {
         require(control.draft_small_m_candidate_for_test(a.metadata,8),"independent draft small-M control not admitted");
         require(!single_row.draft_small_m_candidate_for_test(a.metadata,2),
@@ -248,12 +248,12 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
                                      std::ostream& out) {
     require(prompt.size() == 512, "draft-small qualification requires real ctx512");
     require(oscar, "draft-small qualification requires canonical OSCAR routing");
-    require(env("NINFER_EXL3_DRAFT_SMALL_M") == "0",
+    require(env("VOIDINFER_EXL3_DRAFT_SMALL_M") == "0",
             "draft-small real capture must start from explicit flag0 baseline");
-    ninfer::test::ScopedEnvironmentRestore restore_environment{
-        "NINFER_EXL3_DRAFT_SMALL_M",
-        "NINFER_EXL3_GENERIC_SPLITS"};
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment{
+        "VOIDINFER_EXL3_DRAFT_SMALL_M",
+        "VOIDINFER_EXL3_GENERIC_SPLITS"};
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
     int device = 0;
     cudaDeviceProp device_properties{};
     cuda_check(cudaGetDevice(&device), "draft-small current device");
@@ -282,7 +282,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
             "draft-small ctx512 ring construction mismatch");
 
     std::vector<DraftSmallCapturedProjection> captured;
-    const bool shared_gateup_fixture=env("NINFER_TEST_DRAFT_SHARED_GATEUP_M16")=="1";
+    const bool shared_gateup_fixture=env("VOIDINFER_TEST_DRAFT_SHARED_GATEUP_M16")=="1";
     const auto capture_count=shared_gateup_fixture?35U:25U;
     captured.reserve(capture_count);
     draft.set_projection_observer_for_test(capture_draft_small_projection, &captured,shared_gateup_fixture);
@@ -301,10 +301,10 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
             "draft-small baseline proposal count mismatch");
     require(captured.size() == capture_count,
             "draft-small observer did not capture selected K5 projections");
-    const bool shared_kv_fixture=env("NINFER_TEST_DRAFT_SHARED_KV_M16")=="1";
-    const bool shared_o_fixture=env("NINFER_TEST_DRAFT_SHARED_O_M16")=="1";
-    const bool shared_down_fixture=env("NINFER_TEST_DRAFT_SHARED_DOWN_M16")=="1";
-    if(env("NINFER_TEST_DRAFT_SHARED_Q_M16")=="1" || shared_kv_fixture || shared_o_fixture || shared_down_fixture || shared_gateup_fixture) {
+    const bool shared_kv_fixture=env("VOIDINFER_TEST_DRAFT_SHARED_KV_M16")=="1";
+    const bool shared_o_fixture=env("VOIDINFER_TEST_DRAFT_SHARED_O_M16")=="1";
+    const bool shared_down_fixture=env("VOIDINFER_TEST_DRAFT_SHARED_DOWN_M16")=="1";
+    if(env("VOIDINFER_TEST_DRAFT_SHARED_Q_M16")=="1" || shared_kv_fixture || shared_o_fixture || shared_down_fixture || shared_gateup_fixture) {
         auto sibling=draft.create_execution();sibling->restore_host_ring(draft.export_host_ring());
         std::vector<DraftSmallCapturedProjection> other;other.reserve(capture_count);
         sibling->set_projection_observer_for_test(capture_draft_small_projection,&other,shared_gateup_fixture);
@@ -355,7 +355,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
             "draft-small observer did not capture five projections per layer");
 
     const std::filesystem::path input_directory =
-        std::filesystem::path(env("NINFER_E5A4_OUT")).parent_path() / "inputs";
+        std::filesystem::path(env("VOIDINFER_E5A4_OUT")).parent_path() / "inputs";
     std::filesystem::create_directories(input_directory);
     for (const auto& item : captured) {
         const auto path = input_directory /
@@ -406,7 +406,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
         cuda_check(cudaMemcpy(input_device, item.input.data(), item.input.size() * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice), "draft-small input upload");
 
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "1");
         Exl3CudaLinearWorkspace candidate(in_features, out_features, 8);
         require(std::string(candidate.dispatch_name(item.metadata, 1)) == "generic_mma_split",
                 "draft-small candidate changed M1 dispatch");
@@ -425,11 +425,11 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
                   << s5_proven_by_occupancy_lower_bound << '\n';
         require(s5_proven_by_occupancy_lower_bound,
                 "draft-small host cannot prove the declared normal S5 launch policy");
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "0");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "0");
         Exl3CudaLinearWorkspace generic(in_features, out_features, 8);
         require(std::string(generic.dispatch_name(item.metadata, 8)) == "generic_tile",
                 "draft-small explicit flag0 did not select generic M8");
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "1");
         require(std::string(generic.dispatch_name(item.metadata, 8)) == "generic_tile",
                 "draft-small flag0 workspace did not latch construction state");
 
@@ -568,7 +568,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
     for (const auto* item : representatives) {
         const int in_features = item->metadata.in_features;
         const int out_features = item->metadata.out_features;
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "");
         Exl3CudaLinearWorkspace generic_unset(in_features, out_features, 9);
         Exl3CudaLinearWorkspace target_like_unset(in_features, out_features, 9, false);
         Exl3CudaLinearWorkspace draft_unset(in_features, out_features, 9, true);
@@ -580,7 +580,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
                     "draft_small_m_mma_split",
                 "draft-small draft-owned unset workspace missed qualified default");
         for (const char* disabled : {"0", "2", "true", "01"}) {
-            _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", disabled);
+            _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", disabled);
             Exl3CudaLinearWorkspace generic_disabled(in_features, out_features, 9);
             Exl3CudaLinearWorkspace draft_disabled(in_features, out_features, 9, true);
             require(std::string(generic_disabled.dispatch_name(item->metadata, 8)) ==
@@ -589,10 +589,10 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
                             "generic_tile",
                     std::string("draft-small non-exact opt-in enabled candidate: ") + disabled);
         }
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "0");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "0");
         Exl3CudaLinearWorkspace generic_zero_latched(in_features, out_features, 9);
         Exl3CudaLinearWorkspace draft_zero_latched(in_features, out_features, 9, true);
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "1");
         Exl3CudaLinearWorkspace on_ws(in_features, out_features, 9);
         Exl3CudaLinearWorkspace draft_on_ws(in_features, out_features, 9, true);
         require(std::string(on_ws.dispatch_name(item->metadata, 1)) == "generic_mma_split" &&
@@ -606,7 +606,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
                     std::string(draft_zero_latched.dispatch_name(item->metadata, 8)) ==
                         "generic_tile",
                 "draft-small explicit-zero workspaces observed post-construction env flip");
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "0");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "0");
         require(std::string(on_ws.dispatch_name(item->metadata, 8)) ==
                     "draft_small_m_mma_split" &&
                     std::string(draft_on_ws.dispatch_name(item->metadata, 8)) ==
@@ -719,8 +719,8 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
         std::vector<std::uint16_t> row_reference(static_cast<std::size_t>(out_features));
         cuda_check(cudaMemcpy(input_device, synthetic.data(), synthetic.size() * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice), "draft-small synthetic upload");
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "1");
         Exl3CudaLinearWorkspace workspace(in_features, out_features, 8);
         for (int m = 2; m <= 8; ++m) {
             cuda_check(cudaMemcpy(output_base, initial.data(), elements * sizeof(std::uint16_t),
@@ -763,7 +763,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
         }
 
         // Explicit S1 is compared only with its own M1 topology.
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "1");
+        _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "1");
         Exl3CudaLinearWorkspace split1(in_features, out_features, 8);
         cuda_check(cudaMemcpy(output_base, initial.data(), elements * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice), "draft-small S1 canaries");
@@ -804,7 +804,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
             << ',' << split1_repeat << ',' << split1_guards << ',' << split1_finite << ','
             << split1_mismatches
             << ",0,0,0,0,0,0,0,0,-1,-1,-1,NA,8\n";
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
+        _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
     }
 
     // Stable-buffer capture/replay for M7/M8 on each admitted shape. The eager
@@ -828,12 +828,12 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
         auto* graph_destination = graph_base + guard;
         auto* eager_destination = eager_base + guard;
         const std::vector<std::uint16_t> graph_initial(graph_elements, sentinel);
-        _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "");
-        _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "");
+        _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "1");
         Exl3CudaLinearWorkspace graph_workspace(in_features, out_features, 8);
         Exl3CudaLinearWorkspace eager_workspace(in_features, out_features, 8);
         for (int m : {7, 8}) {
-            _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "1");
+            _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "1");
             std::vector<std::uint16_t> seed(changed.size(), 0);
             cuda_check(cudaMemcpyAsync(input_device, seed.data(), seed.size() * sizeof(std::uint16_t),
                                        cudaMemcpyHostToDevice, graph_stream),
@@ -867,7 +867,7 @@ void run_draft_small_m_qualification(Exl3TextModel& target,
             cuda_check(cudaMemcpy(eager.data(), eager_base,
                                   graph_elements * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
                        "draft-small graph eager download");
-            _putenv_s("NINFER_EXL3_DRAFT_SMALL_M", "0");
+            _putenv_s("VOIDINFER_EXL3_DRAFT_SMALL_M", "0");
             cuda_check(cudaMemcpyAsync(graph_base, graph_initial.data(),
                                        graph_elements * sizeof(std::uint16_t),
                                        cudaMemcpyHostToDevice, graph_stream),

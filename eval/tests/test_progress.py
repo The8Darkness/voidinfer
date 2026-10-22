@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ninfer_eval.events import EventSink, RunEvent
-from ninfer_eval.progress import ProgressRenderer
+from voidinfer_eval.events import EventSink, RunEvent
+from voidinfer_eval.progress import ProgressRenderer
 
 
 class NonTTY(io.StringIO):

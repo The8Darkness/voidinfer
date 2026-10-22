@@ -2,7 +2,7 @@
 #include "exl3/device_page_reader.h"
 #include "exl3/registered_kv_upload.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3SharedAttentionPrefix {
     const std::uint16_t* k=nullptr;
     const std::uint16_t* v=nullptr;

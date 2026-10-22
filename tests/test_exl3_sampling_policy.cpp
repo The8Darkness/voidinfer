@@ -5,14 +5,14 @@
 #include <limits>
 #include <stdexcept>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 namespace {
 void need(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 template<class F> bool refuses(F&& call){try{call();}catch(...){return true;}return false;}
 }
 
 int main() {
-    ninfer::runtime::ResolvedSamplingParameters greedy;
+    voidinfer::runtime::ResolvedSamplingParameters greedy;
     greedy.temperature=0;greedy.top_k=0;greedy.top_p=0;greedy.min_p=1;
     auto policy=Exl3SamplingPolicy::normalize(greedy,7);
     need(policy.greedy && policy.effective_top_k==7 && policy.top_p_enabled &&

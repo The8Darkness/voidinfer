@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 
 struct HostKVPlaneLayout {
     std::size_t offset             = 0;
@@ -299,4 +299,4 @@ private:
     std::uint64_t revision_ = 1;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

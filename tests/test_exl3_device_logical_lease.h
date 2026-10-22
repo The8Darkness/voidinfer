@@ -9,7 +9,7 @@
 #include <string_view>
 
 inline void run_device_logical_invalid_handle_host_only() {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Coordinator=Exl3VeriCacheServingCoordinator;
     Exl3VeriCacheServingIdentity identity{"device-logical-host","weights","tokens","exact","text"};
     Exl3VeriCacheServingPrefixCache cache({1,64,2ULL<<30,8ULL<<30},identity);
@@ -35,7 +35,7 @@ inline void run_device_logical_invalid_handle_host_only() {
 // All assertions after root construction exercise coordinator metadata only.
 inline void run_device_logical_model_contract(const char* target_path,
     const char* draft_path) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Coordinator=Exl3VeriCacheServingCoordinator;
     using Request=Exl3VeriCacheRequest;
     constexpr int max_context=256;

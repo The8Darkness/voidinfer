@@ -5,7 +5,7 @@
 #include <charconv>
 #include <string_view>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Startup configuration only. Zero is an actual zero-byte cap; absence alone
 // preserves the unlimited policy. This bounds inventoried host metadata, not
 // authoritative host payload, OS working-set quota or CUDA registration.

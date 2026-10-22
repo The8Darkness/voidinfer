@@ -21,17 +21,22 @@
 #undef cublas_check
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <cstdio>
+#include <filesystem>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 namespace cg = cooperative_groups;
@@ -57,7 +62,7 @@ constexpr float kHadamardScale = 0.088388347648f;
 
 bool exl3_pdl_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_PDL");
+        const char* value=std::getenv("VOIDINFER_EXL3_PDL");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -114,17 +119,17 @@ constexpr std::size_t coherent_deep_shared_bytes(int bits, int stages) {
 }
 // The coherent K6/K7 packed producers run 128-column CTAs whose grid is too
 // small to cover DRAM latency with a two-stage ring. Four stages (default) is
-// the measured selection; NINFER_EXL3_COHERENT_DEEP_PIPELINE=0 restores the
+// the measured selection; VOIDINFER_EXL3_COHERENT_DEEP_PIPELINE=0 restores the
 // two-stage ring and 8 is retained for comparison. Numerically identical.
 int coherent_deep_pipeline_stages() {
     static const int stages = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_DEEP_PIPELINE");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_DEEP_PIPELINE");
         if (!value) return 4;
         if (std::strcmp(value, "0") == 0) return 0;
         if (std::strcmp(value, "4") == 0) return 4;
         if (std::strcmp(value, "8") == 0) return 8;
         throw std::invalid_argument(
-            "NINFER_EXL3_COHERENT_DEEP_PIPELINE must be 0, 4 or 8");
+            "VOIDINFER_EXL3_COHERENT_DEEP_PIPELINE must be 0, 4 or 8");
     }();
     return stages;
 }
@@ -140,7 +145,7 @@ std::unordered_map<int,std::size_t> prefill_persisting_l2_by_device;
 // matched token and numerical screen has qualified the complete composition.
 bool ordinary_graph_stream_reduction_allowed() noexcept {
     const char* value = std::getenv(
-        "NINFER_EXL3_ALLOW_ORDINARY_GRAPH_STREAM_REDUCTION");
+        "VOIDINFER_EXL3_ALLOW_ORDINARY_GRAPH_STREAM_REDUCTION");
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -981,7 +986,7 @@ __global__ void output_hadamard_fp16_inplace_kernel(
 // transformed bits are identical; only the CTA/barrier structure changes.
 bool exl3_hadamard_warp_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_HADAMARD_WARP");
+        const char* value=std::getenv("VOIDINFER_EXL3_HADAMARD_WARP");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -1707,7 +1712,7 @@ __device__ __forceinline__ void exl3_dq4_generic(const std::uint32_t* packed,
                                                   int t_offset,
                                                   Exl3FragB& fragment,
                                                   std::uint32_t mul1_multiplier) {
-#ifndef NINFER_EXL3_K7_DIVERGENT_DECODE
+#ifndef VOIDINFER_EXL3_K7_DIVERGENT_DECODE
     if constexpr (Bits == 7 && K7ThreeWord) {
         exl3_dq4_k7_window(packed, t_offset, fragment, mul1_multiplier);
         return;
@@ -2060,13 +2065,157 @@ __global__ void exl3_reconstruct_transformed_weight_kernel(
 // NVFP4 weight global scale is a constant bound instead of a measured amax.
 constexpr float kNvfp4WeightGlobal = 3.5f / (6.0f * 448.0f);
 
+// One thread's 16 decoded values of a 16x16 trellis tile column (rows 0..15)
+// in tensor-core order, bit-identical to decode_state_generic +
+// decode_mul1_generic. Half selects columns 8..15 and is warp-uniform, so the
+// bit offset of every row inside the thread's window is a compile-time
+// constant: the window words are read from shared memory once per tile and
+// each state is one funnel shift (was four 16-bit loads per value).
+template <int Bits, int Half>
+__device__ __forceinline__ void exl3_decode_column16_bits(const std::uint32_t* __restrict__ words,
+    int column_group, std::uint32_t multiplier, std::uint16_t (&h)[16]) {
+    constexpr int kWords32 = 8 * Bits;
+    // Stream bit (MSB-first) where the window of rel=0 starts, minus
+    // column_group*32*Bits (a whole number of words).
+    constexpr int kStart = Half * 4 * Bits + Bits - 16 + 256 * Bits;
+    constexpr int kWord0 = kStart / 32;
+    constexpr int kBit0 = kStart % 32;
+    constexpr int kSpan = (kBit0 + 27 * Bits) / 32 + 2;
+    std::uint32_t w[kSpan];
+    const int base = column_group * Bits + kWord0;
+#pragma unroll
+    for (int i = 0; i < kSpan; ++i) w[i] = words[(base + i) % kWords32];
+#pragma unroll
+    for (int row = 0; row < 16; ++row) {
+        const int rel = ((row & 7) >> 1) * 8 + (row >= 8 ? 2 : 0) + (row & 1);
+        const int bit = kBit0 + rel * Bits;
+        const std::uint32_t state =
+            __funnelshift_l(w[(bit >> 5) + 1], w[bit >> 5], bit & 31) >> 16;
+        const std::uint32_t product = state * multiplier;
+        const std::uint32_t byte_sum = __dp4a(product, 0x01010101u, 0u);
+        const auto input = __ushort_as_half(static_cast<std::uint16_t>(0x6400u + byte_sum));
+        const auto inverse = __ushort_as_half(static_cast<std::uint16_t>(0x1eeeu));
+        const auto bias = __ushort_as_half(static_cast<std::uint16_t>(0xc931u));
+        h[row] = __half_as_ushort(__hfma(input, inverse, bias));
+    }
+}
+
+template <int Bits, int Half>
+__device__ __forceinline__ float exl3_decode_column16(const std::uint32_t* __restrict__ words,
+    int column_group, std::uint32_t multiplier, float (&x)[16]) {
+    std::uint16_t h[16];
+    exl3_decode_column16_bits<Bits, Half>(words, column_group, multiplier, h);
+    float amax = 0.0f;
+#pragma unroll
+    for (int row = 0; row < 16; ++row) {
+        x[row] = __half2float(__ushort_as_half(h[row]));
+        amax = fmaxf(amax, fabsf(x[row]));
+    }
+    return amax;
+}
+
+// Row-major FP16 reconstruction ([k][n], the exl3_reconstruct_transformed_
+// weight_kernel layout) of 32 rows x 256 columns per block: register-window
+// column decode, then a shared-memory transpose so every global store is a
+// full 16-byte row segment (was one 256-thread block and one 2-byte store per
+// value). Requires k % 32 == 0, n % 8 == 0 and 16-byte aligned output rows.
+template <int Bits>
+__global__ void __launch_bounds__(256) exl3_reconstruct_rows_kernel(
+    const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
+    std::uint16_t* __restrict__ reconstructed, int k, int n) {
+    constexpr int kTilesK = 2;
+    constexpr int kWords = 16 * Bits;
+    __shared__ __align__(16) std::uint32_t packed[kTilesK][16][kWords / 2];
+    __shared__ __align__(16) std::uint16_t tile[kTilesK * 16][256 + 8];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tiles_n = n / 16;
+    const int tile_n0 = static_cast<int>(blockIdx.x) * 16;
+    const int live_tiles = min(16, tiles_n - tile_n0);
+    const int k_tile0 = static_cast<int>(blockIdx.y) * kTilesK;
+    if ((reinterpret_cast<std::uintptr_t>(trellis) & 15) == 0) {
+        constexpr int kChunks = 2 * Bits;
+#pragma unroll
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const auto* source = reinterpret_cast<const uint4*>(trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords);
+            auto* destination = reinterpret_cast<uint4*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kChunks; i += 256) destination[i] = source[i];
+        }
+    } else {
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const std::uint16_t* source = trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
+            auto* destination = reinterpret_cast<std::uint16_t*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kWords; i += 256) destination[i] = source[i];
+        }
+    }
+    __syncthreads();
+    const int warp = tid >> 5, lane = tid & 31;
+    const int half = warp & 1;
+    const int local_tile = (warp >> 1) * 4 + (lane >> 3);
+    const int column_group = lane & 7;
+    if (local_tile < live_tiles) {
+        const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
+        const int column = local_tile * 16 + half * 8 + column_group;
+#pragma unroll
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            std::uint16_t h[16];
+            if (half) exl3_decode_column16_bits<Bits, 1>(&packed[kt][local_tile][0], column_group, multiplier, h);
+            else exl3_decode_column16_bits<Bits, 0>(&packed[kt][local_tile][0], column_group, multiplier, h);
+#pragma unroll
+            for (int row = 0; row < 16; ++row) tile[kt * 16 + row][column] = h[row];
+        }
+    }
+    __syncthreads();
+    const int chunks = live_tiles * 2;   // 16-byte segments per row
+    for (int i = tid; i < kTilesK * 16 * 32; i += 256) {
+        const int row = i >> 5, chunk = i & 31;
+        if (chunk >= chunks) continue;
+        *reinterpret_cast<uint4*>(reconstructed +
+            (static_cast<std::size_t>(k_tile0) * 16 + row) * n + tile_n0 * 16 + chunk * 8) =
+            *reinterpret_cast<const uint4*>(&tile[row][chunk * 8]);
+    }
+}
+
+// Row-major FP16 reconstruction of a whole transformed weight ([k][n]).
+inline void launch_reconstruct_transformed_weight(int bits, const std::uint16_t* trellis,
+    const std::int32_t* mul1, std::uint16_t* reconstructed, int k, int n,
+    cudaStream_t stream) {
+    static const bool rows_kernel = [] {
+        const char* value = std::getenv("VOIDINFER_EXL3_RECONSTRUCT_ROWS");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (rows_kernel && k % 32 == 0 && n % 8 == 0 &&
+        (reinterpret_cast<std::uintptr_t>(reconstructed) & 15) == 0) {
+        const dim3 grid((n / 16 + 15) / 16, k / 32);
+        switch (bits) {
+        case 4: exl3_reconstruct_rows_kernel<4><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 5: exl3_reconstruct_rows_kernel<5><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 6: exl3_reconstruct_rows_kernel<6><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 7: exl3_reconstruct_rows_kernel<7><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        case 8: exl3_reconstruct_rows_kernel<8><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); return;
+        default: break;
+        }
+    }
+    const dim3 grid(n / 16, k / 16);
+    switch (bits) {
+    case 4: exl3_reconstruct_transformed_weight_kernel<4><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 5: exl3_reconstruct_transformed_weight_kernel<5><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 6: exl3_reconstruct_transformed_weight_kernel<6><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 7: exl3_reconstruct_transformed_weight_kernel<7><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    case 8: exl3_reconstruct_transformed_weight_kernel<8><<<grid, 256, 0, stream>>>(trellis, mul1, reconstructed, k, n); break;
+    default: throw std::invalid_argument("EXL3 reconstruction supports K4..K8");
+    }
+}
+
 // Fused EXL3 decode + block quantization of one transformed weight into the
 // K-major MXFP8 (Quant=32) or NVFP4 (Quant=16) prefill operand, bypassing the
 // FP16 reconstruction plane. Each thread decodes one output column over
 // Blocks consecutive quantization blocks along K from the packed trellis tiles
 // staged in shared memory, so its value bytes form whole 32-byte segments
-// (NVFP4: 4 x 16 values = 32 bytes, scales one 32-bit store; MXFP8: 32 bytes
-// per block). Grid (ceil(n/256), k/(Quant*Blocks)).
+// (NVFP4: 4 x 16 values = 32 bytes and scales one 32-bit store; MXFP8: 32
+// bytes per block). Warp w covers four tiles of column half w&1. Grid
+// (ceil(n/256), k/(Quant*Blocks)).
 template <int Bits, int Quant, int Blocks>
 __global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
     const std::uint16_t* __restrict__ trellis, const std::int32_t* __restrict__ mul1,
@@ -2075,43 +2224,58 @@ __global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
     constexpr int kTilesPerBlock = Quant / 16;
     constexpr int kTilesK = kTilesPerBlock * Blocks;
     constexpr int kWords = 16 * Bits;          // packed u16 words per 16x16 tile
-    __shared__ std::uint16_t packed[kTilesK][16][kWords];
+    __shared__ __align__(16) std::uint32_t packed[kTilesK][16][kWords / 2];
     const int tid = static_cast<int>(threadIdx.x);
     const int tiles_n = n / 16;
     const int tile_n0 = static_cast<int>(blockIdx.x) * 16;
     const int live_tiles = min(16, tiles_n - tile_n0);
     const int k_tile0 = static_cast<int>(blockIdx.y) * kTilesK;
-    for (int kt = 0; kt < kTilesK; ++kt) {
-        const std::uint16_t* source = trellis +
-            (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
-        for (int i = tid; i < live_tiles * kWords; i += 256)
-            packed[kt][i / kWords][i % kWords] = source[i];
+    if ((reinterpret_cast<std::uintptr_t>(trellis) & 15) == 0) {
+        // A tile is 2*Bits 16-byte chunks; consecutive tiles are contiguous.
+        constexpr int kChunks = 2 * Bits;
+#pragma unroll
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const auto* source = reinterpret_cast<const uint4*>(trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords);
+            auto* destination = reinterpret_cast<uint4*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kChunks; i += 256) destination[i] = source[i];
+        }
+    } else {
+        for (int kt = 0; kt < kTilesK; ++kt) {
+            const std::uint16_t* source = trellis +
+                (static_cast<std::size_t>(k_tile0 + kt) * tiles_n + tile_n0) * kWords;
+            auto* destination = reinterpret_cast<std::uint16_t*>(&packed[kt][0][0]);
+            for (int i = tid; i < live_tiles * kWords; i += 256) destination[i] = source[i];
+        }
     }
     if (Quant == 16 && tid == 0 && blockIdx.x == 0 && blockIdx.y == 0)
         *weight_global = kNvfp4WeightGlobal;
     __syncthreads();
-    const int local_tile = tid / 16, column_in_tile = tid % 16;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int half = warp & 1;
+    const int local_tile = (warp >> 1) * 4 + (lane >> 3);
+    const int column_group = lane & 7;
     if (local_tile >= live_tiles) return;
-    const int column = (tile_n0 + local_tile) * 16 + column_in_tile;
+    const int column = (tile_n0 + local_tile) * 16 + half * 8 + column_group;
     const std::uint32_t multiplier = static_cast<std::uint32_t>(*mul1);
     const int k0 = static_cast<int>(blockIdx.y) * Quant * Blocks;
     const int inner_blocks = (k / Quant + 3) / 4 * 4;
     std::uint32_t codes = 0;
+    std::uint32_t nv_words[Quant == 16 ? 2 * Blocks : 1];
 #pragma unroll
     for (int b = 0; b < Blocks; ++b) {
         float x[Quant];
         float amax = 0.0f;
 #pragma unroll
         for (int kt = 0; kt < kTilesPerBlock; ++kt) {
+            float column_values[16];
+            const std::uint32_t* words = &packed[b * kTilesPerBlock + kt][local_tile][0];
+            const float tile_amax = half
+                ? exl3_decode_column16<Bits, 1>(words, column_group, multiplier, column_values)
+                : exl3_decode_column16<Bits, 0>(words, column_group, multiplier, column_values);
+            amax = fmaxf(amax, tile_amax);
 #pragma unroll
-            for (int row = 0; row < 16; ++row) {
-                const int encoded = inverse_tensor_core_index(row, column_in_tile);
-                const float value = __half2float(__ushort_as_half(decode_mul1_generic(
-                    decode_state_generic(packed[b * kTilesPerBlock + kt][local_tile],
-                                         Bits, encoded), multiplier)));
-                x[kt * 16 + row] = value;
-                amax = fmaxf(amax, fabsf(value));
-            }
+            for (int row = 0; row < 16; ++row) x[kt * 16 + row] = column_values[row];
         }
         const int kb = k0 + b * Quant;
         if constexpr (Quant == 32) {
@@ -2121,14 +2285,30 @@ __global__ void __launch_bounds__(256, 4) exl3_decode_quantize_weight_kernel(
             scales[mxfp8_scale_offset(column, kb / 32, inner_blocks)] =
                 static_cast<std::uint8_t>(exponent + 127);
         } else {
-            std::uint8_t code = 0;
-            nvfp4_encode16(x, amax, kNvfp4WeightGlobal,
-                values + (static_cast<std::size_t>(column) * k + kb) / 2, code);
+            // nvfp4_encode16 with the four blocks' 32 value bytes stored at once.
+            float scale = 1.0f;
+            const std::uint8_t code = nvfp4_scale_code(
+                fmaxf(amax / (6.0f * kNvfp4WeightGlobal), 1e-30f), scale);
+            const float inverse = 1.0f / (scale * kNvfp4WeightGlobal);
+#pragma unroll
+            for (int i = 0; i < 16; i += 4) {
+                const auto low = static_cast<std::uint32_t>(__nv_cvt_float2_to_fp4x2(
+                    make_float2(x[i] * inverse, x[i + 1] * inverse), __NV_E2M1, cudaRoundNearest)) & 0xffu;
+                const auto high = static_cast<std::uint32_t>(__nv_cvt_float2_to_fp4x2(
+                    make_float2(x[i + 2] * inverse, x[i + 3] * inverse), __NV_E2M1, cudaRoundNearest)) & 0xffu;
+                const std::uint32_t pair = low | (high << 8);
+                if ((i & 4) == 0) nv_words[b * 2 + i / 8] = pair;
+                else nv_words[b * 2 + i / 8] |= pair << 16;
+            }
             codes |= static_cast<std::uint32_t>(code) << (8 * b);
         }
     }
     if constexpr (Quant == 16) {
         static_assert(Blocks == 4, "NVFP4 scale store covers four inner blocks");
+        auto* destination = reinterpret_cast<uint4*>(
+            values + (static_cast<std::size_t>(column) * k + k0) / 2);
+        destination[0] = make_uint4(nv_words[0], nv_words[1], nv_words[2], nv_words[3]);
+        destination[1] = make_uint4(nv_words[4], nv_words[5], nv_words[6], nv_words[7]);
         *reinterpret_cast<std::uint32_t*>(scales +
             mxfp8_scale_offset(column, k0 / 16, inner_blocks)) = codes;
     }
@@ -2141,6 +2321,8 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
     constexpr int kBlocks = Quant == 16 ? 4 : 1;
     const dim3 grid((n / 16 + 15) / 16, k / (Quant * kBlocks));
     switch (bits) {
+    case 4: exl3_decode_quantize_weight_kernel<4, Quant, kBlocks><<<grid, 256, 0, stream>>>(
+        trellis, mul1, values, scales, weight_global, k, n); break;
     case 5: exl3_decode_quantize_weight_kernel<5, Quant, kBlocks><<<grid, 256, 0, stream>>>(
         trellis, mul1, values, scales, weight_global, k, n); break;
     case 6: exl3_decode_quantize_weight_kernel<6, Quant, kBlocks><<<grid, 256, 0, stream>>>(
@@ -2149,7 +2331,27 @@ void launch_decode_quantize_weight(int bits, const std::uint16_t* trellis,
         trellis, mul1, values, scales, weight_global, k, n); break;
     case 8: exl3_decode_quantize_weight_kernel<8, Quant, kBlocks><<<grid, 256, 0, stream>>>(
         trellis, mul1, values, scales, weight_global, k, n); break;
-    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K5..K8");
+    default: throw std::invalid_argument("fused EXL3 decode/quantize supports K4..K8");
+    }
+}
+
+// Whether a block-scaled prefill projection uses NVFP4 (else MXFP8) under
+// NVFP4 policy `mode` (see the policy at workspace construction).
+inline bool nvfp4_projection(int mode, const Exl3CudaLinearMetadata& metadata, int layer) {
+    const bool gate_up = metadata.in_features == 5120 && metadata.out_features == 17408;
+    const bool down = metadata.in_features == 17408 && metadata.out_features == 5120;
+    const bool gdn_qkvz = metadata.in_features == 5120 &&
+        (metadata.out_features == 10240 || metadata.out_features == 6144);
+    switch (mode) {
+    case 1: return true;
+    case 2: return gate_up || down;
+    case 3: return (gate_up || down) && layer >= 0 && layer < 56;
+    case 4: return gate_up || down || gdn_qkvz;
+    case 5: return down || (gate_up && layer >= 32);
+    case 6: return down || layer >= 32;
+    case 7: return gate_up && layer >= 32;
+    case 8: return down;
+    default: return false;
     }
 }
 
@@ -2911,7 +3113,7 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
            bool RegisterPipeline = false, bool GlobalSlices = false,
            int DeepStages = 0, int Warps = 8, int TilesPerStage = 1,
-           bool FusedInput = false>
+           bool FusedInput = false, int MTiles = 1>
 __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                                                  const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
@@ -2931,6 +3133,20 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     static_assert(!FusedInput || (DeepStages > 0 && AsyncA && !RegisterPipeline &&
                                   !Fp16Accumulate && !PredecodedB),
                   "fused input requires the deep async-A FP32 producer");
+    // MTiles 2 / 4 (batched rounds of 3-4 / 5-8 agents, rows 17..32 / 33..64):
+    // two / four M16 A tiles share every decoded B fragment; each output row
+    // keeps the M16 MMA sequence of its own tile.
+    static_assert(MTiles == 1 || ((MTiles == 2 || MTiles == 4) && DeepStages > 0 && AsyncA &&
+                                  !FusedInput && !RegisterPipeline && !PredecodedB &&
+                                  Warps * 32 >= 32 * MTiles),
+                  "M32/M64 require the deep async-A producer");
+    constexpr int kExtraTiles = MTiles > 1 ? MTiles - 1 : 1;
+    // The staged output tile covers at most two M16 tiles (32 rows): M64
+    // writes its partials in two passes through it (so it still fits the
+    // drained ring and four CTAs stay resident).
+    constexpr int kStoreTiles = MTiles > 2 ? 2 : MTiles;
+    static_assert(MTiles <= 2 || (PartialOnly && !SingleSplit && !GlobalSlices),
+                  "M64 stores partials only");
     // Deep async-A stages may stream the constant packed weights of their
     // preload groups before the dependency wait; everything else waits first.
     constexpr bool kEarlyWeights = DeepStages > 0 && AsyncA && !RegisterPipeline;
@@ -2964,10 +3180,12 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                   "global slices require async-A partial-only accumulation");
     // DeepStages keeps DeepStages-1 packed tiles in flight per CTA. It changes
     // only copy scheduling; every output sees the same MMA sequence.
+    // Deep stages with Fp16Accumulate (batched rounds): FP16 MMA partials
+    // fold into the FP32 accumulators after every stage group.
     static_assert(DeepStages == 0 ||
                       (DeepStages >= 3 && DeepStages <= 8 && AsyncA &&
-                       !RegisterPipeline && !Fp16Accumulate),
-                  "deep cp.async staging requires the async-A FP32 path");
+                       !RegisterPipeline && (!Fp16Accumulate || !FusedInput)),
+                  "deep cp.async staging requires the async-A path");
     constexpr int tile_half = PredecodedB ? 256 : 16 * Bits;
     constexpr int raw_stage_half = output_tiles_per_block * tile_half;
     static_assert(TilesPerStage == 1 ||
@@ -2980,15 +3198,21 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     // builds A fragments from sh_in and stages no A tiles. Launchers size
     // fused-input shared memory with exl3_fused_input_shared_bytes.
     constexpr bool alias_c = DeepStages > 0 &&
-        exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block);
+        exl3_deep_ring_holds_output(raw_stage_count * raw_stage_half, output_tiles_per_block * kStoreTiles);
+    // M32: the 32-row output tile reuses the whole drained A + B ring
+    // (launch_coherent_packed_variant), which doubles the resident CTAs per SM.
+    constexpr bool alias_c_ring = MTiles >= 2 && !alias_c &&
+        exl3_deep_ring_holds_output(raw_stage_count * (256 * MTiles + raw_stage_half),
+                                    output_tiles_per_block * kStoreTiles);
     extern __shared__ half shared[];
     half* sh_a = shared;
     auto* sh_raw = reinterpret_cast<std::uint16_t*>(
-        sh_a + (FusedInput ? 0 : (AsyncA ? raw_stage_count * 256 : 256)));
-    float* sh_c = alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
+        sh_a + (FusedInput ? 0 : (AsyncA ? raw_stage_count * 256 * MTiles : 256)));
+    float* sh_c = alias_c_ring ? reinterpret_cast<float*>(shared) :
+        alias_c ? reinterpret_cast<float*>(sh_raw) : reinterpret_cast<float*>(
         sh_raw + raw_stage_count * raw_stage_half);
     half* sh_in = alias_c ? reinterpret_cast<half*>(sh_raw + raw_stage_count * raw_stage_half)
-                          : reinterpret_cast<half*>(sh_c + 16 * output_tiles_per_block * 16);
+                          : reinterpret_cast<half*>(sh_c + 16 * kStoreTiles * output_tiles_per_block * 16);
     const int thread = static_cast<int>(threadIdx.x);
     const int warp = thread / 32;
     const int lane = thread & 31;
@@ -3016,13 +3240,14 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             exl3_cp_async_16(destination + chunk * 8, source + chunk * 8);
         }
         if constexpr (AsyncA && !FusedInput) {
-            if (part != 1 && thread < 32) {
+            if (part != 1 && thread < 32 * MTiles) {
                 const int row = thread / 2;
+                const int local = row & 15;
                 const int column = (thread % 2) * 8;
                 const int source_column =
-                    (thread % 2 ^ ((row >> 2) & 1)) * 8;
+                    (thread % 2 ^ ((local >> 2) & 1)) * 8;
                 half* destination_a =
-                    sh_a + stage * 256 + row * 16 + column;
+                    sh_a + stage * 256 * MTiles + (row >> 4) * 256 + local * 16 + column;
                 if (row < rows) {
                     exl3_cp_async_16(
                         destination_a,
@@ -3046,7 +3271,20 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     }
 
     Exl3FragC c[fragments_per_warp];
+    // Accumulators of the further M16 tiles (rows 16.., MTiles > 1).
+    Exl3FragC c2[kExtraTiles][MTiles > 1 ? fragments_per_warp : 1];
+    Exl3FragCHalf c2_half[kExtraTiles][MTiles > 1 ? fragments_per_warp : 1];
     Exl3FragCHalf c_half[fragments_per_warp];
+    #pragma unroll
+    for (int m = 0; m < kExtraTiles; ++m) {
+        #pragma unroll
+        for (int n = 0; n < (MTiles > 1 ? fragments_per_warp : 1); ++n) {
+            c2_half[m][n].values[0] = __float2half2_rn(0.0f);
+            c2_half[m][n].values[1] = __float2half2_rn(0.0f);
+            #pragma unroll
+            for (float& value : c2[m][n].values) value = 0.0f;
+        }
+    }
     #pragma unroll
     for (int n = 0; n < fragments_per_warp; ++n) {
         #pragma unroll
@@ -3066,6 +3304,21 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                 c[n].values[3] += high.y;
                 c_half[n].values[0] = __float2half2_rn(0.0f);
                 c_half[n].values[1] = __float2half2_rn(0.0f);
+            }
+            if constexpr (MTiles > 1) {
+                #pragma unroll
+                for (int m = 0; m < MTiles - 1; ++m)
+                #pragma unroll
+                for (int n = 0; n < fragments_per_warp; ++n) {
+                    const float2 low = __half22float2(c2_half[m][n].values[0]);
+                    const float2 high = __half22float2(c2_half[m][n].values[1]);
+                    c2[m][n].values[0] += low.x;
+                    c2[m][n].values[1] += low.y;
+                    c2[m][n].values[2] += high.x;
+                    c2[m][n].values[3] += high.y;
+                    c2_half[m][n].values[0] = __float2half2_rn(0.0f);
+                    c2_half[m][n].values[1] = __float2half2_rn(0.0f);
+                }
             }
         }
     };
@@ -3221,6 +3474,7 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             if (tile_k_begin + group * per + t >= tile_k_end) break;
             const int stage = (group % stages) * per + t;
             Exl3FragA a;
+            [[maybe_unused]] Exl3FragA a2[kExtraTiles];
             if constexpr (FusedInput) {
                 // m16n8k16 A: words 0/2 hold row lane/4 at columns
                 // 2*(lane%4) and 8+2*(lane%4); words 1/3 (rows 8..15) are zero.
@@ -3238,7 +3492,12 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             const int r = (lane % 8) + 8 * ((lane / 8) % 2);
             const int base_c = lane / 16;
             const int c_swizzled = base_c ^ ((r >> 2) & 1);
-            exl3_ldsm4(a, sh_a + stage * 256 + r * 16 + c_swizzled * 8);
+            exl3_ldsm4(a, sh_a + stage * 256 * MTiles + r * 16 + c_swizzled * 8);
+            if constexpr (MTiles > 1) {
+                #pragma unroll
+                for (int m = 0; m < MTiles - 1; ++m)
+                    exl3_ldsm4(a2[m], sh_a + stage * 256 * MTiles + 256 * (m + 1) + r * 16 + c_swizzled * 8);
+            }
             }
             #pragma unroll
             for (int n2 = 0; n2 < fragments_per_warp; n2 += 2) {
@@ -3261,10 +3520,30 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
                     exl3_dq4_generic<Bits, K7ThreeWord>(
                         packed, (lane << 3) + 4, b1, mul1_multiplier);
                 }
+                if constexpr (Fp16Accumulate) {
+                    exl3_mma_m16n8k16_half(a, b0, c_half[n2]);
+                    exl3_mma_m16n8k16_half(a, b1, c_half[n2 + 1]);
+                    if constexpr (MTiles > 1) {
+                        #pragma unroll
+                        for (int m = 0; m < MTiles - 1; ++m) {
+                            exl3_mma_m16n8k16_half(a2[m], b0, c2_half[m][n2]);
+                            exl3_mma_m16n8k16_half(a2[m], b1, c2_half[m][n2 + 1]);
+                        }
+                    }
+                } else {
                 exl3_mma_m16n8k16(a, b0, c[n2]);
                 exl3_mma_m16n8k16(a, b1, c[n2 + 1]);
+                if constexpr (MTiles > 1) {
+                    #pragma unroll
+                    for (int m = 0; m < MTiles - 1; ++m) {
+                        exl3_mma_m16n8k16(a2[m], b0, c2[m][n2]);
+                        exl3_mma_m16n8k16(a2[m], b1, c2[m][n2 + 1]);
+                    }
+                }
+                }
             }
           }
+          fold_half_accumulators();
         }
         exl3_cp_async_wait();
         __syncthreads();
@@ -3343,6 +3622,41 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
     const int r0 = lane / 4;
     const int r1 = r0 + 8;
     const int column = (lane % 4) * 2;
+    if constexpr (MTiles == 4) {
+        // Two passes of 32 rows (tiles 0-1, then 2-3) through the staged tile.
+        const std::size_t partial_stride = static_cast<std::size_t>(rows) * output_features;
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            __syncthreads();
+            #pragma unroll
+            for (int n = 0; n < fragments_per_warp; ++n) {
+                #pragma unroll
+                for (int local = 0; local < 2; ++local) {
+                    const int tile = pass * 2 + local;
+                    const Exl3FragC& fragment = tile == 0 ? c[n] : c2[tile - 1][n];
+                    if (pass * 32 + local * 16 + r0 < rows) {
+                        float* destination = sh_c + (local * 16 + r0) * output_tile_elements + (n0 + n) * 8 + column;
+                        destination[0] = fragment.values[0];
+                        destination[1] = fragment.values[1];
+                    }
+                    if (pass * 32 + local * 16 + r1 < rows) {
+                        float* destination = sh_c + (local * 16 + r1) * output_tile_elements + (n0 + n) * 8 + column;
+                        destination[0] = fragment.values[2];
+                        destination[1] = fragment.values[3];
+                    }
+                }
+            }
+            __syncthreads();
+            const int pass_rows = min(32, rows - pass * 32);
+            for (int i = thread; i < pass_rows * output_tile_elements; i += threads) {
+                const int row = pass * 32 + i / output_tile_elements;
+                const int column_index = i % output_tile_elements;
+                accum[static_cast<std::size_t>(split) * partial_stride +
+                      row * output_features + tile_base * 16 + column_index] = sh_c[i];
+            }
+        }
+        return;
+    } else {
     #pragma unroll
     for (int n = 0; n < fragments_per_warp; ++n) {
         if (r0 < rows) {
@@ -3355,6 +3669,23 @@ __device__ __forceinline__ void exl3_gemm_m1_generic_mma_body(int block_index,
             destination[0] = c[n].values[2];
             destination[1] = c[n].values[3];
         }
+        if constexpr (MTiles > 1) {
+            #pragma unroll
+            for (int m = 0; m < MTiles - 1; ++m) {
+                const int offset = 16 * (m + 1);
+                if (r0 + offset < rows) {
+                    float* destination = sh_c + (r0 + offset) * output_tile_elements + (n0 + n) * 8 + column;
+                    destination[0] = c2[m][n].values[0];
+                    destination[1] = c2[m][n].values[1];
+                }
+                if (r1 + offset < rows) {
+                    float* destination = sh_c + (r1 + offset) * output_tile_elements + (n0 + n) * 8 + column;
+                    destination[0] = c2[m][n].values[2];
+                    destination[1] = c2[m][n].values[3];
+                }
+            }
+        }
+    }
     }
     __syncthreads();
     const std::size_t partial_stride =
@@ -3417,7 +3748,7 @@ template <int Bits, bool SingleSplit = false, int OutputTilesPerBlock = 32,
            bool K7ThreeWord = false, bool PredecodedB = false,
            bool FastK6Decode = false, bool Fp16Accumulate = false,
            bool RegisterPipeline = false, bool GlobalSlices = false,
-           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1>
+           int DeepStages = 0, int Warps = 8, int TilesPerStage = 1, int MTiles = 1>
 __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed,
                                                  const std::uint16_t* trellis,
                                                  const std::int32_t* mul1,
@@ -3428,9 +3759,28 @@ __global__ void exl3_gemm_m1_generic_mma_kernel(const std::uint16_t* transformed
                                                  int split_count) {
     exl3_gemm_m1_generic_mma_body<Bits, SingleSplit, OutputTilesPerBlock, AsyncA,
         PartialOnly, K7ThreeWord, PredecodedB, FastK6Decode, Fp16Accumulate,
-        RegisterPipeline, GlobalSlices, DeepStages, Warps, TilesPerStage, false>(
+        RegisterPipeline, GlobalSlices, DeepStages, Warps, TilesPerStage, false, MTiles>(
             static_cast<int>(blockIdx.x), transformed, trellis, mul1, accum, rows, input_features, output_features,
             split_count, nullptr, nullptr);
+}
+
+// Two same-input projections of 17..32 rows in one launch: blocks below
+// grid_a run the M32 128-column producer for the first tensor, the rest for
+// the second (one shared K split).
+template <int Bits, int MTiles = 2, bool Fp16 = false>
+__global__ void exl3_gemm_m32_dual_kernel(const std::uint16_t* transformed_a,
+    const std::uint16_t* trellis_a, const std::int32_t* mul1_a, float* accum_a, int output_features_a,
+    const std::uint16_t* transformed_b, const std::uint16_t* trellis_b, const std::int32_t* mul1_b,
+    float* accum_b, int output_features_b, int rows, int input_features, int split_count, int grid_a) {
+    const int block = static_cast<int>(blockIdx.x);
+    if (block < grid_a)
+        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, Fp16,
+            false, false, 4, 4, 2, false, MTiles>(block, transformed_a, trellis_a, mul1_a, accum_a, rows,
+            input_features, output_features_a, split_count, nullptr, nullptr);
+    else
+        exl3_gemm_m1_generic_mma_body<Bits, false, 8, true, true, Bits == 7, false, Bits == 6, Fp16,
+            false, false, 4, 4, 2, false, MTiles>(block - grid_a, transformed_b, trellis_b, mul1_b, accum_b,
+            rows, input_features, output_features_b, split_count, nullptr, nullptr);
 }
 
 template <int Bits, bool K7ThreeWord, bool FastK6Decode, int DeepStages, int Warps,
@@ -4698,6 +5048,128 @@ __global__ void exl3_split_plane_discriminator_compare_kernel(
     if(index<count&&selected[index]!=candidate[index])atomicAdd(mismatches,1ULL);
 }
 
+
+// Recorded FP16 prefill GEMM algorithms (after crit-hub kestrel's
+// gemm_table.txt, restricted to bit-identical results). Default: a per-user
+// table named for the GPU, its driver and the cuBLASLt version
+// (%LOCALAPPDATA%\VoidInfer\gemm-table\..., else $XDG_CACHE_HOME or
+// ~/.cache/voidinfer/gemm-table), so a table is never reused on another
+// device or library. VOIDINFER_EXL3_GEMM_TABLE=<file> names another table,
+// =0 disables. A GEMM shape the table lacks is tuned on first use (outside
+// stream capture) when its row count is a multiple of 128 (whole prompt
+// blocks; VOIDINFER_EXL3_GEMM_TUNE=1 tunes every row count, =0 none): every
+// cuBLASLt heuristic candidate runs on the real operands, only candidates
+// whose output is bitwise identical to cuBLAS's default for that exact shape
+// are timed, and the fastest is recorded when it beats the default by
+// VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN (percent, default 3); otherwise the
+// default is recorded. A tune that fails (device memory) runs the default
+// and is retried by the next process. Shapes without an entry, and recorded
+// algorithms the shape does not support, run cuBLAS's default: a table never
+// changes a result.
+__global__ void exl3_gemm_bitwise_diff_kernel(const std::uint32_t* a,const std::uint32_t* b,
+    std::size_t words,int* diff) {
+    for(std::size_t i=blockIdx.x*static_cast<std::size_t>(blockDim.x)+threadIdx.x;i<words;
+        i+=static_cast<std::size_t>(gridDim.x)*blockDim.x)
+        if(a[i]!=b[i]) {atomicExch(diff,1);return;}
+}
+class Exl3GemmTable {
+public:
+    struct Entry {bool lt=false;cublasLtMatmulAlgo_t algo{};};
+    static Exl3GemmTable& get() {static Exl3GemmTable table;return table;}
+    bool enabled() const noexcept {return !path_.empty();}
+    bool tune(int rows) const noexcept {return tune_==2 || (tune_==1 && rows%128==0);}
+    double min_gain() const noexcept {return min_gain_;}
+    static std::uint64_t key(bool fp16_compute,bool fp16_output,int in,int out,int rows) {
+        return (fp16_compute?1ull<<63:0ull)|(fp16_output?1ull<<62:0ull)|
+            (static_cast<std::uint64_t>(in&0xFFFFF)<<40)|
+            (static_cast<std::uint64_t>(out&0xFFFFF)<<20)|static_cast<std::uint64_t>(rows&0xFFFFF);
+    }
+    std::optional<Entry> find(std::uint64_t k) {
+        std::lock_guard lock(mutex_);
+        const auto it=entries_.find(k);
+        if(it==entries_.end())return std::nullopt;
+        return it->second;
+    }
+    void record(std::uint64_t k,const Entry& entry,bool persist) {
+        std::lock_guard lock(mutex_);
+        entries_[k]=entry;
+        if(!persist)return;
+        if(std::FILE* f=std::fopen(path_.c_str(),"a")) {
+            std::fprintf(f,"%016llx %d ",static_cast<unsigned long long>(k),entry.lt?1:0);
+            const auto* bytes=reinterpret_cast<const unsigned char*>(&entry.algo);
+            for(std::size_t i=0;i<sizeof(entry.algo);++i)std::fprintf(f,"%02x",bytes[i]);
+            std::fprintf(f,"\n");
+            std::fclose(f);
+        }
+    }
+private:
+    Exl3GemmTable() {
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE"))
+            tune_=std::strcmp(value,"1")==0?2:std::strcmp(value,"0")==0?0:1;
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TABLE"); value && *value) {
+            if(std::strcmp(value,"0")!=0)path_=value;
+        } else {
+            path_=default_path();
+        }
+        if(const char* value=std::getenv("VOIDINFER_EXL3_GEMM_TUNE_MIN_GAIN"))
+            min_gain_=std::clamp(std::atof(value),0.0,50.0);
+        if(path_.empty())return;
+        std::FILE* f=std::fopen(path_.c_str(),"r");
+        if(!f)return;
+        char line[512];
+        while(std::fgets(line,sizeof(line),f)) {
+            unsigned long long k=0;int lt=0;char hex[200]{};
+            if(std::sscanf(line,"%llx %d %199s",&k,&lt,hex)!=3)continue;
+            Entry entry;entry.lt=lt!=0;
+            auto* bytes=reinterpret_cast<unsigned char*>(&entry.algo);
+            if(std::strlen(hex)!=2*sizeof(entry.algo))continue;
+            bool ok=true;
+            for(std::size_t i=0;i<sizeof(entry.algo);++i) {
+                unsigned v=0;
+                if(std::sscanf(hex+2*i,"%2x",&v)!=1){ok=false;break;}
+                bytes[i]=static_cast<unsigned char>(v);
+            }
+            if(ok)entries_[k]=entry;
+        }
+        std::fclose(f);
+    }
+    static std::string default_path() {
+        try {
+            int device=0,driver=0;
+            cudaDeviceProp properties{};
+            if(cudaGetDevice(&device)!=cudaSuccess ||
+               cudaGetDeviceProperties(&properties,device)!=cudaSuccess ||
+               cudaDriverGetVersion(&driver)!=cudaSuccess)return {};
+            std::filesystem::path root;
+#ifdef _WIN32
+            if(const char* local=std::getenv("LOCALAPPDATA"); local && *local)
+                root=std::filesystem::path(local)/"VoidInfer";
+#else
+            if(const char* cache=std::getenv("XDG_CACHE_HOME"); cache && *cache)
+                root=std::filesystem::path(cache)/"voidinfer";
+            else if(const char* home=std::getenv("HOME"); home && *home)
+                root=std::filesystem::path(home)/".cache"/"voidinfer";
+#endif
+            if(root.empty())return {};
+            std::string gpu;
+            for(const char* c=properties.name;*c;++c)
+                gpu+=std::isalnum(static_cast<unsigned char>(*c))?*c:'-';
+            const auto directory=root/"gemm-table";
+            std::filesystem::create_directories(directory);
+            char version[96];
+            std::snprintf(version,sizeof(version),"_sm%d%d_driver%d_cublaslt%zu.txt",
+                properties.major,properties.minor,driver,cublasLtGetVersion());
+            return (directory/(gpu+version)).string();
+        } catch(...) {
+            return {};  // no writable cache directory: the table is off
+        }
+    }
+    std::string path_;
+    int tune_=1;  // 0 never, 1 row counts that are multiples of 128, 2 every row count
+    double min_gain_=3.0;
+    std::mutex mutex_;
+    std::unordered_map<std::uint64_t,Entry> entries_;
+};
 } // namespace
 
 Exl3Mul1LookupDiscriminator exl3_mul1_lookup_discriminator_for_test(
@@ -5032,7 +5504,7 @@ void exl3_transform_input_pair(
         {reinterpret_cast<std::uintptr_t>(input),reinterpret_cast<std::uintptr_t>(first_weights.suh),
          reinterpret_cast<std::uintptr_t>(second_weights.suh),reinterpret_cast<std::uintptr_t>(first_transformed),
          reinterpret_cast<std::uintptr_t>(second_transformed)});
-    if(exl3_equal_transform_reuse_enabled(std::getenv("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS")))
+    if(exl3_equal_transform_reuse_enabled(std::getenv("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS")))
         input_hadamard_pair_kernel<kHadamard,true><<<
             dim3(rows, first_metadata.in_features / kHadamard),dim3(kHadamard),0,stream>>>(
                 input,first_weights.suh,second_weights.suh,first_transformed,second_transformed,rows,first_metadata.in_features);
@@ -5094,49 +5566,49 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
        (transformed.data!=nullptr && transformed.bytes<requirement.transformed_bytes))
         throw std::invalid_argument("EXL3 borrowed transform capacity");
     requirement.require_disjoint_borrowed_views(transformed.data,accumulation.data);
-    const bool stream_reduce = read_binary_option("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",
+    const bool stream_reduce = read_binary_option("VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION",
         "K6 small-M stream reduction must be0 or1");
     k6_stream_reduction_enabled_ = target_wide_prefill_owner && stream_reduce;
-    const char* extended=std::getenv("NINFER_EXL3_EXTENDED_STREAM_REDUCTION");
+    const char* extended=std::getenv("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION");
     if(extended&&std::strcmp(extended,"0")!=0&&std::strcmp(extended,"1")!=0)
         throw std::invalid_argument("extended target stream reduction must be0 or1");
     extended_stream_reduction_enabled_=target_wide_prefill_owner&&extended&&std::strcmp(extended,"1")==0;
     const char* host_kv_gdn_segment_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_GDN_SEGMENT_GRAPHS");
     const char* host_kv_mlp_tail_graphs=
-        std::getenv("NINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_HOST_KV_MLP_TAIL_GRAPHS");
     host_kv_gdn_segment_graph_capture_=
         (host_kv_gdn_segment_graphs &&
          std::strcmp(host_kv_gdn_segment_graphs,"1")==0) ||
         (host_kv_mlp_tail_graphs &&
          std::strcmp(host_kv_mlp_tail_graphs,"1")==0);
-    const bool kv_stream = read_binary_option("NINFER_EXL3_KV_K7_STREAM_REDUCTION",
+    const bool kv_stream = read_binary_option("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION",
         "K7 KV stream reduction must be 0 or 1");
     kv_k7_stream_reduction_enabled_ = target_kv_owner && kv_stream;
     // Widen only explicit staged target prefill, with construction-latched opt-in.
-    const char* wide64 = std::getenv("NINFER_EXL3_PREFILL_WIDE64");
+    const char* wide64 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE64");
     target_wide64_enabled_ = wide64 && std::strcmp(wide64, "1") == 0;
-    const char* wide128 = std::getenv("NINFER_EXL3_PREFILL_WIDE128");
+    const char* wide128 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE128");
     target_wide128_enabled_ = target_wide64_enabled_ && wide128 && std::strcmp(wide128, "1") == 0;
-    const char* wide256 = std::getenv("NINFER_EXL3_PREFILL_WIDE256");
+    const char* wide256 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE256");
     target_wide256_enabled_ = target_wide128_enabled_ && wide256 && std::strcmp(wide256, "1") == 0;
-    const char* wide512 = std::getenv("NINFER_EXL3_PREFILL_WIDE512");
+    const char* wide512 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE512");
     target_wide512_enabled_ = target_wide256_enabled_ && wide512 && std::strcmp(wide512,"1")==0;
-    const char* wide1024 = std::getenv("NINFER_EXL3_PREFILL_WIDE1024");
+    const char* wide1024 = std::getenv("VOIDINFER_EXL3_PREFILL_WIDE1024");
     target_wide1024_enabled_ = target_wide512_enabled_ && wide1024 && std::strcmp(wide1024,"1")==0;
     const char* projection_graphs =
-        std::getenv("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
+        std::getenv("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
     if (projection_graphs && std::strcmp(projection_graphs,"0") != 0 &&
         std::strcmp(projection_graphs,"1") != 0)
         throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_PROJECTION_GRAPHS must be 0 or 1");
+            "VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS must be 0 or 1");
     // T139/W13: capture only workspaces owned by the exact target-wide caller.
     // The graph records the already-selected transform/projection/reduction
     // kernels; it never selects an alternate arithmetic route.
     prefill_projection_graph_enabled_ = target_wide_prefill_owner &&
         projection_graphs && std::strcmp(projection_graphs,"1") == 0;
-    const bool persisting_l2 = read_binary_option("NINFER_EXL3_PREFILL_PERSISTING_L2",
-        "NINFER_EXL3_PREFILL_PERSISTING_L2 must be 0 or 1");
+    const bool persisting_l2 = read_binary_option("VOIDINFER_EXL3_PREFILL_PERSISTING_L2",
+        "VOIDINFER_EXL3_PREFILL_PERSISTING_L2 must be 0 or 1");
     prefill_persisting_l2_enabled_ = target_wide_prefill_owner &&
         persisting_l2;
     if(prefill_persisting_l2_enabled_) {
@@ -5151,42 +5623,42 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         else (void)cudaGetLastError();
     }
     // Qualified H6 small-M remains enabled by default; zero selects comparison.
-    const char* h6_small_m = std::getenv("NINFER_EXL3_H6_SMALL_M");
+    const char* h6_small_m = std::getenv("VOIDINFER_EXL3_H6_SMALL_M");
     h6_small_m_enabled_ = h6_small_m == nullptr || std::string(h6_small_m) != "0";
     // Draft-owned callers may select the qualified default while generic/target
     // workspaces remain off. The exact environment override is construction-latched.
-    const char* draft_small_m = std::getenv("NINFER_EXL3_DRAFT_SMALL_M");
+    const char* draft_small_m = std::getenv("VOIDINFER_EXL3_DRAFT_SMALL_M");
     draft_small_m_enabled_ = draft_small_m == nullptr
         ? default_enable_draft_small_m
         : std::string(draft_small_m) == "1";
     const char* draft_k5_async_a =
-        std::getenv("NINFER_EXL3_DRAFT_K5_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_DRAFT_K5_ASYNC_A");
     if (draft_k5_async_a &&
         std::strcmp(draft_k5_async_a, "0") != 0 &&
         std::strcmp(draft_k5_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_DRAFT_K5_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_DRAFT_K5_ASYNC_A must be 0 or 1");
     }
     draft_k5_async_a_enabled_ = draft_small_m_enabled_ &&
         draft_k5_async_a && std::strcmp(draft_k5_async_a, "1") == 0;
     // Target gate/up admission is deliberately opt-in and target-owned.  The
     // exact environment value is latched once, but cannot change dispatch
     // unless a continuation gate/up call explicitly admits the candidate.
-    const char* draft_prefill = std::getenv("NINFER_DFLASH2_PREFILL_BATCH");
+    const char* draft_prefill = std::getenv("VOIDINFER_DFLASH2_PREFILL_BATCH");
     draft_prefill_fc_enabled_ = draft_prefill_fc_owner && draft_prefill && std::string(draft_prefill) == "1";
-    const char* staged_prefill = std::getenv("NINFER_EXL3_PREFILL_STAGED_REDUCTION");
+    const char* staged_prefill = std::getenv("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION");
     target_staged_prefill_enabled_ = target_wide_prefill_owner && staged_prefill != nullptr &&
         std::string(staged_prefill) == "1";
-    const char* target_wide_prefill = std::getenv("NINFER_EXL3_WIDE_PREFILL");
+    const char* target_wide_prefill = std::getenv("VOIDINFER_EXL3_WIDE_PREFILL");
     target_wide_prefill_enabled_ = target_wide_prefill_owner &&
         target_wide_prefill != nullptr && std::string(target_wide_prefill) == "1";
     const char* fast_wide_prefill_gemm =
-        std::getenv("NINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM");
+        std::getenv("VOIDINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM");
     if (fast_wide_prefill_gemm &&
         std::strcmp(fast_wide_prefill_gemm, "0") != 0 &&
         std::strcmp(fast_wide_prefill_gemm, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_MIA_PARITY_WIDE_PREFILL_GEMM must be 0 or 1");
     }
     // The candidate is construction-latched and still requires the existing
     // target-wide owner and staged-wide admission.
@@ -5196,118 +5668,118 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     const bool qualified_default_group = exl3_prefill_qualified_default_group(
         max_rows_, target_wide_prefill_enabled_, target_staged_prefill_enabled_,
         accumulation.data != nullptr);
-    const char* initial16 = std::getenv("NINFER_EXL3_TARGET_INITIAL16_ORDERED");
+    const char* initial16 = std::getenv("VOIDINFER_EXL3_TARGET_INITIAL16_ORDERED");
     target_initial16_enabled_ = target_wide_prefill_owner &&
         (initial16 ? std::string(initial16) == "1" : qualified_default_group);
-    const char* target_gateup_m16 = std::getenv("NINFER_EXL3_TARGET_GATEUP_M16");
+    const char* target_gateup_m16 = std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_M16");
     target_gateup_m16_enabled_ = target_gateup_owner &&
         (target_gateup_m16 == nullptr || std::string(target_gateup_m16) != "0");
-    const char* target_gateup_k5 = std::getenv("NINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
+    const char* target_gateup_k5 = std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
     target_gateup_k5_small_m_enabled_ = target_gateup_owner && target_gateup_k5 &&
         std::strcmp(target_gateup_k5, "1") == 0;
     const char* target_k5_small_m_batch =
-        std::getenv("NINFER_EXL3_TARGET_K5_SMALL_M_BATCH");
+        std::getenv("VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH");
     if (target_k5_small_m_batch &&
         std::strcmp(target_k5_small_m_batch, "0") != 0 &&
         std::strcmp(target_k5_small_m_batch, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_K5_SMALL_M_BATCH must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_K5_SMALL_M_BATCH must be 0 or 1");
     }
     const char* target_gateup_small_m =
-        std::getenv("NINFER_EXL3_TARGET_GATEUP_SMALL_M");
+        std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M");
     target_gateup_small_m_enabled_ = target_gateup_owner &&
         (target_gateup_small_m == nullptr || std::string(target_gateup_small_m) != "0");
     const char* target_gateup_k6_async_a =
-        std::getenv("NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A");
     if (target_gateup_k6_async_a &&
         std::strcmp(target_gateup_k6_async_a, "0") != 0 &&
         std::strcmp(target_gateup_k6_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_GATEUP_K6_ASYNC_A must be 0 or 1");
     }
     target_gateup_k6_async_a_enabled_ =
         target_gateup_owner && target_gateup_k6_async_a &&
         std::strcmp(target_gateup_k6_async_a, "1") == 0;
     const char* target_gateup_k6_n16 =
-        std::getenv("NINFER_EXL3_TARGET_GATEUP_K6_N16");
+        std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K6_N16");
     if (target_gateup_k6_n16 &&
         std::strcmp(target_gateup_k6_n16, "0") != 0 &&
         std::strcmp(target_gateup_k6_n16, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_GATEUP_K6_N16 must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_GATEUP_K6_N16 must be 0 or 1");
     }
     target_gateup_k6_n16_enabled_ = target_gateup_owner &&
         target_gateup_k6_n16 &&
         std::strcmp(target_gateup_k6_n16, "1") == 0;
     const char* target_gateup_k7_small_m =
-        std::getenv("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M");
+        std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M");
     target_gateup_k7_small_m_enabled_ = target_gateup_owner &&
         target_gateup_k7_small_m &&
         std::strcmp(target_gateup_k7_small_m, "1") == 0;
     const char* target_down_small_m =
-        std::getenv("NINFER_EXL3_TARGET_DOWN_SMALL_M");
+        std::getenv("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M");
     target_down_small_m_enabled_ = target_down_owner &&
         (target_down_small_m == nullptr || std::string(target_down_small_m) != "0");
     const char* target_down_k7_small_m =
-        std::getenv("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
+        std::getenv("VOIDINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
     target_down_k7_small_m_enabled_ = target_down_owner &&
         (target_down_k7_small_m == nullptr || std::string(target_down_k7_small_m) != "0");
     const char* target_down_k6_async_a =
-        std::getenv("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A");
     if (target_down_k6_async_a &&
         std::strcmp(target_down_k6_async_a, "0") != 0 &&
         std::strcmp(target_down_k6_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A must be 0 or 1");
     }
     target_down_k6_async_a_enabled_ = target_down_owner &&
         target_down_k6_async_a &&
         std::strcmp(target_down_k6_async_a, "1") == 0;
     const char* target_down_k7_async_a =
-        std::getenv("NINFER_EXL3_TARGET_DOWN_K7_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_DOWN_K7_ASYNC_A");
     if (target_down_k7_async_a &&
         std::strcmp(target_down_k7_async_a, "0") != 0 &&
         std::strcmp(target_down_k7_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_DOWN_K7_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_DOWN_K7_ASYNC_A must be 0 or 1");
     }
     target_down_k7_async_a_enabled_ = target_down_owner &&
         target_down_k7_async_a &&
         std::strcmp(target_down_k7_async_a, "1") == 0;
     const char* target_m1_k6_n32_async_a =
-        std::getenv("NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A");
     if (target_m1_k6_n32_async_a &&
         std::strcmp(target_m1_k6_n32_async_a, "0") != 0 &&
         std::strcmp(target_m1_k6_n32_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_M1_K6_N32_ASYNC_A must be 0 or 1");
     }
     const bool target_m1_owner = target_gateup_owner || target_down_owner ||
         target_o_k7_owner || target_z_k6_owner || target_wide_prefill_owner ||
         target_qkv_k6_owner || target_kv_owner || target_q_k6_owner;
     const char* fast_same_weights_fp16_accum =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_ACCUM");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_ACCUM");
     if (fast_same_weights_fp16_accum &&
         std::strcmp(fast_same_weights_fp16_accum, "0") != 0 &&
         std::strcmp(fast_same_weights_fp16_accum, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_ACCUM must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_ACCUM must be 0 or 1");
     }
     fast_same_weights_fp16_accum_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_accum &&
         std::strcmp(fast_same_weights_fp16_accum, "1") == 0;
-    const bool fast_same_weights_fp16_m1 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1 must be 0 or 1");
+    const bool fast_same_weights_fp16_m1 = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1 must be 0 or 1");
     fast_same_weights_fp16_m1_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1;
     fast_fp16_m2_8_down_enabled_ = target_down_owner &&
-        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6",
+        read_binary_option("VOIDINFER_EXL3_FAST_FP16_M2_8_DOWN_K6",
             "fast FP16 M2-8 down K6 must be 0 or 1");
     fast_fp16_m2_8_fused_down_enabled_ = target_down_owner &&
-        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6",
+        read_binary_option("VOIDINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6",
             "fast FP16 M2-8 fused down K6 must be 0 or 1");
     const bool coherent_wide_k6_requested =
-        read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6",
+        read_binary_option("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6",
             "coherent wide K6 must be 0 or 1");
     coherent_wide_k6_operation_ =
         target_q_k6_owner && in_features_ == 5120 && out_features_ == 12288 ? 0 :
@@ -5320,47 +5792,47 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
     // Split10 is the quality-gated default (teacher-forced verify NLL within
     // +/-0.00012 nats/token); 0 restores the 5-split reduction order.
     coherent_wide_k6_split10_enabled_ = coherent_wide_k6_enabled_ &&
-        (!std::getenv("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10") ||
-         read_binary_option("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",
+        (!std::getenv("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10") ||
+         read_binary_option("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",
             "coherent wide K6 split10 must be 0 or 1"));
     coherent_down_k6_enabled_ = target_down_owner &&
-        read_binary_option("NINFER_EXL3_COHERENT_DOWN_K6",
+        read_binary_option("VOIDINFER_EXL3_COHERENT_DOWN_K6",
             "coherent K6 down must be 0 or 1");
     coherent_down_k7_enabled_ = target_down_owner &&
-        read_binary_option("NINFER_EXL3_COHERENT_DOWN_K7",
+        read_binary_option("VOIDINFER_EXL3_COHERENT_DOWN_K7",
             "coherent K7 down must be 0 or 1");
     coherent_o_k7_enabled_ = target_o_k7_owner &&
-        read_binary_option("NINFER_EXL3_COHERENT_O_K7",
+        read_binary_option("VOIDINFER_EXL3_COHERENT_O_K7",
             "coherent K7 O must be 0 or 1");
     fast_fp16_m2_8_all_enabled_ = target_m1_owner &&
-        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8",
+        read_binary_option("VOIDINFER_EXL3_FAST_FP16_M2_8",
             "fast FP16 M2-8 must be 0 or 1");
     fast_fp16_m2_8_async_a_enabled_ = target_m1_owner &&
-        read_binary_option("NINFER_EXL3_FAST_FP16_M2_8_ASYNC_A",
+        read_binary_option("VOIDINFER_EXL3_FAST_FP16_M2_8_ASYNC_A",
             "fast FP16 M2-8 async A must be 0 or 1");
-    const bool fast_same_weights_fp16_m1_n16 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16 must be 0 or 1");
+    const bool fast_same_weights_fp16_m1_n16 = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N16 must be 0 or 1");
     fast_same_weights_fp16_m1_n16_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_n16;
     const char* fast_same_weights_fp16_m1_k6_register_pipeline =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_K6_REGISTER_PIPELINE");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_K6_REGISTER_PIPELINE");
     if (fast_same_weights_fp16_m1_k6_register_pipeline &&
         std::strcmp(fast_same_weights_fp16_m1_k6_register_pipeline, "0") != 0 &&
         std::strcmp(fast_same_weights_fp16_m1_k6_register_pipeline, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_K6_REGISTER_PIPELINE must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_K6_REGISTER_PIPELINE must be 0 or 1");
     }
     fast_same_weights_fp16_m1_k6_register_pipeline_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1_enabled_ &&
         fast_same_weights_fp16_m1_k6_register_pipeline &&
         std::strcmp(fast_same_weights_fp16_m1_k6_register_pipeline, "1") == 0;
     const char* fast_native_persistent_m1 =
-        std::getenv("NINFER_EXL3_FAST_NATIVE_PERSISTENT_M1");
+        std::getenv("VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_M1");
     if (fast_native_persistent_m1 &&
         std::strcmp(fast_native_persistent_m1, "0") != 0 &&
         std::strcmp(fast_native_persistent_m1, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_NATIVE_PERSISTENT_M1 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_M1 must be 0 or 1");
     }
     // This is an independently gated native persistent-grid differential.  It
     // uses the vendored EXL3/PTX primitives in this binary and never delegates
@@ -5369,12 +5841,12 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         fast_native_persistent_m1 &&
         std::strcmp(fast_native_persistent_m1, "1") == 0;
     const char* fast_native_mia_m1_fp16 =
-        std::getenv("NINFER_EXL3_FAST_NATIVE_MIA_M1_FP16");
+        std::getenv("VOIDINFER_EXL3_FAST_NATIVE_MIA_M1_FP16");
     if (fast_native_mia_m1_fp16 &&
         std::strcmp(fast_native_mia_m1_fp16, "0") != 0 &&
         std::strcmp(fast_native_mia_m1_fp16, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_NATIVE_MIA_M1_FP16 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_NATIVE_MIA_M1_FP16 must be 0 or 1");
     }
     // Independently labeled same-weight FP16-output differential.  It uses
     // the vendored Mia-shaped cooperative inner directly and is never implied
@@ -5383,12 +5855,12 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         fast_native_mia_m1_fp16 &&
         std::strcmp(fast_native_mia_m1_fp16, "1") == 0;
     const char* fast_native_mia_m1_fp16_fused_input =
-        std::getenv("NINFER_EXL3_FAST_NATIVE_MIA_M1_FP16_FUSED_INPUT");
+        std::getenv("VOIDINFER_EXL3_FAST_NATIVE_MIA_M1_FP16_FUSED_INPUT");
     if (fast_native_mia_m1_fp16_fused_input &&
         std::strcmp(fast_native_mia_m1_fp16_fused_input, "0") != 0 &&
         std::strcmp(fast_native_mia_m1_fp16_fused_input, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_NATIVE_MIA_M1_FP16_FUSED_INPUT must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_NATIVE_MIA_M1_FP16_FUSED_INPUT must be 0 or 1");
     }
     // This is a separately labeled native differential: it fuses the existing
     // native-semantics input Hadamard into the same cooperative grid as the
@@ -5398,12 +5870,12 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         fast_native_mia_m1_fp16_fused_input &&
         std::strcmp(fast_native_mia_m1_fp16_fused_input, "1") == 0;
     const char* fast_native_persistent_prefill =
-        std::getenv("NINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL");
+        std::getenv("VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL");
     if (fast_native_persistent_prefill &&
         std::strcmp(fast_native_persistent_prefill, "0") != 0 &&
         std::strcmp(fast_native_persistent_prefill, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL must be 0 or 1");
     }
     // Separate prefill differential. It is target-wide-owner gated and never
     // implied by the already-qualified M=1 route.
@@ -5411,12 +5883,12 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         target_wide_prefill_enabled_ && fast_native_persistent_prefill &&
         std::strcmp(fast_native_persistent_prefill, "1") == 0;
     const char* fast_native_mia_target_prefill_fp16 =
-        std::getenv("NINFER_EXL3_FAST_NATIVE_MIA_TARGET_PREFILL_FP16");
+        std::getenv("VOIDINFER_EXL3_FAST_NATIVE_MIA_TARGET_PREFILL_FP16");
     if (fast_native_mia_target_prefill_fp16 &&
         std::strcmp(fast_native_mia_target_prefill_fp16, "0") != 0 &&
         std::strcmp(fast_native_mia_target_prefill_fp16, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_NATIVE_MIA_TARGET_PREFILL_FP16 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_NATIVE_MIA_TARGET_PREFILL_FP16 must be 0 or 1");
     }
     // Separately labeled target-wide same-weight FP16-output differential.
     // It is construction-latched to the target prefill owner and does not
@@ -5425,33 +5897,33 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         target_wide_prefill_enabled_ && fast_native_mia_target_prefill_fp16 &&
         std::strcmp(fast_native_mia_target_prefill_fp16, "1") == 0;
     const char* fast_native_persistent_m1_only =
-        std::getenv("NINFER_EXL3_FAST_NATIVE_PERSISTENT_M1_ONLY");
+        std::getenv("VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_M1_ONLY");
     if (fast_native_persistent_m1_only &&
         std::strcmp(fast_native_persistent_m1_only, "6") != 0 &&
         std::strcmp(fast_native_persistent_m1_only, "7") != 0 &&
         std::strcmp(fast_native_persistent_m1_only, "both") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_NATIVE_PERSISTENT_M1_ONLY must be 6, 7, or both");
+            "VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_M1_ONLY must be 6, 7, or both");
     }
     fast_native_persistent_m1_only_ =
         fast_native_persistent_m1_only &&
         std::strcmp(fast_native_persistent_m1_only, "6") == 0 ? 6 :
         fast_native_persistent_m1_only &&
         std::strcmp(fast_native_persistent_m1_only, "7") == 0 ? 7 : 0;
-    const bool fast_same_weights_fp16_m1_wide = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE must be 0 or 1");
+    const bool fast_same_weights_fp16_m1_wide = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE must be 0 or 1");
     fast_same_weights_fp16_m1_wide_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_wide;
-    const bool fast_same_weights_fp16_m1_wide_n32 = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32 must be 0 or 1");
+    const bool fast_same_weights_fp16_m1_wide_n32 = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_N32 must be 0 or 1");
     fast_same_weights_fp16_m1_wide_n32_enabled_ = fast_same_weights_fp16_m1_wide_enabled_ && fast_same_weights_fp16_m1_wide_n32;
     const char* fast_same_weights_fp16_m1_wide_k5 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_K5");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_K5");
     if (fast_same_weights_fp16_m1_wide_k5 &&
         std::strcmp(fast_same_weights_fp16_m1_wide_k5, "0") != 0 &&
         std::strcmp(fast_same_weights_fp16_m1_wide_k5, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_K5 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_WIDE_K5 must be 0 or 1");
     }
     // K5 is deliberately separate from the established K6/K7 wide lane:
     // its packed decoder has different signed-bit handling and needs its own
@@ -5460,12 +5932,12 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         fast_same_weights_fp16_m1_enabled_ && fast_same_weights_fp16_m1_wide_k5 &&
         std::strcmp(fast_same_weights_fp16_m1_wide_k5, "1") == 0;
     const char* fast_same_weights_fp16_m1_n64 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64");
     if (fast_same_weights_fp16_m1_n64 &&
         std::strcmp(fast_same_weights_fp16_m1_n64, "0") != 0 &&
         std::strcmp(fast_same_weights_fp16_m1_n64, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64 must be 0 or 1");
     }
     // Separate, target-owned differential route. It is deliberately not
     // implied by FAST_SAME_WEIGHTS_FP16_M1: the 64-tile topology has a larger
@@ -5474,97 +5946,97 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         fast_same_weights_fp16_m1_n64 &&
         std::strcmp(fast_same_weights_fp16_m1_n64, "1") == 0;
     const char* fast_same_weights_fp16_m1_n64_k5 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64_K5");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64_K5");
     if (fast_same_weights_fp16_m1_n64_k5 &&
         std::strcmp(fast_same_weights_fp16_m1_n64_k5, "0") != 0 &&
         std::strcmp(fast_same_weights_fp16_m1_n64_k5, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64_K5 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1_N64_K5 must be 0 or 1");
     }
     // K5-only exact route: the packed EXL3 weights and native FP32-MMA
     // arithmetic remain authoritative; this is not the INT8/re-quantized path.
     fast_same_weights_fp16_m1_n64_k5_enabled_ = target_m1_owner &&
         fast_same_weights_fp16_m1_n64_k5 &&
         std::strcmp(fast_same_weights_fp16_m1_n64_k5, "1") == 0;
-    const bool fast_same_weights_int8_gemv = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV must be 0 or 1");
+    const bool fast_same_weights_int8_gemv = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV must be 0 or 1");
     fast_same_weights_int8_gemv_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv;
     const char* fast_same_weights_int8_gemv_k7 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_K7");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_K7");
     if (fast_same_weights_int8_gemv_k7 &&
         std::strcmp(fast_same_weights_int8_gemv_k7, "0") != 0 &&
         std::strcmp(fast_same_weights_int8_gemv_k7, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_K7 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_K7 must be 0 or 1");
     }
     fast_same_weights_int8_gemv_k7_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv_k7 &&
         std::strcmp(fast_same_weights_int8_gemv_k7, "1") == 0;
     const char* fast_same_weights_int8_gemv_down_k6 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K6");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K6");
     if (fast_same_weights_int8_gemv_down_k6 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k6, "0") != 0 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k6, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K6 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K6 must be 0 or 1");
     }
     fast_same_weights_int8_gemv_down_k6_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv_down_k6 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k6, "1") == 0;
     const char* fast_same_weights_int8_gemv_down_k7 =
-        std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K7");
+        std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K7");
     if (fast_same_weights_int8_gemv_down_k7 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k7, "0") != 0 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k7, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K7 must be 0 or 1");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_DOWN_K7 must be 0 or 1");
     }
     fast_same_weights_int8_gemv_down_k7_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv_down_k7 &&
         std::strcmp(fast_same_weights_int8_gemv_down_k7, "1") == 0;
-    const bool fast_same_weights_int8_mia_policy = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY must be 0 or 1");
+    const bool fast_same_weights_int8_mia_policy = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_MIA_POLICY must be 0 or 1");
     fast_same_weights_int8_mia_policy_enabled_ = target_m1_owner &&
         fast_same_weights_int8_mia_policy;
-    const bool fast_same_weights_int8_gemv_occupancy_grid = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID must be 0 or 1");
+    const bool fast_same_weights_int8_gemv_occupancy_grid = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_INT8_GEMV_OCCUPANCY_GRID must be 0 or 1");
     fast_same_weights_int8_gemv_occupancy_grid_enabled_ = target_m1_owner &&
         fast_same_weights_int8_gemv_occupancy_grid;
-    const bool fast_same_weights_fp16kv_m1_mgemm_pair = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR must be 0 or 1");
+    const bool fast_same_weights_fp16kv_m1_mgemm_pair = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_PAIR must be 0 or 1");
     fast_same_weights_fp16kv_m1_mgemm_pair_enabled_ = target_m1_owner &&
         fast_same_weights_fp16kv_m1_mgemm_pair;
-    const bool fast_same_weights_fp16kv_m1_mgemm_policy = read_binary_option("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY",
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY must be 0 or 1");
+    const bool fast_same_weights_fp16kv_m1_mgemm_policy = read_binary_option("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY",
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_MGEMM_POLICY must be 0 or 1");
     fast_same_weights_fp16kv_m1_mgemm_policy_enabled_ = target_m1_owner &&
         fast_same_weights_fp16kv_m1_mgemm_policy;
     target_k5_small_m_batch_enabled_ = target_m1_owner &&
         target_k5_small_m_batch &&
         std::strcmp(target_k5_small_m_batch, "1") == 0;
     const char* target_k6_m1_simt=
-        std::getenv("NINFER_EXL3_TARGET_K6_M1_SIMT");
+        std::getenv("VOIDINFER_EXL3_TARGET_K6_M1_SIMT");
     if(target_k6_m1_simt && std::strcmp(target_k6_m1_simt,"0")!=0 &&
        std::strcmp(target_k6_m1_simt,"1")!=0)
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_K6_M1_SIMT must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_K6_M1_SIMT must be 0 or 1");
     target_k6_m1_simt_enabled_=target_m1_owner && target_k6_m1_simt &&
         std::strcmp(target_k6_m1_simt,"1")==0;
     const char* target_m1_k6_n16=
-        std::getenv("NINFER_EXL3_TARGET_M1_K6_N16");
+        std::getenv("VOIDINFER_EXL3_TARGET_M1_K6_N16");
     if(target_m1_k6_n16 && std::strcmp(target_m1_k6_n16,"0")!=0 &&
        std::strcmp(target_m1_k6_n16,"1")!=0)
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_M1_K6_N16 must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_M1_K6_N16 must be 0 or 1");
     target_m1_k6_n16_enabled_=target_m1_owner && target_m1_k6_n16 &&
         std::strcmp(target_m1_k6_n16,"1")==0;
     const char* target_m1_k7_three_word =
-        std::getenv("NINFER_EXL3_TARGET_M1_K7_THREE_WORD");
+        std::getenv("VOIDINFER_EXL3_TARGET_M1_K7_THREE_WORD");
     if (target_m1_k7_three_word &&
         std::strcmp(target_m1_k7_three_word, "0") != 0 &&
         std::strcmp(target_m1_k7_three_word, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_M1_K7_THREE_WORD must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_M1_K7_THREE_WORD must be 0 or 1");
     }
     target_m1_k7_three_word_enabled_ = target_m1_owner &&
         target_m1_k7_three_word &&
@@ -5573,33 +6045,33 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         target_m1_k6_n32_async_a &&
         std::strcmp(target_m1_k6_n32_async_a, "1") == 0;
     const char* native_k6_critical_path =
-        std::getenv("NINFER_EXL3_NATIVE_K6_CRITICAL_PATH");
+        std::getenv("VOIDINFER_EXL3_NATIVE_K6_CRITICAL_PATH");
     if (native_k6_critical_path &&
         std::strcmp(native_k6_critical_path, "0") != 0 &&
         std::strcmp(native_k6_critical_path, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_CRITICAL_PATH must be 0 or 1");
+            "VOIDINFER_EXL3_NATIVE_K6_CRITICAL_PATH must be 0 or 1");
     }
     // R49 target-only differential. The unset state is deliberately disabled;
     // ordinary callers and the existing INT8 down owners cannot reach it.
     native_k6_critical_path_enabled_ = target_m1_owner &&
         native_k6_critical_path &&
         std::strcmp(native_k6_critical_path, "1") == 0;
-    const bool native_k6_global_slices = read_binary_option("NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES",
-        "NINFER_EXL3_NATIVE_K6_GLOBAL_SLICES must be 0 or 1");
+    const bool native_k6_global_slices = read_binary_option("VOIDINFER_EXL3_NATIVE_K6_GLOBAL_SLICES",
+        "VOIDINFER_EXL3_NATIVE_K6_GLOBAL_SLICES must be 0 or 1");
     native_k6_global_slices_enabled_ = target_m1_owner &&
         native_k6_critical_path_enabled_ && native_k6_global_slices;
-    const bool native_k6_register_pipeline = read_binary_option("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE",
-        "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE must be 0 or 1");
+    const bool native_k6_register_pipeline = read_binary_option("VOIDINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE",
+        "VOIDINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE must be 0 or 1");
     native_k6_register_pipeline_enabled_ = target_m1_owner &&
         native_k6_critical_path_enabled_ && native_k6_register_pipeline;
     const char* native_k6_shape4_register_pipeline =
-        std::getenv("NINFER_EXL3_NATIVE_K6_SHAPE4_REGISTER_PIPELINE");
+        std::getenv("VOIDINFER_EXL3_NATIVE_K6_SHAPE4_REGISTER_PIPELINE");
     if (native_k6_shape4_register_pipeline &&
         std::strcmp(native_k6_shape4_register_pipeline, "0") != 0 &&
         std::strcmp(native_k6_shape4_register_pipeline, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_NATIVE_K6_SHAPE4_REGISTER_PIPELINE must be 0 or 1");
+            "VOIDINFER_EXL3_NATIVE_K6_SHAPE4_REGISTER_PIPELINE must be 0 or 1");
     }
     // Shape-4-only differential: keep the existing generic K6 contract, but
     // expose the Mia-shaped 256-thread/N32 pipeline as an independently
@@ -5610,139 +6082,139 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         in_features_ == 5120 && out_features_ == 17408 &&
         native_k6_shape4_register_pipeline &&
         std::strcmp(native_k6_shape4_register_pipeline, "1") == 0;
-    const bool native_k6_register_pipeline_n16 = read_binary_option("NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16",
-        "NINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16 must be 0 or 1");
+    const bool native_k6_register_pipeline_n16 = read_binary_option("VOIDINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16",
+        "VOIDINFER_EXL3_NATIVE_K6_REGISTER_PIPELINE_N16 must be 0 or 1");
     native_k6_register_pipeline_n16_enabled_ = target_m1_owner &&
         native_k6_register_pipeline_enabled_ && native_k6_register_pipeline_n16;
     const char* target_m1_k7_n32_async_a =
-        std::getenv("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A");
     if (target_m1_k7_n32_async_a &&
         std::strcmp(target_m1_k7_n32_async_a, "0") != 0 &&
         std::strcmp(target_m1_k7_n32_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A must be 0 or 1");
     }
     target_m1_k7_n32_async_a_enabled_ = target_m1_owner &&
         target_m1_k7_n32_async_a &&
         std::strcmp(target_m1_k7_n32_async_a, "1") == 0;
     const char* target_k6_small_m_async_a =
-        std::getenv("NINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A");
     if (target_k6_small_m_async_a &&
         std::strcmp(target_k6_small_m_async_a, "0") != 0 &&
         std::strcmp(target_k6_small_m_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_K6_SMALL_M_ASYNC_A must be 0 or 1");
     }
     target_k6_small_m_async_a_enabled_ = target_m1_owner &&
         target_k6_small_m_async_a &&
         std::strcmp(target_k6_small_m_async_a, "1") == 0;
     const char* target_k7_small_m_async_a =
-        std::getenv("NINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A");
+        std::getenv("VOIDINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A");
     if (target_k7_small_m_async_a &&
         std::strcmp(target_k7_small_m_async_a, "0") != 0 &&
         std::strcmp(target_k7_small_m_async_a, "1") != 0) {
         throw std::invalid_argument(
-            "NINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A must be 0 or 1");
+            "VOIDINFER_EXL3_TARGET_K7_SMALL_M_ASYNC_A must be 0 or 1");
     }
     target_k7_small_m_async_a_enabled_ = target_m1_owner &&
         target_k7_small_m_async_a &&
         std::strcmp(target_k7_small_m_async_a, "1") == 0;
-    const char* target_kv = std::getenv("NINFER_EXL3_TARGET_KV_SMALL_M");
+    const char* target_kv = std::getenv("VOIDINFER_EXL3_TARGET_KV_SMALL_M");
     target_kv_small_m_enabled_ = target_kv_owner && target_kv &&
         std::strcmp(target_kv, "1") == 0;
-    const char* target_o_k6_small_m = std::getenv("NINFER_EXL3_TARGET_O_K6_SMALL_M");
+    const char* target_o_k6_small_m = std::getenv("VOIDINFER_EXL3_TARGET_O_K6_SMALL_M");
     target_o_k6_small_m_enabled_ = target_o_k7_owner && target_o_k6_small_m &&
         std::strcmp(target_o_k6_small_m, "1") == 0;
     const char* target_o_k7_small_m =
-        std::getenv("NINFER_EXL3_TARGET_O_K7_SMALL_M");
+        std::getenv("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M");
     target_o_k7_small_m_enabled_ = target_o_k7_owner &&
         (target_o_k7_small_m == nullptr || std::string(target_o_k7_small_m) != "0");
-    const char* target_qkv_k6_small_m = std::getenv("NINFER_EXL3_TARGET_QKV_K6_SMALL_M");
+    const char* target_qkv_k6_small_m = std::getenv("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M");
     target_qkv_k6_small_m_enabled_ = target_qkv_k6_owner &&
         (target_qkv_k6_small_m == nullptr || std::string(target_qkv_k6_small_m) != "0");
-    const char* target_q_k6_small_m = std::getenv("NINFER_EXL3_TARGET_Q_K6_SMALL_M");
+    const char* target_q_k6_small_m = std::getenv("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M");
     target_q_k6_small_m_enabled_ = target_q_k6_owner && target_q_k6_small_m &&
         std::strcmp(target_q_k6_small_m, "1") == 0;
-    const char* target_z_k6_small_m = std::getenv("NINFER_EXL3_TARGET_Z_K6_SMALL_M");
+    const char* target_z_k6_small_m = std::getenv("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M");
     target_z_k6_small_m_enabled_ = target_z_k6_owner &&
         (target_z_k6_small_m == nullptr || std::string(target_z_k6_small_m) != "0");
-    const char* direct_async_a=std::getenv("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
+    const char* direct_async_a=std::getenv("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
     target_direct_async_a_=direct_async_a && std::strcmp(direct_async_a,"1")==0;
-    const char* direct_async_all=std::getenv("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
+    const char* direct_async_all=std::getenv("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
     if(direct_async_all && std::strcmp(direct_async_all,"0")!=0 &&
        std::strcmp(direct_async_all,"1")!=0)
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL must be 0 or 1");
     target_direct_async_all_=target_direct_async_a_ &&
         (direct_async_all ? std::strcmp(direct_async_all,"1")==0
                           : qualified_default_group);
-    const char* direct_tiles64=std::getenv("NINFER_EXL3_PREFILL_DIRECT_TILES64");
+    const char* direct_tiles64=std::getenv("VOIDINFER_EXL3_PREFILL_DIRECT_TILES64");
     if(direct_tiles64 && std::strcmp(direct_tiles64,"0")!=0 &&
        std::strcmp(direct_tiles64,"1")!=0)
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_DIRECT_TILES64 must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_DIRECT_TILES64 must be 0 or 1");
     target_direct_tiles64_=target_direct_async_a_ &&
         (direct_tiles64 ? std::strcmp(direct_tiles64,"1")==0
                         : qualified_default_group);
-    const bool k6_fast_decode = read_binary_option("NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE",
-        "NINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE must be 0 or 1");
+    const bool k6_fast_decode = read_binary_option("VOIDINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE",
+        "VOIDINFER_EXL3_PREFILL_K6_MOD48_FAST_DECODE must be 0 or 1");
     target_k6_fast_decode_ = target_wide_prefill_owner && k6_fast_decode;
-    const bool k6_rowpair_n64 = read_binary_option("NINFER_EXL3_PREFILL_K6_ROWPAIR_N64",
-        "NINFER_EXL3_PREFILL_K6_ROWPAIR_N64 must be 0 or 1");
+    const bool k6_rowpair_n64 = read_binary_option("VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64",
+        "VOIDINFER_EXL3_PREFILL_K6_ROWPAIR_N64 must be 0 or 1");
     target_k6_rowpair_n64_ = target_wide_prefill_owner && k6_rowpair_n64;
-    const bool k6_down_rowpair = read_binary_option("NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",
-        "NINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR must be 0 or 1");
+    const bool k6_down_rowpair = read_binary_option("VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR",
+        "VOIDINFER_EXL3_PREFILL_K6_DOWN_ROWPAIR must be 0 or 1");
     target_k6_down_rowpair_ = target_down_owner && target_wide_prefill_owner &&
         k6_down_rowpair;
-    const bool shape4_n64 = read_binary_option("NINFER_EXL3_PREFILL_SHAPE4_N64",
-        "NINFER_EXL3_PREFILL_SHAPE4_N64 must be 0 or 1");
+    const bool shape4_n64 = read_binary_option("VOIDINFER_EXL3_PREFILL_SHAPE4_N64",
+        "VOIDINFER_EXL3_PREFILL_SHAPE4_N64 must be 0 or 1");
     target_shape4_n64_ = specialized_shape_ && target_wide_prefill_owner &&
         shape4_n64;
-    const bool gateup_warpgroup = read_binary_option("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC",
-        "NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC must be 0 or 1");
+    const bool gateup_warpgroup = read_binary_option("VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC",
+        "VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC must be 0 or 1");
     target_k6_gateup_warpgroup_async_ = target_gateup_owner &&
         gateup_warpgroup;
-    const bool gateup_n32_pair_cta = read_binary_option("NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA",
-        "NINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA must be 0 or 1");
+    const bool gateup_n32_pair_cta = read_binary_option("VOIDINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA",
+        "VOIDINFER_EXL3_PREFILL_K6_GATEUP_N32_PAIR_CTA must be 0 or 1");
     target_k6_gateup_n32_pair_cta_ = target_gateup_owner &&
         gateup_n32_pair_cta;
     if(target_k6_gateup_n32_pair_cta_ && target_k6_gateup_warpgroup_async_)
         throw std::invalid_argument(
             "K6 gate/up N32-pair CTA and warp-group candidates are mutually exclusive");
-    const bool gate_up_pair = read_binary_option("NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR",
-        "NINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR must be 0 or 1");
+    const bool gate_up_pair = read_binary_option("VOIDINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR",
+        "VOIDINFER_EXL3_TARGET_PREFILL_GATE_UP_PAIR must be 0 or 1");
     target_prefill_gate_up_pair_ = target_gateup_owner && gate_up_pair;
     const char* k7_tiles64_exact_splits =
-        std::getenv("NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS");
+        std::getenv("VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS");
     if (k7_tiles64_exact_splits &&
         std::strcmp(k7_tiles64_exact_splits,"0")!=0 &&
         std::strcmp(k7_tiles64_exact_splits,"1")!=0)
         throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS must be 0 or 1");
+            "VOIDINFER_EXL3_PREFILL_K7_TILES64_EXACT_SPLITS must be 0 or 1");
     target_k7_tiles64_exact_splits_ = target_wide_prefill_owner &&
         k7_tiles64_exact_splits &&
         std::strcmp(k7_tiles64_exact_splits,"1")==0;
-    const bool k8_kv_async_a = read_binary_option("NINFER_EXL3_PREFILL_K8_KV_ASYNC_A",
-        "NINFER_EXL3_PREFILL_K8_KV_ASYNC_A must be 0 or 1");
+    const bool k8_kv_async_a = read_binary_option("VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A",
+        "VOIDINFER_EXL3_PREFILL_K8_KV_ASYNC_A must be 0 or 1");
     target_k8_kv_prefill_async_a_ = target_kv_owner && k8_kv_async_a;
-    const char* reduce_shfl=std::getenv("NINFER_EXL3_PREFILL_REDUCE_SHFL");
+    const char* reduce_shfl=std::getenv("VOIDINFER_EXL3_PREFILL_REDUCE_SHFL");
     if(reduce_shfl && std::strcmp(reduce_shfl,"0")!=0 &&
        std::strcmp(reduce_shfl,"1")!=0)
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_REDUCE_SHFL must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_REDUCE_SHFL must be 0 or 1");
     target_reduce_shfl_=target_wide_prefill_owner &&
         (reduce_shfl ? std::strcmp(reduce_shfl,"1")==0
                      : qualified_default_group);
-    const bool reduce_min_barriers = read_binary_option("NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS",
-        "NINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS must be 0 or 1");
+    const bool reduce_min_barriers = read_binary_option("VOIDINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS",
+        "VOIDINFER_EXL3_PREFILL_REDUCE_SHFL_MIN_BARRIERS must be 0 or 1");
     target_reduce_shfl_min_barriers_ = target_reduce_shfl_ &&
         reduce_min_barriers;
-    const char* rowpair=std::getenv("NINFER_EXL3_PREFILL_ROWPAIR_K6");
+    const char* rowpair=std::getenv("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6");
     target_rowpair_k6_=target_wide_prefill_owner && rowpair && std::strcmp(rowpair,"1")==0;
-    const bool rowpair_k7 = read_binary_option("NINFER_EXL3_PREFILL_ROWPAIR_K7",
-        "NINFER_EXL3_PREFILL_ROWPAIR_K7 must be 0 or 1");
+    const bool rowpair_k7 = read_binary_option("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7",
+        "VOIDINFER_EXL3_PREFILL_ROWPAIR_K7 must be 0 or 1");
     target_rowpair_k7_ = target_wide_prefill_owner && rowpair_k7;
-    const char* direct_partials=std::getenv("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
+    const char* direct_partials=std::getenv("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS");
     target_direct_partials_=direct_partials
         ? std::strcmp(direct_partials,"1")==0 : qualified_default_group;
-    const char* staged_shape4=std::getenv("NINFER_EXL3_PREFILL_STAGED_SHAPE4");
+    const char* staged_shape4=std::getenv("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4");
     target_staged_shape4_=staged_shape4
         ? std::strcmp(staged_shape4,"1")==0 : qualified_default_group;
     if (in_features_ <= 0 || out_features_ <= 0 || in_features_ % kHadamard != 0 ||
@@ -6647,7 +7119,7 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
         transformed_owned_ = false;
     } else {
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&transformed_), transformed_bytes),
-                   "cudaMalloc EXL3 transformed workspace");
+                   "cudaMalloc EXL3 transformed workspace"); { static const bool trace_alloc=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr; if(trace_alloc && transformed_bytes>=(256u<<10)) std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB LINEAR transformed %dx%d rows=%d%c",transformed_bytes/1048576.0,in_features_,out_features_,max_rows_,10); }
     }
     try {
         const auto constructor_failure=constructor_failure_for_test_;
@@ -6661,7 +7133,7 @@ Exl3CudaLinearWorkspace::Exl3CudaLinearWorkspace(int in_features,
             accum_owned_ = false;
         } else {
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&accum_), accum_bytes),
-                       "cudaMalloc EXL3 accumulation workspace");
+                       "cudaMalloc EXL3 accumulation workspace"); { static const bool trace_alloc=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr; if(trace_alloc && accum_bytes>=(256u<<10)) std::fprintf(stderr,"DEVICE_ALLOCATION %.1f MiB LINEAR accum %dx%d rows=%d%c",accum_bytes/1048576.0,in_features_,out_features_,max_rows_,10); }
         }
     } catch (...) {
         if(!accum_)storage_retirement_->accumulation_credit.reset();
@@ -6809,6 +7281,8 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
         std::size_t workspace_bytes = 0;
     };
     std::unordered_map<std::uint64_t,LtPlan> lt_plans;
+    // Recorded-algorithm plans (Exl3GemmTable), keyed by Exl3GemmTable::key.
+    std::unordered_map<std::uint64_t,LtPlan> table_plans;
     bool k5_lt_enabled = false;
     bool large_lt_enabled = false;
     bool mxfp8_enabled = false;
@@ -6845,11 +7319,18 @@ struct Exl3CudaReconstructGemmWorkspace::Impl {
     std::size_t reuse_used = 0;
     bool reuse_active = false;
     std::size_t reuse_scope_count = 0;
+    // Held from begin_layer_reuse to end_layer_reuse (the prompt thread);
+    // release_layer_reuse takes it from other threads.
+    std::mutex reuse_mutex;
+    bool reuse_locked = false;
+    std::atomic<std::size_t> reuse_limit{std::numeric_limits<std::size_t>::max()};
+    std::atomic<std::size_t> reuse_bytes{0};
     int diagnostic_remaining = 0;
 };
 
 std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
-    int in_features,int out_features,int rows,bool accept_transpose_shape) {
+    int in_features,int out_features,int rows,bool accept_transpose_shape,
+    bool accept_all_model_shapes) {
     if(in_features<=0 || out_features<=0 || rows<=0 ||
         in_features%kHadamard!=0 || out_features%kHadamard!=0)
         throw std::invalid_argument("T69 reconstruct GEMM dimensions");
@@ -6858,7 +7339,8 @@ std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
     const auto input=accept_transpose_shape?std::max(in_features,out_features):in_features;
     const auto output=accept_transpose_shape?std::max(in_features,out_features):out_features;
     required.add(Domain::device,rows,static_cast<std::uint64_t>(input)*sizeof(std::uint16_t));
-    required.add(Domain::device,in_features,static_cast<std::uint64_t>(out_features)*sizeof(std::uint16_t));
+    required.add(Domain::device,1,static_cast<std::uint64_t>(reconstruction_plane_elements(
+        in_features,out_features,accept_all_model_shapes))*sizeof(std::uint16_t));
     required.add(Domain::device,rows,
         static_cast<std::uint64_t>(output)*sizeof(float) +
         static_cast<std::uint64_t>(output / 16)*sizeof(int));
@@ -6871,7 +7353,8 @@ std::size_t Exl3CudaReconstructGemmWorkspace::workspace_bytes_required(
 Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     int in_features, int out_features, int max_rows,
     bool accept_transpose_shape, bool accept_all_model_shapes) : impl_(nullptr) {
-    const auto required_bytes=workspace_bytes_required(in_features,out_features,max_rows,accept_transpose_shape);
+    const auto required_bytes=workspace_bytes_required(in_features,out_features,max_rows,
+        accept_transpose_shape,accept_all_model_shapes);
     impl_=new Impl{};
     if (in_features <= 0 || out_features <= 0 || max_rows <= 0 ||
         in_features % kHadamard != 0 || out_features % kHadamard != 0) {
@@ -6884,7 +7367,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->accept_transpose_shape = accept_transpose_shape;
     impl_->accept_all_model_shapes = accept_all_model_shapes;
     const char* fused_original = std::getenv(
-        "NINFER_EXL3_FAST_MIA_PARITY_FUSED_RECONSTRUCT");
+        "VOIDINFER_EXL3_FAST_MIA_PARITY_FUSED_RECONSTRUCT");
     if (fused_original && std::strcmp(fused_original, "0") != 0 &&
         std::strcmp(fused_original, "1") != 0) {
         delete impl_; impl_ = nullptr;
@@ -6894,7 +7377,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->fused_original_enabled = accept_all_model_shapes && fused_original &&
         std::strcmp(fused_original, "1") == 0;
     const char* original_gdn_mlp=std::getenv(
-        "NINFER_EXL3_FAST_ORIGINAL_GDN_MLP_CACHE");
+        "VOIDINFER_EXL3_FAST_ORIGINAL_GDN_MLP_CACHE");
     if(original_gdn_mlp && std::strcmp(original_gdn_mlp,"0")!=0 &&
        std::strcmp(original_gdn_mlp,"1")!=0) {
         delete impl_;impl_=nullptr;
@@ -6903,7 +7386,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->original_gdn_mlp_cache_enabled=accept_all_model_shapes &&
         original_gdn_mlp && std::strcmp(original_gdn_mlp,"1")==0;
     const char* fp16_compute = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GEMM_FP16_COMPUTE");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_GEMM_FP16_COMPUTE");
     if (fp16_compute && std::strcmp(fp16_compute, "0") != 0 &&
         std::strcmp(fp16_compute, "1") != 0) {
         delete impl_; impl_ = nullptr;
@@ -6913,7 +7396,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->fp16_compute_enabled = accept_all_model_shapes && fp16_compute &&
         std::strcmp(fp16_compute, "1") == 0;
     const char* k5_layer_prefill=std::getenv(
-        "NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
+        "VOIDINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
     if(k5_layer_prefill && std::strcmp(k5_layer_prefill,"0")!=0 &&
        std::strcmp(k5_layer_prefill,"1")!=0) {
         delete impl_; impl_=nullptr;
@@ -6921,14 +7404,14 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->k5_layer_prefill_enabled=accept_all_model_shapes &&
         k5_layer_prefill && std::strcmp(k5_layer_prefill,"1")==0;
-    const char* k5_lt=std::getenv("NINFER_EXL3_FAST_PREFILL_K5_CUBLAS_LT");
+    const char* k5_lt=std::getenv("VOIDINFER_EXL3_FAST_PREFILL_K5_CUBLAS_LT");
     if(k5_lt && std::strcmp(k5_lt,"0")!=0 && std::strcmp(k5_lt,"1")!=0) {
         delete impl_; impl_=nullptr;
         throw std::invalid_argument("K5 prefill cuBLASLt must be 0 or 1");
     }
     impl_->k5_lt_enabled=accept_all_model_shapes && k5_lt &&
         std::strcmp(k5_lt,"1")==0;
-    const char* large_lt=std::getenv("NINFER_EXL3_FAST_PREFILL_LARGE_CUBLAS_LT");
+    const char* large_lt=std::getenv("VOIDINFER_EXL3_FAST_PREFILL_LARGE_CUBLAS_LT");
     if(large_lt && std::strcmp(large_lt,"0")!=0 &&
         std::strcmp(large_lt,"1")!=0) {
         delete impl_; impl_=nullptr;
@@ -6936,47 +7419,53 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     }
     impl_->large_lt_enabled=accept_all_model_shapes && large_lt &&
         std::strcmp(large_lt,"1")==0;
-    // Prefill numerical policy (default 1, quality-gated; 0 = FP16 control):
-    // large-M projections run as MXFP8 (E4M3 with block-32 E8M0 scales on
-    // weights and activations, FP32 accumulation).
-    const char* mxfp8=std::getenv("NINFER_EXL3_PREFILL_MXFP8");
+    // Prefill numerical policy (default 0 = FP16 projections). 1 runs large-M
+    // projections as MXFP8 (E4M3 with block-32 E8M0 scales on weights and
+    // activations, FP32 accumulation): ~1.5x faster prefill, but its prompt KV
+    // is what exact VeriCache verifies against, so it stays in every answer:
+    // KL vs FP16 KV + FP16 prefill 0.0086 / 0.0104 at 4K / 16K against
+    // 0.0014 / 0.0024 with FP16 prefill (8-fixture panel, Oct 13 2026).
+    const char* mxfp8=std::getenv("VOIDINFER_EXL3_PREFILL_MXFP8");
     if(mxfp8 && std::strcmp(mxfp8,"0")!=0 && std::strcmp(mxfp8,"1")!=0) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_MXFP8 must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_MXFP8 must be 0 or 1");
     }
-    impl_->mxfp8_enabled=accept_all_model_shapes &&
-        (!mxfp8 || std::strcmp(mxfp8,"1")==0);
-    // NVFP4 prefill numerical policy (default 2 = MLP gate/up/down only,
-    // quality-gated; 0 = MXFP8 control; 1 = all admitted prefill projections,
-    // rejected on held-out quality: +0.039 overall, prose +0.068).
-    // Requires the MXFP8 route.
-    const char* nvfp4=std::getenv("NINFER_EXL3_PREFILL_NVFP4");
-    if(nvfp4 && std::strcmp(nvfp4,"0")!=0 && std::strcmp(nvfp4,"1")!=0 &&
-       std::strcmp(nvfp4,"2")!=0 && std::strcmp(nvfp4,"3")!=0 && std::strcmp(nvfp4,"4")!=0) {
+    impl_->mxfp8_enabled=accept_all_model_shapes && mxfp8 && std::strcmp(mxfp8,"1")==0;
+    // NVFP4 prefill numerical policy (nvfp4_projection), on top of the MXFP8
+    // route only. 0 = MXFP8 everywhere. Measured as KL(BF16 || ours) on the 4K paired panel (8
+    // fixtures, top-60, L0 decode): full-precision ingest 0.0147, mode 0
+    // 0.0161 (prefill 0.55 s at 4K, 5.12 s at 32K); 7 = gate/up of layers
+    // 32..63 0.0188 (0.51 / 4.77 s); 8 = MLP down everywhere 0.0247; 5 = 7 + 8
+    // 0.0281 (0.47 / 4.47 s, worse on every fixture than mode 0); 6 = every
+    // projection of layers 32..63 + down; 2 = MLP gate/up/down; 1 = all
+    // projections; 3 = MLP layers 0..55 (VoidInfer artifact); 4 = MLP + GDN
+    // QKV/Z. VoidInfer itself measures 0.080-0.087. Requires the MXFP8 route.
+    const char* nvfp4=std::getenv("VOIDINFER_EXL3_PREFILL_NVFP4");
+    if(nvfp4 && (std::strlen(nvfp4)!=1 || nvfp4[0]<'0' || nvfp4[0]>'8')) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_NVFP4 must be 0..4");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_NVFP4 must be 0..8");
     }
-    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 2) : 0;
-    const char* fused_decode=std::getenv("NINFER_EXL3_PREFILL_FUSED_DECODE");
+    impl_->nvfp4_mode=impl_->mxfp8_enabled ? (nvfp4 ? std::atoi(nvfp4) : 0) : 0;
+    const char* fused_decode=std::getenv("VOIDINFER_EXL3_PREFILL_FUSED_DECODE");
     if(fused_decode && std::strcmp(fused_decode,"0")!=0 && std::strcmp(fused_decode,"1")!=0) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_DECODE must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_FUSED_DECODE must be 0 or 1");
     }
     impl_->fused_decode_enabled=!fused_decode || std::strcmp(fused_decode,"1")==0;
-    const char* fused_act=std::getenv("NINFER_EXL3_PREFILL_FUSED_ACT");
+    const char* fused_act=std::getenv("VOIDINFER_EXL3_PREFILL_FUSED_ACT");
     if(fused_act && std::strcmp(fused_act,"0")!=0 && std::strcmp(fused_act,"1")!=0) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_ACT must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_FUSED_ACT must be 0 or 1");
     }
     impl_->fused_act_enabled=!fused_act || std::strcmp(fused_act,"1")==0;
-    const char* fused_mlp=std::getenv("NINFER_EXL3_PREFILL_FUSED_MLP");
+    const char* fused_mlp=std::getenv("VOIDINFER_EXL3_PREFILL_FUSED_MLP");
     if(fused_mlp && std::strcmp(fused_mlp,"0")!=0 && std::strcmp(fused_mlp,"1")!=0) {
         delete impl_; impl_=nullptr;
-        throw std::invalid_argument("NINFER_EXL3_PREFILL_FUSED_MLP must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_FUSED_MLP must be 0 or 1");
     }
     impl_->fused_mlp_enabled=!fused_mlp || std::strcmp(fused_mlp,"1")==0;
     const char* packed_direct_k6 = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_PACKED_DIRECT_K6");
     if (packed_direct_k6 && std::strcmp(packed_direct_k6, "0") != 0 &&
         std::strcmp(packed_direct_k6, "1") != 0) {
         delete impl_; impl_ = nullptr;
@@ -6986,7 +7475,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->packed_direct_k6_enabled = accept_all_model_shapes &&
         packed_direct_k6 && std::strcmp(packed_direct_k6, "1") == 0;
     const char* packed_direct_k5 = std::getenv(
-        "NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5");
+        "VOIDINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5");
     if (packed_direct_k5 && std::strcmp(packed_direct_k5, "0") != 0 &&
         std::strcmp(packed_direct_k5, "1") != 0) {
         delete impl_; impl_ = nullptr;
@@ -6995,7 +7484,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->packed_direct_k5_enabled = accept_all_model_shapes &&
         packed_direct_k5 && std::strcmp(packed_direct_k5, "1") == 0;
     const char* persistent_prefill = std::getenv(
-        "NINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL");
+        "VOIDINFER_EXL3_FAST_NATIVE_PERSISTENT_PREFILL");
     if (persistent_prefill && std::strcmp(persistent_prefill, "0") != 0 &&
         std::strcmp(persistent_prefill, "1") != 0) {
         delete impl_; impl_ = nullptr;
@@ -7005,7 +7494,7 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     impl_->persistent_prefill_enabled = accept_all_model_shapes &&
         persistent_prefill && std::strcmp(persistent_prefill, "1") == 0;
     const char* mia_prefill_fp16 = std::getenv(
-        "NINFER_EXL3_FAST_NATIVE_MIA_PREFILL_FP16");
+        "VOIDINFER_EXL3_FAST_NATIVE_MIA_PREFILL_FP16");
     if (mia_prefill_fp16 && std::strcmp(mia_prefill_fp16, "0") != 0 &&
         std::strcmp(mia_prefill_fp16, "1") != 0) {
         delete impl_; impl_ = nullptr;
@@ -7069,8 +7558,8 @@ Exl3CudaReconstructGemmWorkspace::Exl3CudaReconstructGemmWorkspace(
     const std::size_t transformed_bytes = static_cast<std::size_t>(max_rows) *
         (accept_transpose_shape ? maximum_features : in_features) *
         sizeof(std::uint16_t);
-    const std::size_t reconstructed_bytes = static_cast<std::size_t>(in_features) *
-        out_features * sizeof(std::uint16_t);
+    const std::size_t reconstructed_bytes = reconstruction_plane_elements(
+        in_features, out_features, accept_all_model_shapes) * sizeof(std::uint16_t);
     const std::size_t accumulation_width = accept_transpose_shape
         ? static_cast<std::size_t>(maximum_features)
         : static_cast<std::size_t>(out_features);
@@ -7123,6 +7612,12 @@ Exl3CudaReconstructGemmWorkspace::~Exl3CudaReconstructGemmWorkspace() {
     if (!impl_) return;
     if (impl_->weight_prefetch_stream)
         (void)cudaStreamSynchronize(impl_->weight_prefetch_stream);
+    for (auto& [key, plan] : impl_->table_plans) {
+        if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+        if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+        if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+        if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+    }
     for (auto& [key, plan] : impl_->lt_plans) {
         if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
         if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
@@ -7156,13 +7651,16 @@ Exl3ReconstructGemmStats Exl3CudaReconstructGemmWorkspace::stats() const noexcep
 
 void Exl3CudaReconstructGemmWorkspace::begin_layer_reuse(
     std::size_t max_cached_bytes, bool allow_k5) {
-    if (!impl_ || impl_->reuse_active || !impl_->accept_all_model_shapes || !max_cached_bytes)
+    if (!impl_ || impl_->reuse_active || !impl_->accept_all_model_shapes)
         throw std::invalid_argument("layer-major weight reuse admission");
+    impl_->reuse_mutex.lock();
+    impl_->reuse_locked = true;
     impl_->reuse_active = true;
     impl_->k5_scope_enabled = allow_k5 && impl_->k5_layer_prefill_enabled;
-    impl_->reuse_budget = max_cached_bytes;
+    impl_->reuse_budget = std::min(max_cached_bytes,
+        impl_->reuse_limit.load(std::memory_order_relaxed));
     impl_->reuse_used = 0;
-    const char* profile=std::getenv("NINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
+    const char* profile=std::getenv("VOIDINFER_EXL3_TEST_LAYER_MAJOR_PROFILE");
     impl_->diagnostic_remaining = impl_->reuse_scope_count==0 && profile &&
         std::strcmp(profile,"1")==0 ? 16 : 0;
     ++impl_->reuse_scope_count;
@@ -7197,6 +7695,48 @@ void Exl3CudaReconstructGemmWorkspace::end_layer_reuse() noexcept {
         slot.valid = false;
         slot.prefetch_pending = false;
     }
+    impl_->reuse_bytes.store(impl_->reuse_capacity, std::memory_order_relaxed);
+    if (impl_->reuse_locked) {
+        impl_->reuse_locked = false;
+        impl_->reuse_mutex.unlock();
+    }
+}
+
+std::size_t Exl3CudaReconstructGemmWorkspace::release_layer_reuse(std::size_t keep_bytes) {
+    if (!impl_) return 0;
+    std::unique_lock lock(impl_->reuse_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return 0;
+    impl_->reuse_limit.store(keep_bytes, std::memory_order_relaxed);
+    std::size_t released = 0;
+    while (impl_->reuse_capacity > keep_bytes) {
+        decltype(impl_->reuse_slots.data()) largest = nullptr;
+        for (auto& slot : impl_->reuse_slots)
+            if (slot.data && (!largest || slot.capacity > largest->capacity)) largest = &slot;
+        if (!largest) break;
+        // cudaFree waits for the device: GEMMs of an earlier scope may still read the slot.
+        cuda_check(cudaFree(largest->data), "release layer-major weight slot");
+        largest->data = nullptr;
+        impl_->reuse_capacity -= largest->capacity;
+        released += largest->capacity;
+        largest->capacity = 0;
+        largest->valid = false;
+    }
+    impl_->stats.cached_weight_capacity_bytes = impl_->reuse_capacity;
+    impl_->reuse_bytes.store(impl_->reuse_capacity, std::memory_order_relaxed);
+    return released;
+}
+
+std::unique_lock<std::mutex> Exl3CudaReconstructGemmWorkspace::lock_layer_reuse_budget() {
+    if (!impl_) throw std::logic_error("layer-major reuse budget without a workspace");
+    return std::unique_lock<std::mutex>(impl_->reuse_mutex);
+}
+
+void Exl3CudaReconstructGemmWorkspace::set_layer_reuse_limit(std::size_t bytes) noexcept {
+    if (impl_) impl_->reuse_limit.store(bytes, std::memory_order_relaxed);
+}
+
+std::size_t Exl3CudaReconstructGemmWorkspace::layer_reuse_bytes() const noexcept {
+    return impl_ ? impl_->reuse_bytes.load(std::memory_order_relaxed) : 0;
 }
 
 bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(
@@ -7269,10 +7809,9 @@ bool Exl3CudaReconstructGemmWorkspace::prefetch_numeric_weight(
     cuda_check(cudaStreamWaitEvent(impl_->weight_prefetch_stream,
         slot->prefetch_fork,0),"join K5 weight prefetch fork");
     slot->prefetch_pending=true;
-    exl3_reconstruct_transformed_weight_kernel<5><<<
-        dim3(metadata.out_features/16,metadata.in_features/16),256,0,
-        impl_->weight_prefetch_stream>>>(weights.trellis,weights.mul1,
-            slot->data,metadata.in_features,metadata.out_features);
+    launch_reconstruct_transformed_weight(5,weights.trellis,weights.mul1,
+        slot->data,metadata.in_features,metadata.out_features,
+        impl_->weight_prefetch_stream);
     cuda_check(cudaGetLastError(),"launch K5 weight prefetch");
     cuda_check(cudaEventRecord(slot->prefetch_ready,
         impl_->weight_prefetch_stream),"record K5 weight prefetch ready");
@@ -7290,15 +7829,23 @@ bool Exl3CudaReconstructGemmWorkspace::supports(
             metadata.out_features > 0 &&
             metadata.in_features <= impl_->in_features &&
             metadata.out_features <= impl_->out_features &&
+            static_cast<std::size_t>(metadata.in_features) * metadata.out_features <=
+                reconstruction_plane_elements(impl_->in_features, impl_->out_features, true) &&
             metadata.in_features % kHadamard == 0 &&
             metadata.out_features % kHadamard == 0;
-        const bool k5_layer=metadata.K==5 &&
+        const bool k5_layer=(metadata.K==5 || metadata.K==4) &&
             (impl_->k5_scope_enabled || impl_->mxfp8_enabled) &&
             impl_->reuse_active && rows>=256;
         // K8 (attention K/V) is admitted only to the fused decode route.
         const bool k8_layer=metadata.K==8 && impl_->mxfp8_enabled &&
             impl_->fused_decode_enabled && impl_->reuse_active && rows>=256;
-        return bounded_shape && (metadata.K == 6 || metadata.K == 7 || k5_layer || k8_layer) &&
+        // Row-major wide passes (VeriCache verify, short prompt chunks) take
+        // the FP16 reconstruct + GEMM route at every stored width: the
+        // direct trellis kernels they fell back to ran ~2x slower.
+        const bool wide_fp16=!impl_->reuse_active && rows>=256 &&
+            metadata.K>=4 && metadata.K<=8;
+        return bounded_shape &&
+            (metadata.K == 6 || metadata.K == 7 || k5_layer || k8_layer || wide_fp16) &&
             metadata.mul1 && !metadata.mcg && !metadata.has_bias;
     }
     const bool primary_shape =
@@ -7355,7 +7902,7 @@ bool Exl3CudaReconstructGemmWorkspace::forward_numeric_mlp(
         !supports(gate_metadata, rows) || !supports(up_metadata, rows) ||
         !supports(down_metadata, rows) || !gate.svh || !up.svh)
         return false;
-    const char* fast = std::getenv("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+    const char* fast = std::getenv("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     if (!fast || std::strcmp(fast, "1") != 0) return false;
     struct Reset {
         Impl* impl;
@@ -7438,7 +7985,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     if (up && fused_original)
         throw std::invalid_argument("original-basis GEMM cannot consume transformed gate/up input");
     const char* fast_same_weights_fp16kv = std::getenv(
-        "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
+        "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL");
     const bool fast_fp16_destination = impl_->accept_all_model_shapes &&
         rows > 1 && fast_same_weights_fp16kv &&
         std::strcmp(fast_same_weights_fp16kv, "1") == 0;
@@ -7449,8 +7996,16 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                      impl_->mia_prefill_fp16_enabled ||
                      impl_->packed_direct_k6_enabled))
         throw std::invalid_argument("bulk down residual epilogue admission");
+    // The K5 projections accumulate in FP16 like K6/K7 (default since Oct 15
+    // 2026; VOIDINFER_EXL3_PREFILL_FP16_ACCUM_K5=0 keeps FP32 compute): prefill
+    // 32K 8.03 -> 7.69 s, 128K 42.83 -> 41.52 s; KL vs BF16 at 4K 0.00992 ->
+    // 0.01001 (8 fixtures), paired KL vs FP32 K5 0.0017 / 0.0023 at 4K / 16K.
+    static const bool fp16_k5=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_FP16_ACCUM_K5");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
     const bool fp16_compute = impl_->fp16_compute_enabled &&
-        fast_fp16_destination && !fused_original && metadata.K!=5;
+        fast_fp16_destination && !fused_original && (metadata.K!=5 || fp16_k5);
     // Under the block-quantized route the FP16 transformed input is only
     // materialized if a non-quantized branch consumes it; otherwise the
     // transform is fused into activation quantization.
@@ -7846,13 +8401,29 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         return;
     }
 
-    const dim3 reconstruct_grid(metadata.out_features / 16,
-                                metadata.in_features / 16);
     const std::size_t weight_bytes =
         static_cast<std::size_t>(metadata.in_features) *
         static_cast<std::size_t>(metadata.out_features) * sizeof(std::uint16_t);
     std::uint16_t* reconstructed = impl_->reconstructed;
     bool reconstruct_needed = true;
+    // A slot holds the operand this call will consume: the MXFP8 (E4M3 +
+    // E8M0 per 32) or NVFP4 (packed values, scales, global scale) image when
+    // the block-scaled route applies, else the FP16 weight. Sizing slots by
+    // that image lets a bounded cache keep whole layers resident.
+    const bool slot_block_scaled = impl_->mxfp8_enabled && fast_fp16_destination &&
+        !fused_original && rows >= 16 &&
+        metadata.in_features % 128 == 0 && metadata.out_features % 128 == 0;
+    const bool slot_nvfp4 = slot_block_scaled &&
+        nvfp4_projection(impl_->nvfp4_mode, metadata, impl_->prefill_layer);
+    const std::size_t elements =
+        static_cast<std::size_t>(metadata.in_features) * metadata.out_features;
+    static const bool compact_slots = [] {
+        const char* value = std::getenv("VOIDINFER_EXL3_COMPACT_LAYER_MAJOR_SLOTS");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    const std::size_t slot_bytes = !compact_slots || !slot_block_scaled ? weight_bytes :
+        ((slot_nvfp4 ? elements / 2 + elements / 16 + sizeof(float) : elements + elements / 32) + 255) /
+            256 * 256;
     if (impl_->reuse_active && (!fused_original || original_gdn_mlp)) {
         Impl::ReuseSlot* slot = nullptr;
         for (std::size_t index = 0; index < impl_->reuse_used; ++index) {
@@ -7882,8 +8453,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
             slot->out_features = metadata.out_features;
             slot->K = metadata.K;
             slot->original_basis = fused_original;
-            if (slot->capacity < weight_bytes &&
-                impl_->reuse_capacity - slot->capacity + weight_bytes <=
+            if (slot->capacity < slot_bytes &&
+                impl_->reuse_capacity - slot->capacity + slot_bytes <=
                     impl_->reuse_budget) {
                 if (slot->data) {
                     cuda_check(cudaFree(slot->data),
@@ -7893,14 +8464,14 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     slot->capacity = 0;
                 }
                 cuda_check(cudaMalloc(reinterpret_cast<void**>(&slot->data),
-                                      weight_bytes),
+                                      slot_bytes),
                            "allocate bounded layer-major weight slot");
-                slot->capacity = weight_bytes;
-                impl_->reuse_capacity += weight_bytes;
+                slot->capacity = slot_bytes;
+                impl_->reuse_capacity += slot_bytes;
                 impl_->stats.cached_weight_capacity_bytes = impl_->reuse_capacity;
             }
         }
-        if (slot->data && slot->capacity >= weight_bytes) {
+        if (slot->data && slot->capacity >= slot_bytes) {
             reconstructed = slot->data;
             if (slot->prefetch_pending) {
                 cuda_check(cudaStreamWaitEvent(stream,slot->prefetch_ready,0),
@@ -7925,17 +8496,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         reconstructed != impl_->reconstructed;
     std::uint8_t* const mx_weight =
         mxfp8 ? reinterpret_cast<std::uint8_t*>(reconstructed) : nullptr;
-    const bool mlp_shape =
-        (metadata.in_features == 5120 && metadata.out_features == 17408) ||
-        (metadata.in_features == 17408 && metadata.out_features == 5120);
-    // Mode 3 mirrors the NInfer Qwen3.8 NVFP4 artifact: MLP layers 0..55.
-    const bool gdn_qkvz_shape = metadata.in_features == 5120 &&
-        (metadata.out_features == 10240 || metadata.out_features == 6144);
-    const bool nvfp4 = mxfp8 && (impl_->nvfp4_mode == 1 ||
-        (impl_->nvfp4_mode == 2 && mlp_shape) ||
-        (impl_->nvfp4_mode == 4 && (mlp_shape || gdn_qkvz_shape)) ||
-        (impl_->nvfp4_mode == 3 && mlp_shape && impl_->prefill_layer >= 0 &&
-         impl_->prefill_layer < 56));
+    const bool nvfp4 = mxfp8 &&
+        nvfp4_projection(impl_->nvfp4_mode, metadata, impl_->prefill_layer);
     // NVFP4 slot: packed values (k*n/2), block scales (n x k/16), then the
     // FP32 weight global scale, all inside the FP16-sized reuse slot.
     const std::size_t nv_value_bytes =
@@ -7943,9 +8505,9 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
     const std::size_t nv_scale_bytes =
         static_cast<std::size_t>(metadata.in_features) * metadata.out_features / 16;
     // Default 1: decode EXL3 trellis tiles straight into the quantized operand
-    // (NINFER_EXL3_PREFILL_FUSED_DECODE=0 keeps the FP16 reconstruct + quantize control).
+    // (VOIDINFER_EXL3_PREFILL_FUSED_DECODE=0 keeps the FP16 reconstruct + quantize control).
     const bool fused_decode = mxfp8 && impl_->fused_decode_enabled &&
-        metadata.K >= 5 && metadata.K <= 8;
+        metadata.K >= 4 && metadata.K <= 8;
     float* const nv_weight_global = nvfp4 ? reinterpret_cast<float*>(
         mx_weight + nv_value_bytes + nv_scale_bytes) : nullptr;
     if (mxfp8) reconstructed = impl_->reconstructed;
@@ -7974,27 +8536,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
                     metadata.out_features, nullptr,
                 metadata.in_features, metadata.out_features, stream);
     } else if (reconstruct_needed) {
-        if (metadata.K == 5) {
-            exl3_reconstruct_transformed_weight_kernel<5><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 6) {
-            exl3_reconstruct_transformed_weight_kernel<6><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 8) {
-            exl3_reconstruct_transformed_weight_kernel<8><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        } else {
-            exl3_reconstruct_transformed_weight_kernel<7><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                    weights.trellis, weights.mul1, reconstructed,
-                    metadata.in_features, metadata.out_features);
-        }
+        launch_reconstruct_transformed_weight(metadata.K, weights.trellis, weights.mul1,
+            reconstructed, metadata.in_features, metadata.out_features, stream);
     }
     if (reconstruct_needed) {
         cuda_check(cudaGetLastError(), "T69 reconstruct transformed weight");
@@ -8376,7 +8919,7 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
         else ++impl_->stats.large_lt_calls;
         used_lt=true;
     }
-    if (!used_lt) {
+    const auto default_gemm=[&](void* destination) {
         cublas_check(cublasGemmEx(
             impl_->handle, CUBLAS_OP_N, CUBLAS_OP_N,
             metadata.out_features, rows, metadata.in_features,
@@ -8386,13 +8929,160 @@ void Exl3CudaReconstructGemmWorkspace::forward_numeric_candidate(
             gemm_input, CUDA_R_16F, metadata.in_features,
             fp16_compute ? static_cast<const void*>(&beta_half)
                          : static_cast<const void*>(&beta),
-            gemm_output, output_type, metadata.out_features,
+            destination, output_type, metadata.out_features,
             fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
             fp16_compute ? "T69 same-weights FP16-compute GEMM"
                          : (fused_original ? "T69 fused original-basis GEMM"
                                             : "T69 FP32-compute GEMM"));
+    };
+    // Recorded algorithms (Exl3GemmTable): only bit-identical ones are recorded.
+    auto& gemm_table = Exl3GemmTable::get();
+    if (!used_lt && gemm_table.enabled() && rows > 1) {
+        const bool fp16_output = output_type == CUDA_R_16F;
+        const auto table_key = Exl3GemmTable::key(fp16_compute, fp16_output,
+            metadata.in_features, metadata.out_features, rows);
+        constexpr std::size_t lt_limit = 16u * 1024u * 1024u;
+        const auto make_plan = [&]() -> Impl::LtPlan& {
+            auto found = impl_->table_plans.find(table_key);
+            if (found != impl_->table_plans.end()) return found->second;
+            if (!impl_->lt_handle)
+                cublas_check(cublasLtCreate(&impl_->lt_handle), "create table cuBLASLt handle");
+            Impl::LtPlan plan{};
+            try {
+                cublas_check(cublasLtMatmulDescCreate(&plan.operation,
+                    fp16_compute ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F,
+                    fp16_compute ? CUDA_R_16F : CUDA_R_32F), "create table Lt operation");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_16F,
+                    metadata.out_features, metadata.in_features, metadata.out_features),
+                    "create table Lt A layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_16F,
+                    metadata.in_features, rows, metadata.in_features),
+                    "create table Lt B layout");
+                cublas_check(cublasLtMatrixLayoutCreate(&plan.c, output_type,
+                    metadata.out_features, rows, metadata.out_features),
+                    "create table Lt C layout");
+            } catch (...) {
+                if (plan.a) cublasLtMatrixLayoutDestroy(plan.a);
+                if (plan.b) cublasLtMatrixLayoutDestroy(plan.b);
+                if (plan.c) cublasLtMatrixLayoutDestroy(plan.c);
+                if (plan.operation) cublasLtMatmulDescDestroy(plan.operation);
+                throw;
+            }
+            return impl_->table_plans.emplace(table_key, plan).first->second;
+        };
+        const auto run_lt = [&](const Impl::LtPlan& plan, const cublasLtMatmulAlgo_t& algo,
+                                std::size_t workspace, void* destination) {
+            cublas_check(cublasLtMatmul(impl_->lt_handle, plan.operation,
+                fp16_compute ? static_cast<const void*>(&alpha_half)
+                             : static_cast<const void*>(&alpha),
+                reconstructed, plan.a, gemm_input, plan.b,
+                fp16_compute ? static_cast<const void*>(&beta_half)
+                             : static_cast<const void*>(&beta),
+                destination, plan.c, destination, plan.c, &algo,
+                impl_->cublas_workspace, workspace, stream), "table cuBLASLt GEMM");
+        };
+        auto entry = gemm_table.find(table_key);
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream, &capture), "GEMM table capture query");
+        if (!entry && gemm_table.tune(rows) && capture == cudaStreamCaptureStatusNone) {
+            // Tune on the real operands: default output as the reference,
+            // then every candidate into a second buffer, compared bitwise.
+            Exl3GemmTable::Entry chosen{};
+            bool persist = true;
+            auto& plan = make_plan();
+            const std::size_t bytes = static_cast<std::size_t>(metadata.out_features) * rows *
+                (output_type == CUDA_R_16F ? 2u : 4u);
+            void* reference = nullptr; void* trial = nullptr; int* diff = nullptr;
+            cudaEvent_t begin = nullptr, end = nullptr;
+            const auto cleanup = [&] {
+                if (reference) (void)cudaFree(reference);
+                if (trial) (void)cudaFree(trial);
+                if (diff) (void)cudaFree(diff);
+                if (begin) (void)cudaEventDestroy(begin);
+                if (end) (void)cudaEventDestroy(end);
+            };
+            try {
+                cuda_check(cudaStreamSynchronize(stream), "GEMM tune sync");
+                cuda_check(cudaMalloc(&reference, bytes), "GEMM tune reference");
+                cuda_check(cudaMalloc(&trial, bytes), "GEMM tune trial");
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(&diff), sizeof(int)), "GEMM tune flag");
+                cuda_check(cudaEventCreate(&begin), "GEMM tune event");
+                cuda_check(cudaEventCreate(&end), "GEMM tune event");
+                const auto time = [&](const auto& launch) {
+                    launch();  // warm-up
+                    cuda_check(cudaEventRecord(begin, stream), "GEMM tune begin");
+                    for (int i = 0; i < 5; ++i) launch();
+                    cuda_check(cudaEventRecord(end, stream), "GEMM tune end");
+                    cuda_check(cudaEventSynchronize(end), "GEMM tune wait");
+                    float ms = 0.0f;
+                    cuda_check(cudaEventElapsedTime(&ms, begin, end), "GEMM tune elapsed");
+                    return ms / 5.0f;
+                };
+                const float default_ms = time([&] {default_gemm(reference);});
+                cublasLtMatmulPreference_t preference = nullptr;
+                cublas_check(cublasLtMatmulPreferenceCreate(&preference), "GEMM tune preference");
+                cublasLtMatmulHeuristicResult_t candidates[16]{};
+                int count = 0;
+                const auto status_limit = cublasLtMatmulPreferenceSetAttribute(preference,
+                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &lt_limit, sizeof(lt_limit));
+                const auto status_query = status_limit == CUBLAS_STATUS_SUCCESS ?
+                    cublasLtMatmulAlgoGetHeuristic(impl_->lt_handle, plan.operation, plan.a,
+                        plan.b, plan.c, plan.c, preference, 16, candidates, &count) : status_limit;
+                cublasLtMatmulPreferenceDestroy(preference);
+                float best_ms = default_ms;
+                if (status_query == CUBLAS_STATUS_SUCCESS)
+                for (int i = 0; i < count; ++i) {
+                    if (candidates[i].state != CUBLAS_STATUS_SUCCESS ||
+                        candidates[i].workspaceSize > lt_limit) continue;
+                    run_lt(plan, candidates[i].algo, candidates[i].workspaceSize, trial);
+                    cuda_check(cudaMemsetAsync(diff, 0, sizeof(int), stream), "GEMM tune flag clear");
+                    exl3_gemm_bitwise_diff_kernel<<<1024, 256, 0, stream>>>(
+                        static_cast<const std::uint32_t*>(reference),
+                        static_cast<const std::uint32_t*>(trial), bytes / 4, diff);
+                    cuda_check(cudaGetLastError(), "GEMM tune compare");
+                    int host_diff = 1;
+                    cuda_check(cudaMemcpyAsync(&host_diff, diff, sizeof(int),
+                        cudaMemcpyDeviceToHost, stream), "GEMM tune flag read");
+                    cuda_check(cudaStreamSynchronize(stream), "GEMM tune compare sync");
+                    if (host_diff) continue;  // not bit-identical: never recorded
+                    const float ms = time([&] {
+                        run_lt(plan, candidates[i].algo, candidates[i].workspaceSize, trial);});
+                    if (ms < best_ms) {best_ms = ms; chosen.lt = true; chosen.algo = candidates[i].algo;}
+                }
+                if (chosen.lt && best_ms > default_ms * (1.0 - gemm_table.min_gain() / 100.0))
+                    chosen = {};
+                if (std::getenv("VOIDINFER_EXL3_GEMM_TUNE_TRACE"))
+                    std::fprintf(stderr, "GEMM_TUNE in=%d out=%d rows=%d fp16c=%d default_ms=%.4f best_ms=%.4f lt=%d candidates=%d\n",
+                        metadata.in_features, metadata.out_features, rows, fp16_compute ? 1 : 0,
+                        default_ms, chosen.lt ? best_ms : default_ms, chosen.lt ? 1 : 0, count);
+                cleanup();
+            } catch (...) {
+                cleanup();
+                // A failed allocation or query leaves the device usable: run
+                // the default and let the next process tune this shape again.
+                (void)cudaGetLastError();
+                if (cudaStreamSynchronize(stream) != cudaSuccess) throw;
+                chosen = {};
+                persist = false;
+            }
+            gemm_table.record(table_key, chosen, persist);
+            entry = chosen;
+        }
+        if (entry && entry->lt) {
+            auto& plan = make_plan();
+            cublasLtMatmulHeuristicResult_t check_result{};
+            if (cublasLtMatmulAlgoCheck(impl_->lt_handle, plan.operation, plan.a, plan.b,
+                    plan.c, plan.c, &entry->algo, &check_result) == CUBLAS_STATUS_SUCCESS &&
+                check_result.workspaceSize <= lt_limit) {
+                run_lt(plan, entry->algo, check_result.workspaceSize, gemm_output);
+                used_lt = true;
+            } else {
+                gemm_table.record(table_key, {}, false);  // unsupported here: default from now on
+            }
+        }
     }
+    if (!used_lt) default_gemm(gemm_output);
     if (timing) cuda_check(cudaEventRecord(events[3], stream), "T69 GEMM event");
 
     if (!fused_original) {
@@ -9037,9 +9727,8 @@ void Exl3CudaReconstructGemmWorkspace::forward_v6_numeric(
     // the FP32 butterfly. The established text route deliberately keeps its
     // original full product; this specialization is admitted only here.
     launch_input_hadamard<kHadamard,true>(stream,input,weights.suh,impl_->transformed,rows,metadata.in_features);
-    exl3_reconstruct_transformed_weight_kernel<6><<<
-        dim3(metadata.out_features/16,metadata.in_features/16),256,0,stream>>>(
-        weights.trellis,weights.mul1,impl_->reconstructed,metadata.in_features,metadata.out_features);
+    launch_reconstruct_transformed_weight(6,weights.trellis,weights.mul1,
+        impl_->reconstructed,metadata.in_features,metadata.out_features,stream);
     cuda_check(cudaGetLastError(),"V6 reconstruct/input transform");
     cublas_check(cublasSetStream(impl_->handle,stream),"V6 projection stream");
     cublas_check(cublasSetWorkspace(impl_->handle,impl_->cublas_workspace,16u*1024u*1024u),
@@ -9086,7 +9775,7 @@ void Exl3CudaLinearWorkspace::forward_predecoded_m1_k6_for_test(
     constexpr int tiles_per_block=16;
     const int output_blocks=out_features_/(tiles_per_block*16);
     int split_count=5;
-    if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+    if(const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
        requested&&*requested)
         split_count=std::min(split_count,std::max(1,std::atoi(requested)));
     const int grid_blocks=output_blocks*split_count;
@@ -9115,7 +9804,7 @@ void Exl3CudaLinearWorkspace::forward_fast_decode_m1_k6_for_test(
     constexpr int tiles_per_block=16;
     const int output_blocks=out_features_/(tiles_per_block*16);
     int split_count=5;
-    if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+    if(const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
        requested&&*requested)
         split_count=std::min(split_count,std::max(1,std::atoi(requested)));
     const int grid_blocks=output_blocks*split_count;
@@ -9149,7 +9838,7 @@ void Exl3CudaLinearWorkspace::forward_k6_rowpair_shared_decode_for_test(
     constexpr int tiles=64;
     const int blocks=out_features_/(16*tiles);
     int splits=std::min(5,generic_capacity_[1]/blocks);
-    if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+    if(const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
        requested&&*requested)
         splits=std::min(splits,std::max(1,std::atoi(requested)));
     if(splits<1)throw std::runtime_error(
@@ -9235,7 +9924,7 @@ void Exl3CudaLinearWorkspace::forward_reconstructed_exact_from_transformed(
     int splits=std::min(5,(down ? large_down_candidate_capacity_[metadata.K==6?0:1] :
         generic_capacity_[1])/parent_blocks);
     if (const char* requested=std::getenv(
-            down ? "NINFER_EXL3_LARGE_DOWN_SPLITS" : "NINFER_EXL3_GENERIC_SPLITS");
+            down ? "VOIDINFER_EXL3_LARGE_DOWN_SPLITS" : "VOIDINFER_EXL3_GENERIC_SPLITS");
         requested&&*requested)
         splits=std::min(splits,std::max(1,std::atoi(requested)));
     if(splits<1) throw std::runtime_error("exact reconstruction parent split capacity");
@@ -9323,18 +10012,9 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
         reinterpret_cast<std::uintptr_t>(stream));
     (void)submission;
     try {
-        const dim3 reconstruct_grid(
-            metadata.out_features / 16, metadata.in_features / 16);
-        if (metadata.K == 6) {
-            exl3_reconstruct_transformed_weight_kernel<6, false><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                weights.trellis, weights.mul1, reconstructed_exact_.data,
-                metadata.in_features, metadata.out_features);
-        } else if (metadata.K == 7) {
-            exl3_reconstruct_transformed_weight_kernel<7, false><<<
-                reconstruct_grid, 256, 0, stream>>>(
-                weights.trellis, weights.mul1, reconstructed_exact_.data,
-                metadata.in_features, metadata.out_features);
+        if (metadata.K == 6 || metadata.K == 7) {
+            launch_reconstruct_transformed_weight(metadata.K, weights.trellis, weights.mul1,
+                reconstructed_exact_.data, metadata.in_features, metadata.out_features, stream);
         } else {
             return false;
         }
@@ -9367,9 +10047,11 @@ bool Exl3CudaLinearWorkspace::try_fast_wide_prefill_gemm_from_transformed(
     return true;
 }
 
+// Verifier rows of a batched multi-agent round (two agents x 8 rows).
+constexpr int kBatchedRows = 16;
 static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission, int in_features, int out_features,
-    std::size_t capacity);
+    std::size_t capacity, int max_rows);
 
 static bool coherent_fused_input_for(int rows);
 static bool merged_gate_up_enabled();
@@ -9394,11 +10076,11 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     const std::uint16_t* input,std::uint16_t* gate_output,std::uint16_t* up_output,
     std::uint16_t* activation,int rows,cudaStream_t stream,
     const Exl3CudaLinearWeights* down_weights,Exl3CudaLinearWorkspace* down_workspace) {
-    if(rows<1 || rows>8 || rows>max_rows_ || rows>up_workspace.max_rows_ ||
+    if(rows<1 || rows>16 || rows>max_rows_ || rows>up_workspace.max_rows_ ||
        !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
-       gate_metadata.K!=up_metadata.K || gate_metadata.K<5 || gate_metadata.K>7 ||
+       gate_metadata.K!=up_metadata.K || gate_metadata.K<4 || gate_metadata.K>7 ||
        (!coherent_fused_input_for(rows) && out_features_<in_features_) ||
        in_features_!=up_workspace.in_features_ || out_features_!=up_workspace.out_features_ ||
        out_features_%kHadamard!=0 ||
@@ -9445,20 +10127,22 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
         if(fused) launch(fused_kernel); else launch(staged_kernel);
     };
-    if(gate_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+    if(gate_metadata.K==4) launch_k(exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per,false>);
+    else if(gate_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
     else if(gate_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
     else launch_k(exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<7,true,false,stages,warps,per,false>);
     cuda_check(cudaGetLastError(),"launch merged M1 gate/up producers");
-    // NINFER_EXL3_GATE_UP_REDUCE_WARPS (1, 2, 4 or 8; default 2) warps per CTA:
+    // VOIDINFER_EXL3_GATE_UP_REDUCE_WARPS (1, 2, 4 or 8; default 2) warps per CTA:
     // narrow CTAs spread the split-plane reads over more SMs.
     static const int reduce_warps=[] {
-        const char* value=std::getenv("NINFER_EXL3_GATE_UP_REDUCE_WARPS");
+        const char* value=std::getenv("VOIDINFER_EXL3_GATE_UP_REDUCE_WARPS");
         const int parsed=value?std::atoi(value):2;
         if(parsed!=1&&parsed!=2&&parsed!=4&&parsed!=8)
-            throw std::invalid_argument("NINFER_EXL3_GATE_UP_REDUCE_WARPS must be 1, 2, 4 or 8");
+            throw std::invalid_argument("VOIDINFER_EXL3_GATE_UP_REDUCE_WARPS must be 1, 2, 4 or 8");
         return parsed;
     }();
     const auto launch_reduce=[&](auto kernel,int warps) {
@@ -9486,6 +10170,120 @@ bool Exl3CudaLinearWorkspace::forward_merged_gate_up_silu(
     return true;
 }
 
+namespace {
+thread_local bool g_batched_round_numerics = false;
+}
+void exl3_set_batched_round_numerics(bool batched) noexcept { g_batched_round_numerics = batched; }
+bool exl3_batched_round_numerics() noexcept { return g_batched_round_numerics; }
+
+bool Exl3CudaLinearWorkspace::forward_merged_pair_m32(
+    Exl3CudaLinearWorkspace& second_workspace,
+    const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
+    std::uint16_t* first_output,
+    const Exl3CudaLinearWeights& second_weights,const Exl3CudaLinearMetadata& second_metadata,
+    std::uint16_t* second_output,const std::uint16_t* input,int rows,cudaStream_t stream) {
+    static const bool enabled=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_M32_PAIR");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!enabled || rows<=kBatchedRows || rows>4*kBatchedRows || rows>max_rows_ ||
+       rows>second_workspace.max_rows_ || first_metadata.K!=second_metadata.K ||
+       first_metadata.K<4 || first_metadata.K>8 || in_features_!=second_workspace.in_features_ ||
+       in_features_%kHadamard!=0 || out_features_%128!=0 || second_workspace.out_features_%128!=0 ||
+       first_metadata.in_features!=in_features_ || second_metadata.in_features!=in_features_ ||
+       first_metadata.out_features!=out_features_ ||
+       second_metadata.out_features!=second_workspace.out_features_ ||
+       first_metadata.mcg || second_metadata.mcg || !first_metadata.mul1 || !second_metadata.mul1 ||
+       first_metadata.has_bias || second_metadata.has_bias ||
+       !first_weights.suh || !first_weights.svh || !second_weights.suh || !second_weights.svh ||
+       !first_weights.trellis || !second_weights.trellis || !first_weights.mul1 ||
+       !second_weights.mul1 || !input || !first_output || !second_output ||
+       coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
+       (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2))
+        return false;
+    const int out_a=out_features_, out_b=second_workspace.out_features_;
+    const bool shared_accum=second_workspace.accum_==accum_;
+    // One K split for both: the one filling four 128-column CTAs per SM.
+    int sms=0,device=0;
+    if(cudaGetDevice(&device)!=cudaSuccess ||
+       cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess) sms=170;
+    const int blocks=(out_a+out_b)/128;
+    const int k_tiles=in_features_/16;
+    const auto fits=[&](int split) {
+        const auto plane=[&](int out){return static_cast<std::size_t>(rows)*out*split*sizeof(float);};
+        return shared_accum ? plane(out_a)+plane(out_b)<=accumulation_capacity_bytes_ :
+            plane(out_a)<=accumulation_capacity_bytes_ &&
+            plane(out_b)<=second_workspace.accumulation_capacity_bytes_;
+    };
+    int split=std::clamp(4*sms/blocks,1,20);
+    while(split>1 && (k_tiles/split<16 || !fits(split))) --split;
+    if(!fits(split))return false;
+    float* second_accum=shared_accum?accum_+static_cast<std::size_t>(split)*rows*out_a:
+        second_workspace.accum_;
+    // Input transforms are staged in each workspace's transform buffer, or
+    // in the projection outputs when the workspaces share one.
+    std::uint16_t* staged_a=transformed_;
+    std::uint16_t* staged_b=second_workspace.transformed_;
+    const std::size_t staged_bytes=static_cast<std::size_t>(rows)*in_features_*sizeof(std::uint16_t);
+    if(!staged_a || !staged_b || staged_a==staged_b ||
+       transformed_capacity_bytes_<staged_bytes ||
+       second_workspace.transformed_capacity_bytes_<staged_bytes) {
+        if(out_a<in_features_ || out_b<in_features_)return false;
+        staged_a=first_output;
+        staged_b=second_output;
+    }
+    launch_input_transform_pair(stream,input,first_weights.suh,second_weights.suh,
+        staged_a,staged_b,rows,in_features_);
+    const int grid_a=out_a/128*split, grid_b=out_b/128*split;
+    // M32 (17..32 rows) or M64 (33..64 rows, two-pass output store); the
+    // 32-row output tile aliases the drained ring either way.
+    const int m_tiles=rows>2*kBatchedRows?4:2;
+    const auto launch=[&](auto kernel,int bits) {
+        const std::size_t shared=8u*256u*static_cast<std::size_t>(m_tiles)*sizeof(half)+
+            8u*8u*16u*static_cast<std::size_t>(bits)*sizeof(std::uint16_t);
+        if(shared>48u*1024u)
+            cuda_check(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared)),"set M64 pair shared memory");
+        exl3_launch_pdl(kernel,dim3(grid_a+grid_b),dim3(128),shared,stream,
+            static_cast<const std::uint16_t*>(staged_a),first_weights.trellis,
+            first_weights.mul1,accum_,out_a,static_cast<const std::uint16_t*>(staged_b),
+            second_weights.trellis,second_weights.mul1,second_accum,out_b,rows,in_features_,
+            split,grid_a);
+    };
+    static const bool m64_fp16=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(m_tiles==4 && m64_fp16 && exl3_batched_round_numerics()) switch(first_metadata.K) {
+    case 4: launch(exl3_gemm_m32_dual_kernel<4,4,true>,4); break;
+    case 5: launch(exl3_gemm_m32_dual_kernel<5,4,true>,5); break;
+    case 6: launch(exl3_gemm_m32_dual_kernel<6,4,true>,6); break;
+    case 7: launch(exl3_gemm_m32_dual_kernel<7,4,true>,7); break;
+    default: launch(exl3_gemm_m32_dual_kernel<8,4,true>,8); break;
+    } else if(m_tiles==4) switch(first_metadata.K) {
+    case 4: launch(exl3_gemm_m32_dual_kernel<4,4>,4); break;
+    case 5: launch(exl3_gemm_m32_dual_kernel<5,4>,5); break;
+    case 6: launch(exl3_gemm_m32_dual_kernel<6,4>,6); break;
+    case 7: launch(exl3_gemm_m32_dual_kernel<7,4>,7); break;
+    default: launch(exl3_gemm_m32_dual_kernel<8,4>,8); break;
+    } else switch(first_metadata.K) {
+    case 4: launch(exl3_gemm_m32_dual_kernel<4>,4); break;
+    case 5: launch(exl3_gemm_m32_dual_kernel<5>,5); break;
+    case 6: launch(exl3_gemm_m32_dual_kernel<6>,6); break;
+    case 7: launch(exl3_gemm_m32_dual_kernel<7>,7); break;
+    default: launch(exl3_gemm_m32_dual_kernel<8>,8); break;
+    }
+    cuda_check(cudaGetLastError(),"launch M32 pair producers");
+    const int tasks=rows*((out_a+out_b)/kHadamard);
+    exl3_launch_pdl(exl3_pair_reduce_output_kernel,
+        dim3((tasks+kHadamardWarpsPerBlock-1)/kHadamardWarpsPerBlock),
+        dim3(kHadamardWarpsPerBlock*32),0,stream,accum_,first_weights.svh,first_output,out_a,
+        second_accum,second_weights.svh,second_output,out_b,rows,split,
+        static_cast<std::uint16_t*>(nullptr));
+    cuda_check(cudaGetLastError(),"launch M32 pair reduction");
+    return true;
+}
+
 bool Exl3CudaLinearWorkspace::forward_merged_pair(
     Exl3CudaLinearWorkspace& second_workspace,
     const Exl3CudaLinearWeights& first_weights,const Exl3CudaLinearMetadata& first_metadata,
@@ -9494,11 +10292,11 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
     std::uint16_t* second_output,const std::uint16_t* input,int rows,cudaStream_t stream,
     const Exl3GdnControlSide* control,std::uint16_t* first_bf16) {
     if(control && (in_features_%128!=0 || control->heads<=0))return false;
-    if(rows<1 || rows>8 || rows>max_rows_ || rows>second_workspace.max_rows_ ||
+    if(rows<1 || rows>16 || rows>max_rows_ || rows>second_workspace.max_rows_ ||
        !coherent_fused_input_for(1) || !merged_gate_up_enabled() ||
        coherent_deep_pipeline_stages()!=4 || coherent_packed_warps()!=4 ||
        (coherent_tiles_per_stage_setting()!=0 && coherent_tiles_per_stage_setting()!=2) ||
-       first_metadata.K!=second_metadata.K || first_metadata.K<5 || first_metadata.K>8 ||
+       first_metadata.K!=second_metadata.K || first_metadata.K<4 || first_metadata.K>8 ||
        (!coherent_fused_input_for(rows) &&
         (out_features_<in_features_ || second_workspace.out_features_<in_features_)) ||
        in_features_!=second_workspace.in_features_ ||
@@ -9512,7 +10310,7 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
                                   const Exl3CudaLinearMetadata& metadata) {
         if(const int kv=coherent_kv_split_for(metadata,rows,Exl3CudaLinearAdmission::ordinary,
                workspace.in_features_,workspace.out_features_,
-               workspace.accumulation_capacity_bytes_))
+               workspace.accumulation_capacity_bytes_,workspace.max_rows_))
             return -kv;
         if(metadata.K<=7 &&
            workspace.coherent_wide_k6_candidate(metadata,rows,Exl3CudaLinearAdmission::ordinary))
@@ -9556,7 +10354,9 @@ bool Exl3CudaLinearWorkspace::forward_merged_pair(
     const auto launch_k=[&](auto fused_kernel,auto staged_kernel) {
         if(fused) launch(fused_kernel); else launch(staged_kernel);
     };
-    if(first_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
+    if(first_metadata.K==4) launch_k(exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per>,
+        exl3_gemm_m1_fused_input_dual_kernel<4,false,false,stages,warps,per,false>);
+    else if(first_metadata.K==5) launch_k(exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<5,false,false,stages,warps,per,false>);
     else if(first_metadata.K==6) launch_k(exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per>,
         exl3_gemm_m1_fused_input_dual_kernel<6,false,true,stages,warps,per,false>);
@@ -9596,8 +10396,13 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
     if(admission==Exl3CudaLinearAdmission::target_continuation_head &&
        !target_head_small_m_candidate(metadata,rows,admission))
         throw std::invalid_argument("shared head requires admitted H6 small-M workspace");
+    if (coherent_batched_rows(metadata, rows)) {
+        transform_input(weights, metadata, input, rows, stream);
+        forward_from_transformed(weights, metadata, transformed_, output, rows, stream, admission);
+        return;
+    }
     if (coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
-            accumulation_capacity_bytes_)) {
+            accumulation_capacity_bytes_, max_rows_)) {
         if (coherent_fused_input_for(rows)) {
             forward_from_transformed(weights, metadata, transformed_, output,
                                      rows, stream, admission, input);
@@ -9670,9 +10475,9 @@ void Exl3CudaLinearWorkspace::forward(const Exl3CudaLinearWeights& weights,
             reconstructed_exact_.data,reconstructed_exact_.allow_k6_gate_up);
         reconstructed_exact_.ordered_stream->require_ordered(reinterpret_cast<std::uintptr_t>(stream));
     }
-    std::unique_ptr<ninfer::NvtxRange> projection_range;
-    if (std::getenv("NINFER_EXL3_PROJECTION_NVTX") != nullptr) {
-        projection_range = std::make_unique<ninfer::NvtxRange>(
+    std::unique_ptr<voidinfer::NvtxRange> projection_range;
+    if (std::getenv("VOIDINFER_EXL3_PROJECTION_NVTX") != nullptr) {
+        projection_range = std::make_unique<voidinfer::NvtxRange>(
             std::string("exl3.projection.") + std::to_string(metadata.in_features) + "x" +
             std::to_string(metadata.out_features) + ".k" + std::to_string(metadata.K));
     }
@@ -9880,62 +10685,6 @@ void Exl3CudaLinearWorkspace::transform_input(const Exl3CudaLinearWeights& weigh
     cuda_check(cudaGetLastError(), "launch EXL3 input Hadamard");
 }
 
-void Exl3CudaLinearWorkspace::forward_k4_prefill_for_test(
-    const Exl3CudaLinearWeights& weights,
-    const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-    std::uint16_t* output,int rows,cudaStream_t stream) {
-    if(metadata.K!=4 || metadata.in_features!=in_features_ ||
-       metadata.out_features!=out_features_ || metadata.mcg || !metadata.mul1 ||
-       metadata.has_bias || rows<=16 || rows>max_rows_ ||
-       !weights.trellis || !weights.suh || !weights.svh || !weights.mul1 ||
-       !input || !output || out_features_%kHadamard!=0)
-        throw std::invalid_argument("K4 prefill discriminator contract");
-    transform_input(weights,metadata,input,rows,stream);
-    const int full_groups=rows/16;
-    for(int group=0;group<full_groups;++group) {
-        const auto input_offset=static_cast<std::size_t>(group)*16u*in_features_;
-        const auto output_offset=static_cast<std::size_t>(group)*16u*out_features_;
-        exl3_initial16_ordered_kernel<4><<<out_features_/16,256,0,stream>>>(
-            transformed_+input_offset,weights.trellis,weights.mul1,
-            accum_+output_offset,in_features_,out_features_);
-    }
-    const int tail=rows-full_groups*16;
-    if(tail) {
-        const auto input_offset=static_cast<std::size_t>(full_groups)*16u*in_features_;
-        const auto output_offset=static_cast<std::size_t>(full_groups)*16u*out_features_;
-        exl3_generic_tile_kernel<<<dim3(out_features_/16,tail),dim3(kThreads),0,stream>>>(
-            transformed_+input_offset,weights.trellis,weights.mul1,
-            accum_+output_offset,tail,in_features_,out_features_,4);
-    }
-    cuda_check(cudaGetLastError(),"launch K4 prefill discriminator projection");
-    launch_output_hadamard(stream,accum_,weights.svh,output,rows,out_features_);
-    cuda_check(cudaGetLastError(),"launch K4 prefill discriminator output");
-}
-
-void Exl3CudaLinearWorkspace::forward_k4_prefill_mma_for_test(
-    const Exl3CudaLinearWeights& weights,
-    const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-    std::uint16_t* output,int rows,cudaStream_t stream) {
-    if(metadata.K!=4 || metadata.in_features!=in_features_ ||
-       metadata.out_features!=out_features_ || metadata.mcg || !metadata.mul1 ||
-       metadata.has_bias || rows<=16 || rows>max_rows_ ||
-       !weights.trellis || !weights.suh || !weights.svh || !weights.mul1 ||
-       !input || !output || out_features_%1024!=0)
-        throw std::invalid_argument("K4 MMA prefill discriminator contract");
-    transform_input(weights,metadata,input,rows,stream);
-    constexpr int tiles=64,splits=5;
-    const int blocks=out_features_/(16*tiles);
-    constexpr std::size_t shared_bytes=512u*sizeof(half)+
-        2u*tiles*16u*4u*sizeof(std::uint16_t);
-    exl3_prefill_direct_async_a_kernel<4,tiles,2><<<
-        dim3(blocks*splits,(rows+15)/16),kThreads,shared_bytes,stream>>>(
-            transformed_,weights.trellis,weights.mul1,accum_,rows,
-            in_features_,out_features_,splits);
-    cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator projection");
-    launch_prefill_reduce_output<false>(stream,accum_,weights.svh,output,rows,out_features_,splits);
-    cuda_check(cudaGetLastError(),"launch K4 MMA prefill discriminator output");
-}
-
 bool Exl3CudaLinearWorkspace::forward_target_prefill_gate_up_pair(
     Exl3CudaLinearWorkspace& up_workspace,
     const Exl3CudaLinearWeights& gate_weights,
@@ -9977,7 +10726,7 @@ bool Exl3CudaLinearWorkspace::forward_target_prefill_gate_up_pair(
     const int capacity=std::min(generic_capacity_[1],
         up_workspace.generic_capacity_[1]);
     int splits=std::min(5,capacity/blocks);
-    const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+    const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
     if(requested&&*requested)
         splits=std::min(splits,std::max(1,std::atoi(requested)));
     if(splits<1)return false;
@@ -10102,7 +10851,7 @@ void Exl3CudaLinearWorkspace::forward_target_m1_gate_up_pair(
     }
     const bool wide_gate_up_pair = [&]() {
         const char* requested = std::getenv(
-            "NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_N64");
+            "VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_M1_GATE_UP_N64");
         if (requested && std::strcmp(requested, "0") != 0 &&
             std::strcmp(requested, "1") != 0)
             throw std::invalid_argument(
@@ -10539,7 +11288,7 @@ bool Exl3CudaLinearWorkspace::target_down_small_m_candidate(
         out_features_ != 5120) {
         return false;
     }
-    const char* requested = std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+    const char* requested = std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
     const bool topology16 = requested == nullptr || *requested == '\0' ||
         std::strcmp(requested, "16") == 0 ||
         (metadata.K == 6 && std::strcmp(requested, "16-k6") == 0) ||
@@ -10713,14 +11462,14 @@ std::size_t Exl3CudaLinearWorkspace::coherent_wide_k6_shared_bytes_for_test() no
     return kCoherentWideK6SharedBytes;
 }
 
-// NINFER_EXL3_COHERENT_ANY_K (default 1; quality-gated) also admits K5 and K7 weights to the coherent
+// VOIDINFER_EXL3_COHERENT_ANY_K (default 1; quality-gated) also admits K5 and K7 weights to the coherent
 // wide and down producers (numerics policy: split-plane FP32 accumulation).
 static bool coherent_any_k_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_ANY_K");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_ANY_K");
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_COHERENT_ANY_K must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_ANY_K must be 0 or 1");
     }();
     return enabled;
 }
@@ -10730,11 +11479,13 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
     Exl3CudaLinearAdmission admission) const noexcept {
     if (!coherent_wide_k6_enabled_ || !allow_generic_variants_ ||
         coherent_wide_k6_resident_capacity_ <= 0 ||
-        rows < 1 || rows > 8 || rows > max_rows_ ||
+        rows < 1 || rows > 4 * kBatchedRows || rows > max_rows_ ||
+        (rows > kBatchedRows && admission == Exl3CudaLinearAdmission::ordinary) ||
         metadata.in_features != in_features_ ||
         metadata.out_features != out_features_ ||
         !(metadata.K == 6 ||
-          (coherent_any_k_enabled() && (metadata.K == 5 || metadata.K == 7))) ||
+          (coherent_any_k_enabled() &&
+           (metadata.K == 4 || metadata.K == 5 || metadata.K == 7))) ||
         metadata.mcg || !metadata.mul1 || metadata.has_bias)
         return false;
     constexpr Exl3CudaLinearAdmission continuation[5] = {
@@ -10749,24 +11500,81 @@ bool Exl3CudaLinearWorkspace::coherent_wide_k6_candidate(
          admission == continuation[coherent_wide_k6_operation_]);
 }
 
-// NINFER_EXL3_COHERENT_DOWN_SPLIT / NINFER_EXL3_COHERENT_O_SPLIT (10 default,
+// 17..32-row (M32) calls: the K split that fills the resident slots (four
+// 128-column CTAs per SM; VOIDINFER_EXL3_M32_SLOTS_PER_SM) in one wave, at least
+// 16 k-tiles per CTA and within the accumulation planes. A 400-CTA down
+// projection otherwise leaves 41% of the slots idle (the producer is latency
+// bound below four CTAs per SM). 4-agent forward 24.3 -> 22.1 ms; 3 or 6-8
+// slots per SM measured slower, and 9..16-row calls keep their split (the
+// same rule measured 18.0 -> 19.7 ms there).
+bool Exl3CudaLinearWorkspace::coherent_batched_rows(const Exl3CudaLinearMetadata& metadata,
+    int rows) const noexcept {
+    if(rows<=8) return false;
+    if(draft_batched_enabled_) return true;
+    static const bool target_m32=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_TARGET_COHERENT_M32");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(!target_m32 || rows>64 || rows>max_rows_ || out_features_%128 ||
+       metadata.K<4 || metadata.K>7 || metadata.mcg || !metadata.mul1 || metadata.has_bias)
+        return false;
+    const std::size_t plane=static_cast<std::size_t>(rows)*out_features_*sizeof(float);
+    return accumulation_capacity_bytes_>=plane*static_cast<std::size_t>(coherent_m32_split(rows));
+}
+
+int Exl3CudaLinearWorkspace::coherent_m32_split(int rows) const noexcept {
+    static const int slots = [] {
+        int device = 0, sms = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+            sms = 170;
+        const char* value = std::getenv("VOIDINFER_EXL3_M32_SLOTS_PER_SM");
+        return (value ? std::max(1, std::atoi(value)) : 4) * sms;
+    }();
+    const int blocks = std::max(1, out_features_ / 128);
+    const int k_tiles = in_features_ / 16;
+    int split = std::clamp(slots / blocks, 1, 20);
+    while (split > 1 && (k_tiles / split < 16 ||
+        static_cast<std::size_t>(rows) * static_cast<std::size_t>(out_features_) * split *
+            sizeof(float) > accumulation_capacity_bytes_))
+        --split;
+    return split;
+}
+
+// VOIDINFER_EXL3_COHERENT_DOWN_SPLIT / VOIDINFER_EXL3_COHERENT_O_SPLIT (10 default,
 // quality-gated within +/-0.00022 nats/token; 5 or 8): K partitions of the coherent down / O producers. A numerics-policy
 // choice (FP32 partial boundaries move); falls back to 5 when the owned
-// accumulation planes are too small.
+// accumulation planes are too small. M32 calls use coherent_m32_split.
 int Exl3CudaLinearWorkspace::coherent_split_override(const char* name, int rows) const {
     const char* value = std::getenv(name);
+    if (!value && rows > kBatchedRows) return coherent_m32_split(rows);
     const int base = static_cast<int>(Exl3LinearWorkspaceRequirements::accumulation_splits);
     const int split = value ? std::atoi(value) : 10;
     if (split != 5 && split != 8 && split != 10)
         throw std::invalid_argument("coherent split override must be 5, 8 or 10");
-    const auto required = static_cast<std::size_t>(rows) *
+    // The split follows the workspace's verifier row capacity (at most
+    // kBatchedRows), not this call's rows: a row's result must not depend on
+    // how many rows share the launch (batched multi-agent rounds).
+    const auto required = static_cast<std::size_t>(rows > kBatchedRows ? rows :
+        std::min(max_rows_, kBatchedRows)) *
         static_cast<std::size_t>(out_features_) * split * sizeof(float);
     return accumulation_capacity_bytes_ >= required ? split : base;
 }
 
 int Exl3CudaLinearWorkspace::coherent_wide_k6_split_count(int rows) const noexcept {
     constexpr int split10 = 10;
-    const auto required = static_cast<std::size_t>(rows) *
+    // 17..32-row (M32) calls fill the resident slots (coherent_m32_split);
+    // VOIDINFER_EXL3_COHERENT_M32_SPLIT overrides (1..10).
+    if (rows > kBatchedRows) {
+        static const int m32 = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_M32_SPLIT");
+            return value ? std::max(1, std::min(10, std::atoi(value))) : 0;
+        }();
+        if (m32) return m32;
+        return coherent_m32_split(rows);
+    }
+    const auto required = static_cast<std::size_t>(rows > kBatchedRows ? rows :
+        std::min(max_rows_, kBatchedRows)) *
         static_cast<std::size_t>(out_features_) * split10 * sizeof(float);
     return coherent_wide_k6_split10_enabled_ &&
         accumulation_capacity_bytes_ >= required ? split10 :
@@ -10780,14 +11588,17 @@ bool Exl3CudaLinearWorkspace::coherent_down_k6_candidate(
     // rows of an M16 MMA tile. Scalar, verifier, and correction share this
     // body and five disjoint K partitions.
     return coherent_down_k6_enabled_ && allow_generic_variants_ &&
-        coherent_down_k6_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        coherent_down_k6_resident_capacity_ > 0 && rows >= 1 &&
+        (rows <= kBatchedRows || (rows <= 4 * kBatchedRows &&
+            admission == Exl3CudaLinearAdmission::target_continuation_down)) &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
          admission == Exl3CudaLinearAdmission::target_continuation_down) &&
         in_features_ == 17408 && out_features_ == 5120 &&
         metadata.in_features == in_features_ &&
         metadata.out_features == out_features_ &&
-        (metadata.K == 6 || (coherent_any_k_enabled() && metadata.K == 5)) &&
+        (metadata.K == 6 || (coherent_any_k_enabled() &&
+            (metadata.K == 4 || metadata.K == 5))) &&
         !metadata.mcg && metadata.mul1 && !metadata.has_bias;
 }
 
@@ -10799,7 +11610,9 @@ bool Exl3CudaLinearWorkspace::coherent_down_k7_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     return coherent_down_k7_enabled_ && allow_generic_variants_ &&
-        coherent_down_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        coherent_down_k7_resident_capacity_ > 0 && rows >= 1 &&
+        (rows <= kBatchedRows || (rows <= 4 * kBatchedRows &&
+            admission == Exl3CudaLinearAdmission::target_continuation_down)) &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
          admission == Exl3CudaLinearAdmission::target_continuation_down) &&
@@ -10813,7 +11626,9 @@ bool Exl3CudaLinearWorkspace::coherent_o_k7_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     return coherent_o_k7_enabled_ && allow_generic_variants_ &&
-        coherent_o_k7_resident_capacity_ > 0 && rows >= 1 && rows <= 8 &&
+        coherent_o_k7_resident_capacity_ > 0 && rows >= 1 &&
+        (rows <= kBatchedRows || (rows <= 4 * kBatchedRows &&
+            admission == Exl3CudaLinearAdmission::target_continuation_o)) &&
         rows <= max_rows_ &&
         (admission == Exl3CudaLinearAdmission::ordinary ||
          admission == Exl3CudaLinearAdmission::target_continuation_o) &&
@@ -11116,7 +11931,7 @@ bool Exl3CudaLinearWorkspace::target_down_k6_async_a_candidate(
         !extended_stream_reduction_candidate(metadata, rows, admission)) {
         return false;
     }
-    const char* requested = std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+    const char* requested = std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
     const bool topology16 = requested == nullptr || *requested == '\0' ||
         std::strcmp(requested, "16") == 0 ||
         std::strcmp(requested, "16-k6") == 0;
@@ -11276,7 +12091,7 @@ bool Exl3CudaLinearWorkspace::target_wide_prefill_candidate(
     const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission) const noexcept {
     if (!target_wide_prefill_enabled_ || admission != Exl3CudaLinearAdmission::target_wide_prefill ||
-        rows < 2 || rows > (target_staged_prefill_enabled_ ? (target_wide1024_enabled_ ? 1024 : target_wide512_enabled_ ? 512 : target_wide256_enabled_ ? 256 : target_wide128_enabled_ ? 128 : target_wide64_enabled_ ? 64 : 32) : 16) || rows > max_rows_ || metadata.K < 5 || metadata.K > 8 ||
+        rows < 2 || rows > (target_staged_prefill_enabled_ ? (target_wide1024_enabled_ ? 1024 : target_wide512_enabled_ ? 512 : target_wide256_enabled_ ? 256 : target_wide128_enabled_ ? 128 : target_wide64_enabled_ ? 64 : 32) : 16) || rows > max_rows_ || metadata.K < 4 || metadata.K > 8 ||
         metadata.mcg || !metadata.mul1 || metadata.has_bias ||
         metadata.in_features != in_features_ || metadata.out_features != out_features_) return false;
     const bool target_shape =
@@ -11286,7 +12101,7 @@ bool Exl3CudaLinearWorkspace::target_wide_prefill_candidate(
     if (!target_shape) return false;
     if (specialized_shape_ && metadata.K == kK) return true;
     if (in_features_ == 17408 && out_features_ == 5120 && (metadata.K == 6 || metadata.K == 7)) {
-        const char* requested = std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+        const char* requested = std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
         const std::string topology = requested ? requested : "";
         // Preserve the exact production M1 16-tile split topology. Other
         // experimental topologies retain per-row execution in this first scope.
@@ -11296,7 +12111,7 @@ bool Exl3CudaLinearWorkspace::target_wide_prefill_candidate(
         return out_features_ / (16 * 16) <= large_down_candidate_capacity_[metadata.K == 6 ? 0 : 1];
     }
     return out_features_ % (32 * 16) == 0 && out_features_ / (32 * 16) <=
-        generic_capacity_[metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
+        generic_capacity_[metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
 }
 
 bool Exl3CudaLinearWorkspace::fast_wide_prefill_gemm_candidate(
@@ -11329,53 +12144,6 @@ bool Exl3CudaLinearWorkspace::fast_wide_prefill_gemm_candidate(
     return reconstructed_exact_.bytes == elements * sizeof(std::uint16_t);
 }
 
-bool Exl3CudaLinearWorkspace::native_mtp_wide_prefill_candidate(
-    const Exl3CudaLinearMetadata& metadata, int rows,
-    Exl3CudaLinearAdmission admission) const noexcept {
-    if (admission != Exl3CudaLinearAdmission::native_mtp_wide_prefill ||
-        rows <= 16 || rows > max_rows_ || metadata.K != 4 ||
-        metadata.mcg || !metadata.mul1 || metadata.has_bias ||
-        metadata.in_features != in_features_ ||
-        metadata.out_features != out_features_)
-        return false;
-
-    // These are the eight closed native-MTP EXL3 projection geometries.  The
-    // explicit list prevents an arbitrary K4 module from inheriting the MTP
-    // route, while the multiples document the <4,64,2> kernel contract.
-    const bool native_shape =
-        (in_features_ == 10240 && out_features_ == 5120) ||
-        (in_features_ == 5120 &&
-            (out_features_ == 12288 || out_features_ == 1024 ||
-             out_features_ == 17408)) ||
-        (in_features_ == 6144 && out_features_ == 5120) ||
-        (in_features_ == 17408 && out_features_ == 5120);
-    const bool direct_geometry =
-        in_features_ >= 16 && (in_features_ % 16) == 0 &&
-        out_features_ >= 16 * 64 && (out_features_ % (16 * 64)) == 0;
-    return native_shape && direct_geometry;
-}
-
-bool Exl3CudaLinearWorkspace::native_mtp_one_step_candidate(
-    const Exl3CudaLinearMetadata& metadata, int rows,
-    Exl3CudaLinearAdmission admission) const noexcept {
-    if (admission != Exl3CudaLinearAdmission::native_mtp_one_step || rows != 1 ||
-        rows > max_rows_ || metadata.K != 4 || metadata.mcg || !metadata.mul1 ||
-        metadata.has_bias || metadata.in_features != in_features_ ||
-        metadata.out_features != out_features_)
-        return false;
-    const bool native_shape =
-        (in_features_ == 10240 && out_features_ == 5120) ||
-        (in_features_ == 5120 &&
-            (out_features_ == 12288 || out_features_ == 1024 ||
-             out_features_ == 17408)) ||
-        (in_features_ == 6144 && out_features_ == 5120) ||
-        (in_features_ == 17408 && out_features_ == 5120);
-    const bool direct_geometry =
-        in_features_ >= 16 && (in_features_ % 16) == 0 &&
-        out_features_ >= 16 * 64 && (out_features_ % (16 * 64)) == 0;
-    return native_shape && direct_geometry;
-}
-
 bool Exl3CudaLinearWorkspace::extended_stream_reduction_candidate(
     const Exl3CudaLinearMetadata& metadata,int rows,Exl3CudaLinearAdmission admission) const noexcept {
     if(rows<1||rows>8||(metadata.K!=6&&metadata.K!=7))return false;
@@ -11383,7 +12151,7 @@ bool Exl3CudaLinearWorkspace::extended_stream_reduction_candidate(
         target_kv_small_m_candidate(metadata,rows,admission);
     if(!extended_stream_reduction_enabled_ && !kv)return false;
     if(in_features_==17408&&out_features_==5120){
-        const char* topology=std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+        const char* topology=std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
         if(topology&&std::strcmp(topology,"8")==0)return false;
         const bool ordinary=!topology||!*topology||std::strcmp(topology,"16")==0||
             (metadata.K==6&&std::strcmp(topology,"16-k6")==0)||
@@ -11497,10 +12265,6 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
             return split10_names[coherent_wide_k6_operation_];
         return names[coherent_wide_k6_operation_];
     }
-    if (native_mtp_one_step_candidate(metadata, rows, admission))
-        return "native_mtp_one_step_mma64";
-    if (native_mtp_wide_prefill_candidate(metadata, rows, admission))
-        return "native_mtp_wide_prefill_mma64";
     if (native_k6_critical_path_candidate(metadata, rows, admission)) {
         const int output_blocks = metadata.out_features / (16 * 32);
         if (metadata.K == 6 && rows == 1 &&
@@ -11619,7 +12383,7 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
         return "target_z_k6_small_m_mma_split";
     if (rows == 1 && in_features_ == 17408 && out_features_ == 5120 &&
         (metadata.K == 6 || metadata.K == 7)) {
-        const char* requested = std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+        const char* requested = std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
         const std::string topology =
             requested == nullptr ? std::string() : std::string(requested);
         if (topology.empty() || topology == "16" || topology == "8" ||
@@ -11673,19 +12437,49 @@ const char* Exl3CudaLinearWorkspace::dispatch_name(
 // Coherent packed producer (K6 down, K7 down/O, wide K6) with the selected
 // cp.async depth and CTA width. Every warp keeps 16 output columns and the
 // full split K range, so narrower CTAs only enlarge the grid.
-template <int Bits, int Stages, int Warps, int Per = 1>
+template <int Bits, int Stages, int Warps, int Per = 1, int MTiles = 1, bool Fp16Acc = false,
+          int TilesPerWarp = 1>
 static void launch_coherent_packed_variant(
     cudaStream_t stream, const std::uint16_t* transformed,
     const std::uint16_t* trellis, const std::int32_t* mul1, float* accum,
     int rows, int input_features, int output_features, int split_count,
-    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
-    constexpr int tiles = Warps;
+    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr,
+    int active_features = 0) {
+    constexpr int tiles = Warps * TilesPerWarp;
     constexpr int stage_count = (Stages ? Stages : 2) * Per;
-    const std::size_t shared =
-        static_cast<std::size_t>(stage_count) * 256u * sizeof(half) +
-        static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t) +
-        16u * tiles * 16u * sizeof(float);
-    const int grid = output_features / (16 * tiles) * split_count;
+    constexpr std::size_t ring_bytes =
+        static_cast<std::size_t>(stage_count) * 256u * MTiles * sizeof(half) +
+        static_cast<std::size_t>(stage_count) * tiles * 16u * Bits * sizeof(std::uint16_t);
+    constexpr std::size_t output_bytes = 16u * MTiles * tiles * 16u * sizeof(float);
+    // M32 aliases the output tile over the drained ring (the producer's
+    // alias_c_ring); the other variants keep it separate.
+    // M64 stages its output 32 rows at a time (two-pass store).
+    constexpr std::size_t staged_output_bytes = MTiles > 2 ? output_bytes / 2 : output_bytes;
+    const std::size_t shared = MTiles >= 2 && ring_bytes >= staged_output_bytes ? ring_bytes :
+        ring_bytes + staged_output_bytes;
+    // active_features (single K split only): launch the CTAs of the leading
+    // output columns; the packed trellis stride stays output_features.
+    const int grid = (active_features ? active_features : output_features) / (16 * tiles) *
+        split_count;
+    if constexpr (MTiles >= 2 || Fp16Acc || TilesPerWarp != 1) {
+        static_assert(Stages > 0, "M32/FP16-accumulate coherent producer requires deep stages");
+        if (raw_input) throw std::logic_error("M32/FP16-accumulate coherent producer reads transformed rows");
+        const auto kernel = exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
+            false, Bits == 6, Fp16Acc, false, false, Stages, Warps, Per, MTiles>;
+        if (shared > 48u * 1024u) {
+            static const bool configured = [shared, kernel] {
+                cuda_check(cudaFuncSetAttribute(kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
+                    "set M32 coherent shared memory");
+                return true;
+            }();
+            (void)configured;
+        }
+        exl3_launch_pdl(kernel, dim3(grid), dim3(Warps * 32), shared, stream,
+            transformed, trellis, mul1, accum, rows, input_features,
+            output_features, split_count);
+        return;
+    } else {
     if constexpr (Stages > 0) {
         if (raw_input) {
             const std::size_t fused_shared = exl3_fused_input_shared_bytes(
@@ -11720,13 +12514,13 @@ static void launch_coherent_packed_variant(
     }
     // The exact K6 lane-window and K7 three-word decoders (identical state
     // words and MUL1 arithmetic) are the measured default;
-    // NINFER_EXL3_COHERENT_FAST_DECODE=0 restores the generic decoder.
+    // VOIDINFER_EXL3_COHERENT_FAST_DECODE=0 restores the generic decoder.
     static const bool fast_decode = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_FAST_DECODE");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_FAST_DECODE");
         if (!value) return true;
         if (std::strcmp(value, "0") == 0) return false;
         if (std::strcmp(value, "1") == 0) return true;
-        throw std::invalid_argument("NINFER_EXL3_COHERENT_FAST_DECODE must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_FAST_DECODE must be 0 or 1");
     }();
     if (fast_decode) {
         exl3_launch_pdl(exl3_gemm_m1_generic_mma_kernel<Bits, false, tiles, true, true, Bits == 7,
@@ -11741,77 +12535,78 @@ static void launch_coherent_packed_variant(
         dim3(grid), dim3(Warps * 32), shared, stream,
             transformed, trellis, mul1, accum, rows, input_features,
             output_features, split_count);
+    }
 }
 
-// NINFER_EXL3_COHERENT_WARPS selects the CTA width: 4 warps (64 columns,
+// VOIDINFER_EXL3_COHERENT_WARPS selects the CTA width: 4 warps (64 columns,
 // measured default), 8 (the former 128-column CTA) or 2.
 int coherent_packed_warps() {
     static const int warps = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_WARPS");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_WARPS");
         if (!value || std::strcmp(value, "4") == 0) return 4;
         if (std::strcmp(value, "8") == 0) return 8;
         if (std::strcmp(value, "4") == 0) return 4;
         if (std::strcmp(value, "2") == 0) return 2;
-        throw std::invalid_argument("NINFER_EXL3_COHERENT_WARPS must be 8, 4 or 2");
+        throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_WARPS must be 8, 4 or 2");
     }();
     return warps;
 }
 
-// NINFER_EXL3_MERGED_GATE_UP (default 1; 0 = separate gate, up and SiLU
+// VOIDINFER_EXL3_MERGED_GATE_UP (default 1; 0 = separate gate, up and SiLU
 // launches): single-row MLP gate/up share one producer launch and one
 // reduction/activation kernel. Bit-identical outputs.
 static bool merged_gate_up_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_MERGED_GATE_UP");
+        const char* value = std::getenv("VOIDINFER_EXL3_MERGED_GATE_UP");
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_MERGED_GATE_UP must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_MERGED_GATE_UP must be 0 or 1");
     }();
     return enabled;
 }
 
-// NINFER_EXL3_COHERENT_FUSED_INPUT=R (default 1; 0 = separate input-Hadamard
+// VOIDINFER_EXL3_COHERENT_FUSED_INPUT=R (default 1; 0 = separate input-Hadamard
 // launches): coherent producers of 1..R rows compute the input Hadamard of
 // their split range in the CTA prologue. Every CTA of a split repeats that
 // transform, so wider verifier rows (measured) take one separate transform
 // launch instead. Bit-identical partials and outputs.
 static bool coherent_fused_input_for(int rows) {
     static const int max_rows = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_FUSED_INPUT");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_FUSED_INPUT");
         const int parsed = value ? std::atoi(value) : 1;
         if (parsed < 0 || parsed > 8)
-            throw std::invalid_argument("NINFER_EXL3_COHERENT_FUSED_INPUT must be 0..8");
+            throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_FUSED_INPUT must be 0..8");
         return parsed;
     }();
     return rows >= 1 && rows <= max_rows && coherent_deep_pipeline_stages() > 0;
 }
 
-// NINFER_EXL3_COHERENT_TILES_PER_STAGE: k-tiles per coherent cp.async stage.
+// VOIDINFER_EXL3_COHERENT_TILES_PER_STAGE: k-tiles per coherent cp.async stage.
 // Returns 0 when unset: two tiles per stage for every row count (eight tiles
 // in flight at four stages; measured fastest for M1 and M2..8 verifier rows
 // alike). The choice never changes numerics.
 int coherent_tiles_per_stage_setting() {
     static const int per = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_TILES_PER_STAGE");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_TILES_PER_STAGE");
         if (!value) return 0;
         if (std::strcmp(value, "4") == 0) return 4;
         if (std::strcmp(value, "1") == 0) return 1;
         if (std::strcmp(value, "2") == 0) return 2;
         throw std::invalid_argument(
-            "NINFER_EXL3_COHERENT_TILES_PER_STAGE must be 1, 2 or 4");
+            "VOIDINFER_EXL3_COHERENT_TILES_PER_STAGE must be 1, 2 or 4");
     }();
     return per;
 }
 
 // Small-grid M1 cooperative GEMVs use narrow CTAs by default (measured);
-// NINFER_EXL3_GENERIC_NARROW=0 restores the 512-column CTAs.
+// VOIDINFER_EXL3_GENERIC_NARROW=0 restores the 512-column CTAs.
 bool generic_narrow_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_GENERIC_NARROW");
+        const char* value = std::getenv("VOIDINFER_EXL3_GENERIC_NARROW");
         if (!value) return true;
         if (std::strcmp(value, "0") == 0) return false;
         if (std::strcmp(value, "1") == 0) return true;
-        throw std::invalid_argument("NINFER_EXL3_GENERIC_NARROW must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_GENERIC_NARROW must be 0 or 1");
     }();
     return enabled;
 }
@@ -11822,19 +12617,109 @@ static void launch_coherent_packed_partials(
     const std::uint16_t* transformed, const std::uint16_t* trellis,
     const std::int32_t* mul1, float* accum, int rows, int input_features,
     int output_features, int split_count,
-    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr) {
+    const std::uint16_t* raw_input = nullptr, const std::uint16_t* suh = nullptr,
+    int active_features = 0) {
     const int stages = coherent_deep_pipeline_stages();
+    if (active_features && (split_count != 1 || raw_input || active_features % 128 ||
+                            active_features > output_features))
+        throw std::logic_error("coherent producer active columns need one K split");
     const int warps = coherent_packed_warps();
     if (raw_input && (rows < 1 || rows > 8 || stages == 0))
         throw std::logic_error("fused-input coherent producer requires the deep route and 1..8 rows");
     const int per_setting = coherent_tiles_per_stage_setting();
+    // Batched rounds (more than 8 rows): VOIDINFER_EXL3_COHERENT_FP16_ACC=1 runs
+    // the MMAs with FP16 accumulation (twice the GeForce tensor rate; FP32
+    // folds after every stage group). Single-agent rounds keep FP32.
+    static const bool fp16_acc = [] {
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_FP16_ACC");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const bool batched_fp16 = fp16_acc && rows > 8 && !raw_input && stages == 4 && warps == 4 &&
+        (per_setting ? per_setting : 2) == 2;
+    // Batched rows (more than 8): 128-column CTAs re-read the A rows half
+    // as often (A traffic, not weights, bounds M16/M32; measured gate 49->35 us
+    // at M16, 72->52 us at M32). VOIDINFER_EXL3_COHERENT_BATCH_TPW = 1, 2 or 4.
+    static const int batch_tpw = [] {
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_BATCH_TPW");
+        return value ? std::atoi(value) : 2;
+    }();
+    static const int batch_min_rows = [] {
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_BATCH_TPW_MIN_ROWS");
+        return value ? std::atoi(value) : 9;
+    }();
+    if (rows >= batch_min_rows && (batch_tpw == 2 || batch_tpw == 4) && !raw_input && stages == 4 &&
+        warps == 4 && (per_setting ? per_setting : 2) == 2 && output_features % (64 * batch_tpw) == 0) {
+        // 33..64 rows (batched rounds of 5-8 agents): M64, four M16 A tiles.
+        if (rows > 4 * kBatchedRows)
+            throw std::logic_error("coherent batched producer takes at most 64 rows");
+        if (batch_tpw == 4) {
+            if (rows > 2 * kBatchedRows)
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 4, false, 4>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else if (rows > kBatchedRows)
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 4>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 4>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+        } else if (rows > 2 * kBatchedRows) {
+            // VOIDINFER_EXL3_M64_STAGES (3 or 4): the deep ring depth of the M64 producer.
+            static const int m64_stages = [] {
+                const char* value = std::getenv("VOIDINFER_EXL3_M64_STAGES");
+                return value && std::atoi(value) == 4 ? 4 : 3;
+            }();
+            // FP16 MMA accumulation (FP32 folds after every stage group): the
+            // M64 producer is tensor-bound; C8 sampled 51.8 -> 49.5 ms/round,
+            // VeriCache corrections not higher. VOIDINFER_EXL3_M64_FP16_ACC=0: FP32.
+            static const bool m64_fp16 = [] {
+                const char* value = std::getenv("VOIDINFER_EXL3_M64_FP16_ACC");
+                return !value || std::strcmp(value, "0") != 0;
+            }();
+            if (m64_fp16 && exl3_batched_round_numerics())
+                launch_coherent_packed_variant<Bits, 3, 4, 2, 4, true, 2>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else if (m64_stages == 4)
+                launch_coherent_packed_variant<Bits, 4, 4, 2, 4, false, 2>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+            else
+                launch_coherent_packed_variant<Bits, 3, 4, 2, 4, false, 2>(stream, transformed, trellis, mul1, accum,
+                    rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+        }
+        else if (rows > kBatchedRows)
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 2, false, 2>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+        else
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 1, false, 2>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count, nullptr, nullptr, active_features);
+        return;
+    }
+    if (active_features)
+        throw std::logic_error("coherent producer active columns need the 128-column batched route");
+    if (rows > kBatchedRows) {
+        // Batched rounds of 3-4 agents: the measured default topology only.
+        if (rows > 2 * kBatchedRows || stages != 4 || warps != 4 ||
+            (per_setting ? per_setting : 2) != 2)
+            throw std::logic_error("M32 coherent producer requires 17..32 rows and the default topology");
+        if (batched_fp16)
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 2, true>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count);
+        else
+            launch_coherent_packed_variant<Bits, 4, 4, 2, 2>(stream, transformed, trellis, mul1, accum,
+                rows, input_features, output_features, split_count);
+        return;
+    }
+    if (batched_fp16) {
+        launch_coherent_packed_variant<Bits, 4, 4, 2, 1, true>(stream, transformed, trellis, mul1, accum,
+            rows, input_features, output_features, split_count);
+        return;
+    }
     if (const int per = per_setting ? per_setting : 2; per != 1) {
-#define NINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count, raw_input, suh);                                              return;                                                                    }
-        NINFER_COHERENT_MULTI(4, 4, 2) NINFER_COHERENT_MULTI(4, 4, 4)
-        NINFER_COHERENT_MULTI(8, 4, 2) NINFER_COHERENT_MULTI(8, 4, 4)
-        NINFER_COHERENT_MULTI(4, 2, 2) NINFER_COHERENT_MULTI(4, 2, 4)
-        NINFER_COHERENT_MULTI(8, 2, 2) NINFER_COHERENT_MULTI(8, 2, 4)
-#undef NINFER_COHERENT_MULTI
+#define VOIDINFER_COHERENT_MULTI(S, W, P)                                                 if (stages == S && warps == W && per == P) {                                       launch_coherent_packed_variant<Bits, S, W, P>(stream, transformed,                 trellis, mul1, accum, rows, input_features, output_features,                   split_count, raw_input, suh);                                              return;                                                                    }
+        VOIDINFER_COHERENT_MULTI(4, 4, 2) VOIDINFER_COHERENT_MULTI(4, 4, 4)
+        VOIDINFER_COHERENT_MULTI(8, 4, 2) VOIDINFER_COHERENT_MULTI(8, 4, 4)
+        VOIDINFER_COHERENT_MULTI(4, 2, 2) VOIDINFER_COHERENT_MULTI(4, 2, 4)
+        VOIDINFER_COHERENT_MULTI(8, 2, 2) VOIDINFER_COHERENT_MULTI(8, 2, 4)
+#undef VOIDINFER_COHERENT_MULTI
         throw std::invalid_argument("unsupported coherent multi-tile variant");
     }
     if (warps == 8 && stages == 0) {
@@ -11844,30 +12729,30 @@ static void launch_coherent_packed_partials(
                 output_features, split_count);
         return;
     }
-#define NINFER_COHERENT_VARIANT(S, W)                                          \
+#define VOIDINFER_COHERENT_VARIANT(S, W)                                          \
     if (stages == S && warps == W) {                                           \
         launch_coherent_packed_variant<Bits, S, W>(stream, transformed,        \
             trellis, mul1, accum, rows, input_features, output_features,       \
             split_count);                                                      \
         return;                                                                \
     }
-    NINFER_COHERENT_VARIANT(4, 8) NINFER_COHERENT_VARIANT(8, 8)
-    NINFER_COHERENT_VARIANT(0, 4) NINFER_COHERENT_VARIANT(4, 4)
-    NINFER_COHERENT_VARIANT(8, 4) NINFER_COHERENT_VARIANT(0, 2)
-    NINFER_COHERENT_VARIANT(4, 2) NINFER_COHERENT_VARIANT(8, 2)
-#undef NINFER_COHERENT_VARIANT
+    VOIDINFER_COHERENT_VARIANT(4, 8) VOIDINFER_COHERENT_VARIANT(8, 8)
+    VOIDINFER_COHERENT_VARIANT(0, 4) VOIDINFER_COHERENT_VARIANT(4, 4)
+    VOIDINFER_COHERENT_VARIANT(8, 4) VOIDINFER_COHERENT_VARIANT(0, 2)
+    VOIDINFER_COHERENT_VARIANT(4, 2) VOIDINFER_COHERENT_VARIANT(8, 2)
+#undef VOIDINFER_COHERENT_VARIANT
     throw std::logic_error("unsupported coherent packed producer variant");
 }
 
-// NINFER_EXL3_COHERENT_KV_SPLIT=S (default 20, quality-gated; 0 = generic GEMV): the narrow 5120->1024
+// VOIDINFER_EXL3_COHERENT_KV_SPLIT=S (default 20, quality-gated; 0 = generic GEMV): the narrow 5120->1024
 // K/V projections (K6..K8) run as the coherent split-plane producer with S
 // K partitions instead of the 160-CTA generic GEMV. Numerics-policy candidate.
 static int coherent_kv_split_setting() {
     static const int split = [] {
-        const char* value = std::getenv("NINFER_EXL3_COHERENT_KV_SPLIT");
+        const char* value = std::getenv("VOIDINFER_EXL3_COHERENT_KV_SPLIT");
         const int parsed = value ? std::atoi(value) : 20;
         if (parsed < 0 || parsed > 80)
-            throw std::invalid_argument("NINFER_EXL3_COHERENT_KV_SPLIT must be 0..80");
+            throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_KV_SPLIT must be 0..80");
         return parsed;
     }();
     return split;
@@ -11875,17 +12760,34 @@ static int coherent_kv_split_setting() {
 
 static int coherent_kv_split_for(const Exl3CudaLinearMetadata& metadata, int rows,
     Exl3CudaLinearAdmission admission, int in_features, int out_features,
-    std::size_t capacity) {
+    std::size_t capacity, int max_rows) {
     const int split = coherent_kv_split_setting();
-    if (!split || rows < 1 || rows > 8 || in_features != 5120 || out_features != 1024 ||
+    if (!split || rows < 1 || rows > 4 * kBatchedRows || rows > max_rows ||
+        (rows > kBatchedRows && admission != Exl3CudaLinearAdmission::target_continuation_kv) ||
+        in_features != 5120 || out_features != 1024 ||
         metadata.in_features != in_features || metadata.out_features != out_features ||
-        metadata.K < 6 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
+        metadata.K < 4 || metadata.K > 8 || metadata.mcg || !metadata.mul1 ||
         metadata.has_bias ||
         (admission != Exl3CudaLinearAdmission::ordinary &&
          admission != Exl3CudaLinearAdmission::target_continuation_kv))
         return 0;
-    const auto required = static_cast<std::size_t>(rows) * out_features * split * sizeof(float);
+    // Sized by the workspace's row capacity so the route and split never
+    // depend on how many rows share a launch (batched multi-agent rounds).
+    const auto required = static_cast<std::size_t>(rows > kBatchedRows ? rows :
+        std::min(max_rows, kBatchedRows)) * out_features * split * sizeof(float);
     return capacity >= required ? split : 0;
+}
+
+bool Exl3CudaLinearWorkspace::coherent_continuation_candidate(
+    const Exl3CudaLinearMetadata& metadata, int rows,
+    Exl3CudaLinearAdmission admission) const noexcept {
+    if (rows < 2 || admission == Exl3CudaLinearAdmission::ordinary) return false;
+    return coherent_kv_split_for(metadata, rows, admission, in_features_, out_features_,
+               accumulation_capacity_bytes_, max_rows_) != 0 ||
+        coherent_down_k6_candidate(metadata, rows, admission) ||
+        coherent_down_k7_candidate(metadata, rows, admission) ||
+        coherent_o_k7_candidate(metadata, rows, admission) ||
+        coherent_wide_k6_candidate(metadata, rows, admission);
 }
 
 void Exl3CudaLinearWorkspace::forward_from_transformed(
@@ -11929,9 +12831,51 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     Exl3LinearWorkspaceRequirements::derive(in_features_,out_features_,rows,true,true)
         .require_disjoint_borrowed_views(transformed_input,accum_);
 
+    if ((draft_batched_enabled_ || coherent_batched_rows(metadata, rows)) &&
+        out_features_ % 128 == 0 && metadata.K >= 4 && metadata.K <= 7) {
+        // The K split fills the resident slots within the workspace's
+        // accumulation planes (coherent_m32_split; the vocabulary head keeps
+        // one). 2-agent drafts (16 rows): 2.9 -> 2.75 ms per round; a lone
+        // 8-row draft: 1.845 -> 1.775 ms (down/o went from 400 to 680 CTAs).
+        const std::size_t plane = static_cast<std::size_t>(rows) * out_features_ * sizeof(float);
+        const int split = coherent_m32_split(rows);
+        if (accumulation_capacity_bytes_ < plane * static_cast<std::size_t>(split))
+            throw std::logic_error("batched draft accumulation capacity");
+        // A single-split head computes only its active leading columns (the
+        // draft's vocabulary prefix); the reduction still covers every column.
+        const int active = split == 1 && active_output_features_ > 0 &&
+            active_output_features_ < out_features_ && active_output_features_ % 128 == 0 ?
+            active_output_features_ : 0;
+        if (metadata.K == 4) launch_coherent_packed_partials<4>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
+        else if (metadata.K == 5) launch_coherent_packed_partials<5>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
+        else if (metadata.K == 6) launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
+        else launch_coherent_packed_partials<7>(0, 0, stream, transformed_input,
+            weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, split,
+            nullptr, nullptr, active);
+        cuda_check(cudaGetLastError(), "launch batched draft coherent partials");
+        launch_prefill_reduce_output<false>(stream, accum_, weights.svh, output, rows,
+            out_features_, split);
+        cuda_check(cudaGetLastError(), "launch batched draft reduction/output");
+        return;
+    }
+
     if (const int kv_split = coherent_kv_split_for(metadata, rows, admission,
-            in_features_, out_features_, accumulation_capacity_bytes_)) {
-        if (metadata.K == 6)
+            in_features_, out_features_, accumulation_capacity_bytes_, max_rows_)) {
+        if (metadata.K == 4)
+            launch_coherent_packed_partials<4>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        else if (metadata.K == 5)
+            launch_coherent_packed_partials<5>(0, 0, stream, transformed_input,
+                weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
+                raw_input, fused_suh);
+        else if (metadata.K == 6)
             launch_coherent_packed_partials<6>(0, 0, stream, transformed_input,
                 weights.trellis, weights.mul1, accum_, rows, in_features_, out_features_, kv_split,
                 raw_input, fused_suh);
@@ -11952,11 +12896,15 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
 
     if (coherent_down_k6_candidate(metadata, rows, admission)) {
         constexpr int output_blocks = 5120 / 128;
-        const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
+        const int split_count = coherent_split_override("VOIDINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
         // One packed-MMA producer instantiation serves M1 and M2..8. Each
         // K/N tile's B decode is reused across active independent row C
         // fragments; inactive physical M16 rows are zero and never stored.
-        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+        if (metadata.K == 4) launch_coherent_packed_partials<4>(
+            output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else if (metadata.K == 5) launch_coherent_packed_partials<5>(
             output_blocks * split_count, kCoherentDownK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
@@ -11980,7 +12928,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
 
     if (coherent_down_k7_candidate(metadata, rows, admission)) {
         constexpr int output_blocks = 5120 / 128;
-        const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
+        const int split_count = coherent_split_override("VOIDINFER_EXL3_COHERENT_DOWN_SPLIT", rows);
         launch_coherent_packed_partials<7>(
             output_blocks * split_count, kCoherentDownK7SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
@@ -12001,7 +12949,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
 
     if (coherent_o_k7_candidate(metadata, rows, admission)) {
         constexpr int output_blocks = 5120 / 128;
-        const int split_count = coherent_split_override("NINFER_EXL3_COHERENT_O_SPLIT", rows);
+        const int split_count = coherent_split_override("VOIDINFER_EXL3_COHERENT_O_SPLIT", rows);
         launch_coherent_packed_partials<7>(
             output_blocks * split_count, kCoherentOK7SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
@@ -12023,7 +12971,11 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if (coherent_wide_k6_candidate(metadata, rows, admission)) {
         const int output_blocks = out_features_ / kHadamard;
         const int split_count = coherent_wide_k6_split_count(rows);
-        if (metadata.K == 5) launch_coherent_packed_partials<5>(
+        if (metadata.K == 4) launch_coherent_packed_partials<4>(
+            output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
+            transformed_input, weights.trellis, weights.mul1, accum_,
+            rows, in_features_, out_features_, split_count, raw_input, fused_suh);
+        else if (metadata.K == 5) launch_coherent_packed_partials<5>(
             output_blocks * split_count, kCoherentWideK6SharedBytes, stream,
             transformed_input, weights.trellis, weights.mul1, accum_,
             rows, in_features_, out_features_, split_count, raw_input, fused_suh);
@@ -12072,7 +13024,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         const int capacity=fast_same_weights_fp16_m1_capacity_[
             metadata.K==7?2:(down?1:0)];
         int split_count=std::min(5,capacity/output_blocks);
-        if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if(const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
            requested && *requested)
             split_count=std::min(split_count,std::max(1,std::atoi(requested)));
         if(split_count<1)throw std::runtime_error(
@@ -12348,55 +13300,6 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         return;
     }
 
-    if (native_mtp_one_step_candidate(metadata, rows, admission)) {
-        // The one-row bridge uses the same qualified K4 N64 body as the
-        // closed wide-MTP route.  Keeping this admission separate prevents a
-        // one-row caller from widening ordinary K4 dispatch.
-        constexpr int output_tiles_per_block = 64;
-        constexpr int split_count = 5;
-        const int blocks = out_features_ / (16 * output_tiles_per_block);
-        constexpr std::size_t shared_bytes =
-            512u * sizeof(half) +
-            2u * output_tiles_per_block * 16u * 4u * sizeof(std::uint16_t);
-        exl3_prefill_direct_async_a_kernel<4, output_tiles_per_block, 2><<<
-            dim3(blocks * split_count, 1), kThreads, shared_bytes, stream>>>(
-            transformed_input, weights.trellis, weights.mul1, accum_,
-            rows, in_features_, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP one-step K4 N64 async-A");
-        launch_prefill_reduce_output<false>(stream,
-            accum_, weights.svh, output, rows, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP one-step K4 reduction/output");
-        return;
-    }
-
-    if (native_mtp_wide_prefill_candidate(metadata, rows, admission)) {
-        // Native MTP owns this K4 route explicitly.  Keep the exact qualified
-        // N64 async-A body from the discriminator and reduce its five split
-        // planes in ascending order before the unchanged output Hadamard.
-        constexpr int output_tiles_per_block = 64;
-        constexpr int split_count = 5;
-        const int blocks = out_features_ / (16 * output_tiles_per_block);
-        constexpr std::size_t shared_bytes =
-            512u * sizeof(half) +
-            2u * output_tiles_per_block * 16u * 4u * sizeof(std::uint16_t);
-        exl3_prefill_direct_async_a_kernel<4, output_tiles_per_block, 2><<<
-            dim3(blocks * split_count, (rows + 15) / 16), kThreads,
-            shared_bytes, stream>>>(
-                transformed_input, weights.trellis, weights.mul1, accum_,
-                rows, in_features_, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP K4 N64 async-A prefill");
-        // prefill_reduce_output_kernel's non-shuffle path visits split planes
-        // 0,1,...,4, preserving the qualified ascending reduction order.
-        launch_prefill_reduce_output<false>(stream,
-                accum_, weights.svh, output, rows, out_features_, split_count);
-        cuda_check(cudaGetLastError(),
-                   "launch native MTP K4 N64 reduction/output");
-        return;
-    }
-
     if (fast_native_mia_m1_fp16_candidate(metadata, rows, admission)) {
         const bool k6_gate = metadata.K == 6 && in_features_ == 5120 &&
             out_features_ == 17408;
@@ -12511,7 +13414,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             int global_split_count =
                 std::min(32, native_k6_global_slices_capacity_ / output_blocks);
             if (const char* requested = std::getenv(
-                    "NINFER_EXL3_GLOBAL_SLICE_SPLITS");
+                    "VOIDINFER_EXL3_GLOBAL_SLICE_SPLITS");
                 requested && *requested) {
                 global_split_count = std::min(
                     global_split_count, std::max(1, std::atoi(requested)));
@@ -12581,7 +13484,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                                       : native_k6_critical_path_capacity_);
         int split_count = std::min(
             5, capacity / output_blocks);
-        if (const char* requested = std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if (const char* requested = std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
             requested && *requested) {
             split_count = std::min(split_count,
                                    std::max(1, std::atoi(requested)));
@@ -12698,7 +13601,9 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         const int tiles = down ? 16 : (direct_tiles64 ? 64 : 32);
         const int blocks = out_features_ / (16 * tiles);
         const int capacity = down ? large_down_candidate_capacity_[metadata.K == 6 ? 0 : 1]
-            : generic_capacity_[metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
+            : generic_capacity_[metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2)];
+        if (metadata.K < 4 || metadata.K > 8)
+            throw std::invalid_argument("staged prefill bit width");
         // Pairing adjacent output blocks changes only CTA ownership. Select
         // splits from the established N32 control so every group retains the
         // identical K ranges and ordered partial reduction.
@@ -12706,7 +13611,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             (k7_tiles64_exact_splits || k6_gateup_n32_pair_cta)
             ? out_features_ / (16 * 32) : blocks;
         int splits = std::min(5, capacity / split_blocks);
-        const char* requested = std::getenv(down ? "NINFER_EXL3_LARGE_DOWN_SPLITS" : "NINFER_EXL3_GENERIC_SPLITS");
+        const char* requested = std::getenv(down ? "VOIDINFER_EXL3_LARGE_DOWN_SPLITS" : "VOIDINFER_EXL3_GENERIC_SPLITS");
         if (requested && *requested) splits = std::min(splits, std::max(1, std::atoi(requested)));
         const std::size_t shared_bytes = 256u * sizeof(half) +
             2u * tiles * 16u * metadata.K * sizeof(std::uint16_t) + 16u * tiles * 16u * sizeof(float);
@@ -12733,6 +13638,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         else if (down && metadata.K == 6) exl3_prefill_direct_partials_kernel<6,16><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (down && target_direct_async_all_) exl3_prefill_direct_async_a_kernel<7,16><<<grid,kThreads,async_shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (down) exl3_prefill_direct_partials_kernel<7,16><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
+        else if (metadata.K == 4) exl3_prefill_direct_partials_kernel<4><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 5) exl3_prefill_direct_partials_kernel<5><<<grid,kThreads,shared_bytes-16u*tiles*16u*sizeof(float),stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (k6_gateup_n32_pair_cta) {
             exl3_prefill_k6_gateup_n32_pair_cta_kernel<<<
@@ -12790,6 +13696,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         } else {
         if (down && metadata.K == 6) exl3_prefill_partials_kernel<6,16><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (down) exl3_prefill_partials_kernel<7,16><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
+        else if (metadata.K == 4) exl3_prefill_partials_kernel<4><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 5) exl3_prefill_partials_kernel<5><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 6) exl3_prefill_partials_kernel<6><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
         else if (metadata.K == 7) exl3_prefill_partials_kernel<7><<<grid,kThreads,shared_bytes,stream>>>(transformed_input,weights.trellis,weights.mul1,accum_,rows,in_features_,out_features_,splits);
@@ -12843,7 +13750,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 ? fast_same_weights_fp16_m1_n16_capacity_[1]
                 : fast_same_weights_fp16_m1_n16_capacity_[0];
         int split_count = std::min(5, capacity / output_blocks);
-        if (const char* requested = std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if (const char* requested = std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
             requested && *requested)
             split_count = std::min(split_count, std::max(1, std::atoi(requested)));
         if (split_count < 1)
@@ -12896,7 +13803,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         const int capacity =
             fast_same_weights_fp16_m1_n64_capacity_[metadata.K - 5];
         int split_count = std::min(5, capacity / output_blocks);
-        if (const char* requested = std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if (const char* requested = std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
             requested && *requested)
             split_count = std::min(split_count, std::max(1, std::atoi(requested)));
         const std::size_t shared_bytes =
@@ -12956,7 +13863,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         const int tiles=fast_same_weights_fp16_m1_wide_n32_enabled_ ? 32 : 16;
         const int output_blocks=out_features_/(16*tiles);
         int split_count=5;
-        if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if(const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
            requested && *requested)
             split_count=std::min(split_count,std::max(1,std::atoi(requested)));
         const std::size_t raw_stage_half=static_cast<std::size_t>(tiles)*16u*
@@ -13040,7 +13947,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             ? fast_same_weights_fp16_m1_k6_register_pipeline_capacity_
             : capacity;
         int split_count = std::min(5, launch_capacity / output_blocks);
-        if (const char* requested = std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if (const char* requested = std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
             requested && *requested)
             split_count = std::min(split_count, std::max(1, std::atoi(requested)));
         const std::size_t shared_bytes = use_k6_register_pipeline
@@ -13089,7 +13996,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
     if(target_k6_m1_simt_candidate(metadata,rows,admission)) {
         const int mma_blocks=out_features_/(32*16);
         int split_count=std::min(5,generic_capacity_[1]/mma_blocks);
-        if(const char* requested=std::getenv("NINFER_EXL3_GENERIC_SPLITS");
+        if(const char* requested=std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS");
            requested && *requested)
             split_count=std::min(split_count,std::max(1,std::atoi(requested)));
         const int simt_blocks=out_features_/256;
@@ -13128,13 +14035,13 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         void* kernel_args[] = {&transformed, &trellis, &mul1, &accum, &row_count};
         // Default: the same K5 five-split partition and fixed-order in-kernel
         // reduction through the narrow async-deep generic producer (64-column
-        // CTAs; measured). NINFER_EXL3_SHAPE4_NARROW=0 keeps the shape-4 leaf.
+        // CTAs; measured). VOIDINFER_EXL3_SHAPE4_NARROW=0 keeps the shape-4 leaf.
         static const bool shape4_narrow = [] {
-            const char* value = std::getenv("NINFER_EXL3_SHAPE4_NARROW");
+            const char* value = std::getenv("VOIDINFER_EXL3_SHAPE4_NARROW");
             if (!value) return true;
             if (std::strcmp(value, "0") == 0) return false;
             if (std::strcmp(value, "1") == 0) return true;
-            throw std::invalid_argument("NINFER_EXL3_SHAPE4_NARROW must be 0 or 1");
+            throw std::invalid_argument("VOIDINFER_EXL3_SHAPE4_NARROW must be 0 or 1");
         }();
         if (shape4_narrow) {
             constexpr int warps = 4, stages = 4;
@@ -13162,7 +14069,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                    "launch EXL3 cooperative split GEMV");
     } else if ((rows == 1 && in_features_ == 17408 && out_features_ == 5120 &&
                  (metadata.K == 6 || metadata.K == 7) && [&]() {
-                   const char* requested = std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+                   const char* requested = std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
                    // The corrected 16-tile topology is the production default
                    // for this exact family. "32"/"off" retain an explicit
                    // inherited-topology control for differential benchmarks;
@@ -13176,7 +14083,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                target_m1_k6_n16_candidate(metadata, rows, admission) ||
                (target_wide_prefill_candidate(metadata, rows, admission) &&
                 in_features_ == 17408 && out_features_ == 5120 && (metadata.K == 6 || metadata.K == 7))) {
-        const char* requested = std::getenv("NINFER_EXL3_LARGE_DOWN_TOPOLOGY");
+        const char* requested = std::getenv("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY");
         const bool requested_gateup_k6_n16 =
             target_gateup_k6_n16_candidate(metadata, rows, admission);
         const bool target_m1_k6_n16 =
@@ -13213,7 +14120,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         }
         int split_count = std::min(5, candidate_capacity / output_blocks);
         const char* split_environment = target_gateup_k6_n16 || target_m1_k6_n16
-            ? "NINFER_EXL3_GENERIC_SPLITS" : "NINFER_EXL3_LARGE_DOWN_SPLITS";
+            ? "VOIDINFER_EXL3_GENERIC_SPLITS" : "VOIDINFER_EXL3_LARGE_DOWN_SPLITS";
         if (const char* requested = std::getenv(split_environment);
             requested != nullptr && *requested != '\0') {
             split_count = std::min(split_count, std::max(1, std::atoi(requested)));
@@ -13350,13 +14257,13 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         // Default: 64-column 4-warp CTAs with async-A, the 4x4 cp.async ring
         // and the exact K6 lane-window decoder (measured). Each warp still
         // accumulates its 16 columns over the whole K in order.
-        // NINFER_EXL3_H6_NARROW=0 restores the 512-column launch.
+        // VOIDINFER_EXL3_H6_NARROW=0 restores the 512-column launch.
         static const bool h6_narrow = [] {
-            const char* value = std::getenv("NINFER_EXL3_H6_NARROW");
+            const char* value = std::getenv("VOIDINFER_EXL3_H6_NARROW");
             if (!value) return true;
             if (std::strcmp(value, "0") == 0) return false;
             if (std::strcmp(value, "1") == 0) return true;
-            throw std::invalid_argument("NINFER_EXL3_H6_NARROW must be 0 or 1");
+            throw std::invalid_argument("VOIDINFER_EXL3_H6_NARROW must be 0 or 1");
         }();
         if (h6_narrow) {
             constexpr int warps = 4, stages = 4, per = 4;
@@ -13379,7 +14286,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                        shared_bytes, stream),
                    "launch EXL3 H6 single-split GEMV");
         }
-    } else if (metadata.K >= 5 &&
+    } else if (metadata.K >= 4 &&
                (rows == 1 || draft_small_m_candidate(metadata, rows) ||
                  draft_shared_m16_candidate(metadata,rows,admission) ||
                  draft_prefill_fc_candidate(metadata, rows, admission) ||
@@ -13394,10 +14301,10 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                 target_wide_prefill_candidate(metadata, rows, admission)) &&
                out_features_ % (32 * 16) == 0 &&
                (out_features_ / (32 * 16)) <=
-                   generic_capacity_[metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2)]) {
+                   generic_capacity_[metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2)]) {
         const int tiles_n = out_features_ / 16;
         const int output_blocks = tiles_n / 32;
-        const int capacity_index = metadata.K == 5 ? 0 : (metadata.K == 6 ? 1 : 2);
+        const int capacity_index = metadata.K <= 5 ? 0 : (metadata.K == 6 ? 1 : 2);
         const bool target_gateup_k6_async_a =
             metadata.K == 6 && target_gateup_k6_async_a_enabled_ &&
             target_gateup_small_m_candidate(metadata, rows, admission);
@@ -13428,7 +14335,7 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             throw std::runtime_error("EXL3 generic cooperative kernel exceeds launch capacity");
         }
         int split_count = std::min(5, capacity / output_blocks);
-        if (const char* requested = std::getenv("NINFER_EXL3_GENERIC_SPLITS"); requested && *requested) {
+        if (const char* requested = std::getenv("VOIDINFER_EXL3_GENERIC_SPLITS"); requested && *requested) {
             split_count = std::min(split_count, std::max(1, std::atoi(requested)));
         }
         const std::size_t shared_bytes =
@@ -13514,25 +14421,25 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
             const bool k7_three = metadata.K == 7 && target_m1_k7_three_word;
 // Narrow variants also stage A with cp.async and keep three packed tiles in
 // flight; A values and the MMA sequence are unchanged.
-#define NINFER_NARROW(B, A, T, W)                                             \
+#define VOIDINFER_NARROW(B, A, T, W)                                             \
     reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<B, false, W, true,  \
         false, T, false, false, false, false, false, 4, W>)
             if (metadata.K == 5 && !draft_k5_async_a)
-                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(5, false, false, 2)
-                                                  : NINFER_NARROW(5, false, false, 4);
+                narrow_kernel = narrow_warps == 2 ? VOIDINFER_NARROW(5, false, false, 2)
+                                                  : VOIDINFER_NARROW(5, false, false, 4);
             else if (metadata.K == 8)
-                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(8, false, false, 2)
-                                                  : NINFER_NARROW(8, false, false, 4);
+                narrow_kernel = narrow_warps == 2 ? VOIDINFER_NARROW(8, false, false, 2)
+                                                  : VOIDINFER_NARROW(8, false, false, 4);
             else if (metadata.K == 7 && k7_async && k7_three)
-                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, true, true, 2)
-                                                  : NINFER_NARROW(7, true, true, 4);
+                narrow_kernel = narrow_warps == 2 ? VOIDINFER_NARROW(7, true, true, 2)
+                                                  : VOIDINFER_NARROW(7, true, true, 4);
             else if (metadata.K == 7 && !k7_async && k7_three)
-                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, false, true, 2)
-                                                  : NINFER_NARROW(7, false, true, 4);
+                narrow_kernel = narrow_warps == 2 ? VOIDINFER_NARROW(7, false, true, 2)
+                                                  : VOIDINFER_NARROW(7, false, true, 4);
             else if (metadata.K == 7 && !k7_async && !k7_three)
-                narrow_kernel = narrow_warps == 2 ? NINFER_NARROW(7, false, false, 2)
-                                                  : NINFER_NARROW(7, false, false, 4);
-#undef NINFER_NARROW
+                narrow_kernel = narrow_warps == 2 ? VOIDINFER_NARROW(7, false, false, 2)
+                                                  : VOIDINFER_NARROW(7, false, false, 4);
+#undef VOIDINFER_NARROW
         }
         if (narrow_kernel) {
             const std::size_t narrow_shared =
@@ -13572,6 +14479,12 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            dim3(grid_blocks), dim3(kThreads), kernel_args,
                            shared_bytes, stream),
                        "launch EXL3 draft K5 async-A cooperative split GEMV");
+        } else if (metadata.K == 4) {
+            cuda_check(cudaLaunchCooperativeKernel(
+                           reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<4>),
+                           dim3(grid_blocks), dim3(kThreads), kernel_args,
+                           shared_bytes, stream),
+                       "launch EXL3 K4 cooperative split GEMV");
         } else if (metadata.K == 5) {
             cuda_check(cudaLaunchCooperativeKernel(
                            reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<5>),
@@ -13602,6 +14515,8 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
                            shared_bytes, stream),
                        "launch EXL3 K7 cooperative split GEMV");
         } else {
+            if (metadata.K != 8)
+                throw std::invalid_argument("EXL3 cooperative split GEMV bit width");
             cuda_check(cudaLaunchCooperativeKernel(
                            reinterpret_cast<void*>(exl3_gemm_m1_generic_mma_kernel<8>),
                            dim3(grid_blocks), dim3(kThreads), kernel_args,
@@ -13610,11 +14525,23 @@ void Exl3CudaLinearWorkspace::forward_from_transformed(
         }
     } else if (rows <= 16) {
         const int tiles_n = out_features_ / 16;
+        {
+            // Scalar fallback: reported once per shape (route coverage gaps).
+            static std::mutex reported_mutex;
+            static std::set<std::uint64_t> reported;
+            const std::uint64_t key = (static_cast<std::uint64_t>(metadata.K) << 56) ^
+                (static_cast<std::uint64_t>(in_features_) << 32) ^
+                (static_cast<std::uint64_t>(out_features_) << 8) ^ static_cast<std::uint64_t>(rows);
+            const std::lock_guard lock(reported_mutex);
+            if (reported.insert(key).second)
+                std::fprintf(stderr, "EXL3_SCALAR_FALLBACK K=%d in=%d out=%d rows=%d admission=%d\n",
+                             metadata.K, in_features_, out_features_, rows, static_cast<int>(admission));
+        }
         exl3_generic_tile_kernel<<<dim3(tiles_n, rows), dim3(kThreads), 0, stream>>>(
             transformed_input, weights.trellis, weights.mul1, accum_, rows,
             in_features_, out_features_, metadata.K);
     } else {
-        throw std::invalid_argument("EXL3 CUDA supports at most 16 rows");
+        throw std::invalid_argument("EXL3 CUDA supports at most 16 rows (K="+std::to_string(metadata.K)+" in="+std::to_string(in_features_)+" out="+std::to_string(out_features_)+" rows="+std::to_string(rows)+" admission="+std::to_string(static_cast<int>(admission))+")");
     }
 
     cuda_check(cudaGetLastError(), "launch EXL3 packed GEMV");
@@ -13681,7 +14608,8 @@ struct Exl3PrefetchStreams {
     bool pending=false;
 };
 Exl3PrefetchStreams& exl3_prefetch_streams() {
-    static Exl3PrefetchStreams streams=[] {
+    // Per thread: concurrent Engine lanes enqueue from their own threads.
+    static thread_local Exl3PrefetchStreams streams=[] {
         Exl3PrefetchStreams value;
         cuda_check(cudaStreamCreateWithFlags(&value.side,cudaStreamNonBlocking),"prefetch stream");
         cuda_check(cudaEventCreateWithFlags(&value.fork,cudaEventDisableTiming),"prefetch fork");
@@ -13694,7 +14622,7 @@ Exl3PrefetchStreams& exl3_prefetch_streams() {
 
 bool exl3_l2_prefetch_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_EXL3_L2_PREFETCH");
+        const char* value=std::getenv("VOIDINFER_EXL3_L2_PREFETCH");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
@@ -13718,4 +14646,4 @@ void exl3_l2_prefetch_join(cudaStream_t stream) {
     streams.pending=false;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

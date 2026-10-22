@@ -27,7 +27,7 @@ void run_numeric_attention_splitk_route_t71b(
     const std::vector<std::int64_t>& prose) {
     require(target.max_context()==4352&&code.size()>=4096&&prose.size()>=4096,
         "T71B route fixture/context extent");
-    const std::filesystem::path directory=env("NINFER_T71B_OUT");
+    const std::filesystem::path directory=env("VOIDINFER_T71B_OUT");
     require(!directory.empty()&&!std::filesystem::exists(directory),
         "T71B output directory must be new");
     std::filesystem::create_directories(directory);
@@ -38,20 +38,20 @@ void run_numeric_attention_splitk_route_t71b(
         "tokens_exact,control_persistent_bytes,candidate_persistent_bytes,"
         "score_plane_bytes,partial_workspace_bytes,position_equal\n";
 
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
     constexpr int prefix=4096,steps=128;
     const std::size_t score_plane_bytes=static_cast<std::size_t>(16)*24*4352*4;
     const std::size_t partial_workspace_bytes=
-        ninfer::exl3::exl3_numeric_attention_splitk_workspace_bytes(16,4352);
+        voidinfer::exl3::exl3_numeric_attention_splitk_workspace_bytes(16,4352);
     const std::array<std::pair<const char*,const std::vector<std::int64_t>*>,2>
         fixtures{{{"code",&code},{"prose",&prose}}};
     for(const auto& [name,source]:fixtures) {
-        _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+        _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","1");
+        _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         const auto prompt=std::span<const std::int64_t>(source->data(),prefix);
         t69b_ingest(*control,prompt);t69b_ingest(*candidate,prompt);
@@ -110,9 +110,9 @@ void run_numeric_attention_splitk_route_t71b(
     }
 
     // Unset and explicit zero remain the bit-exact qualified route.
-    _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","");
+    _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","");
     auto unset=target.create_context(true);unset->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+    _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
     auto zero=target.create_context(true);zero->prepare_continuation(8);
     const auto short_prompt=std::span<const std::int64_t>(code.data(),96);
     t69b_ingest(*unset,short_prompt);t69b_ingest(*zero,short_prompt);
@@ -125,7 +125,7 @@ void run_numeric_attention_splitk_route_t71b(
         "T71B zero default state contract");
 
     // Reset after a partially populated candidate request and prove clean reuse.
-    _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","1");
+    _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","1");
     auto reused=target.create_context(true);reused->prepare_continuation(8);
     const std::string contract="t71b;numeric-attention;exact-host;single-user";
     reused->bind_request_compatibility(contract);

@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Programmatic dependent launch for small decode kernels. The prologue waits
 // for the preceding grid (full completion and memory flush) before any read,
@@ -22,15 +22,15 @@ namespace ninfer::exl3 {
         asm volatile("griddepcontrol.launch_dependents;");               \
     } while (0)
 
-// NINFER_EXL3_PDL_SMALL=0 launches these kernels without the attribute.
+// VOIDINFER_EXL3_PDL_SMALL=0 launches these kernels without the attribute.
 inline bool exl3_pdl_small_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_EXL3_PDL_SMALL");
-        const char* pdl = std::getenv("NINFER_EXL3_PDL");
+        const char* value = std::getenv("VOIDINFER_EXL3_PDL_SMALL");
+        const char* pdl = std::getenv("VOIDINFER_EXL3_PDL");
         if (pdl && std::strcmp(pdl, "0") == 0) return false;
         if (!value || std::strcmp(value, "1") == 0) return true;
         if (std::strcmp(value, "0") == 0) return false;
-        throw std::invalid_argument("NINFER_EXL3_PDL_SMALL must be 0 or 1");
+        throw std::invalid_argument("VOIDINFER_EXL3_PDL_SMALL must be 0 or 1");
     }();
     return enabled;
 }
@@ -76,4 +76,4 @@ void exl3_launch_small(void (*kernel)(KernelArgs...), dim3 grid, dim3 block,
         throw std::runtime_error(std::string("small PDL launch: ") + cudaGetErrorString(error));
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

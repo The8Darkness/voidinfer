@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <string_view>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3SampledApiExposure : std::uint8_t {
     public_greedy_only,
@@ -122,4 +122,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

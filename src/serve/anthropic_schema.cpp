@@ -10,7 +10,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -119,25 +119,25 @@ bool has_ephemeral_cache_control(const Json& value, const char* param) {
     return true;
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
+voidinfer::product::media_acquire::Source parse_image_source(const Json& block) {
     if (!block.contains("source") || !block.at("source").is_object()) {
         bad_request("image block must contain a source object", "messages");
     }
     const Json& source     = block.at("source");
     const std::string type = require_string_field(source, "type", "image source");
-    ninfer::product::media_acquire::Source out;
+    voidinfer::product::media_acquire::Source out;
     if (type == "base64") {
         out.media_type         = require_string_field(source, "media_type", "base64 image source");
         const std::string data = require_string_field(source, "data", "base64 image source");
         if (data.empty()) { bad_request("base64 image data must not be empty", "messages"); }
-        out.kind  = ninfer::product::media_acquire::SourceKind::Data;
+        out.kind  = voidinfer::product::media_acquire::SourceKind::Data;
         out.value = "data:" + out.media_type + ";base64," + data;
     } else if (type == "url") {
         out.value = require_string_field(source, "url", "URL image source");
         if (!out.value.starts_with("http://") && !out.value.starts_with("https://")) {
             bad_request("image URL must use HTTP(S)", "messages");
         }
-        out.kind = ninfer::product::media_acquire::SourceKind::Url;
+        out.kind = voidinfer::product::media_acquire::SourceKind::Url;
     } else {
         bad_request("unsupported image source type: " + type, "messages");
     }
@@ -598,16 +598,16 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     return out;
 }
 
-const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_calls) {
+const char* messages_stop_reason(voidinfer::FinishReason reason, bool has_tool_calls) {
     if (has_tool_calls) { return "tool_use"; }
     switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
+    case voidinfer::FinishReason::OutputLimit:
+    case voidinfer::FinishReason::ContextCapacity:
         return "max_tokens";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
+    case voidinfer::FinishReason::None:
+    case voidinfer::FinishReason::StopToken:
+    case voidinfer::FinishReason::StopString:
+    case voidinfer::FinishReason::Cancelled:
         return "end_turn";
     }
     return "end_turn";
@@ -737,4 +737,4 @@ std::string new_message_id() {
     return "msg_" + std::string(buf.data());
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

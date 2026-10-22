@@ -2,23 +2,23 @@
 
 void run_turboangle_l1_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using ninfer::exl3::Exl3TextContext;
-    using ninfer::exl3::Exl3TurboAngleL1Context;
+    using voidinfer::exl3::Exl3TextContext;
+    using voidinfer::exl3::Exl3TurboAngleL1Context;
     constexpr int prefix=96,block=4;
     require(code.size()>=prefix+16 && prose.size()>=prefix+16 && target.max_context()==256,
         "TurboAngle L1 fixture/context extent");
-    _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
-    _putenv_s("NINFER_EXL3_SHARED_ACCUM","0");
-    _putenv_s("NINFER_EXL3_SHARED_TRANSFORM","0");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-    _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_ACCUM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+    _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto l0=target.create_context(true);
     auto l1_native=target.create_context(true);
     require(l0->try_enable_oscar_from_environment() && l1_native->try_enable_oscar_from_environment(),

@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Caller-selected fixed storage: reconciliation never grows metadata while
 // deciding whether the next allocation can be admitted.
 template<std::size_t Capacity> class ReservedHostPayloadUnion {

@@ -18,7 +18,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3GdnLayer;
 class Exl3TextContext;
@@ -225,7 +225,10 @@ enum class Exl3GdnHistoryStorage : std::uint8_t {
 // needed to reconstruct rejected B2/B4/B8 work remain private; the shared wide
 // slab is admitted only when no graph/rejection history can survive the call.
 struct Exl3GdnScratchReuseContract {
-    static constexpr std::size_t private_history_rows=16;
+    // A context's own small-tier rows (gdn_layer.cu private_rows_or_default).
+    static constexpr std::size_t private_history_rows=32;
+    // Exact VeriCache line: its <= 8-row forwards (wider ones use the slab).
+    static constexpr std::size_t line_private_history_rows=8;
     static constexpr std::size_t wide_features_per_row=26624;
     std::size_t row_capacity = 0;
     std::size_t private_row_capacity = 0;
@@ -233,7 +236,7 @@ struct Exl3GdnScratchReuseContract {
     std::size_t shared_wide_bytes = 0;
 
     static bool verifier_rows_supported(std::size_t rows) noexcept {
-        return (rows>=1 && rows<=8) || rows==16;
+        return (rows>=1 && rows<=8) || (rows<=64 && rows%8==0);
     }
     static bool retained_rows_supported(std::size_t rows) noexcept {
         return rows>=2 && rows<=8;
@@ -250,7 +253,8 @@ struct Exl3GdnScratchReuseContract {
         return row_capacity>0 && private_row_capacity>0 &&
             private_row_capacity<=row_capacity &&
             (private_row_capacity==row_capacity ||
-             (private_row_capacity==private_history_rows &&
+             ((private_row_capacity==private_history_rows ||
+               private_row_capacity==line_private_history_rows) &&
               shared_wide_bytes>=wide_bytes_required(row_capacity)));
     }
     Exl3GdnHistoryStorage history_storage(
@@ -413,6 +417,10 @@ struct Exl3GdnLayerCheckpoint {
     // preserve_m1_topology forward must keep that trace immutable instead of
     // redundantly copying the same root into it again.
     bool recurrent_trace_alias = false;
+    // The recurrent "checkpoint" is the layer's live state itself: transaction
+    // forwards leave it at the root (state_write_flag == 0) and the
+    // retained-prefix repair advances it in place. No copy is stored.
+    bool recurrent_live_alias = false;
 
     static bool ranges_disjoint(const void* left,std::size_t left_bytes,
                                 const void* right,std::size_t right_bytes) noexcept {
@@ -484,7 +492,29 @@ struct Exl3GdnGraphQkvzConcurrencyView {
 struct Exl3GdnWideScratchView {
     void* data = nullptr;
     std::size_t bytes = 0;
+    // Rows the layer keeps privately beside the shared slab: 0 = a lane's
+    // (Exl3GdnScratchReuseContract::private_history_rows); the exact VeriCache
+    // line, which runs no decode rounds, keeps line_private_history_rows.
+    int private_rows = 0;
 };
+
+// Device copies of one GDN layer's verified-root save or restore (null
+// pointers skip that copy); exl3_gdn_launch_root_copies runs a whole
+// context's layers in one launch instead of 2-3 copies plus a kernel each.
+struct Exl3GdnRootCopy {
+    void* recurrent_dst = nullptr;
+    const void* recurrent_src = nullptr;
+    void* before_dst = nullptr;            // restore: recurrent state trace
+    void* conv_dst = nullptr;
+    const void* conv_src = nullptr;
+    std::uint16_t* trace_dst = nullptr;    // restore: convolution history trace
+};
+inline constexpr int kExl3GdnRootCopyMax = 64;
+struct Exl3GdnRootCopies {
+    Exl3GdnRootCopy layer[kExl3GdnRootCopyMax];
+    int count = 0;
+};
+void exl3_gdn_launch_root_copies(const Exl3GdnRootCopies& copies, cudaStream_t stream);
 
 class Exl3GdnLayer {
 public:
@@ -586,11 +616,22 @@ public:
     // Production contexts skip trace-only work: the per-forward recurrent
     // state-before copy (3 MB per layer) and the packed conv-output/head copies;
     // only diagnostics and tests read those trace() fields.
-    void set_skip_state_trace(bool skip) noexcept { skip_state_trace_ = skip; }
+    // Skipping the state-before trace also releases its 3 MiB per layer (the
+    // remaining restore copies write a process-wide sink nobody reads).
+    void set_skip_state_trace(bool skip);
+    void set_state_write_flag(const int* flag) noexcept { state_write_flag_ = flag; }
+    void set_live_transaction(bool active) noexcept { live_transaction_ = active; }
     // The next GDN layer of the stack: this layer's decode down reduction also
     // writes the successor's input RMS norm into the successor's input-norm
     // buffer, and the successor skips its own norm for exactly that input.
     void set_successor(Exl3GdnLayer* successor) noexcept { successor_ = successor; }
+    // Concurrent Engine lanes: binds the context's small tier and selects it;
+    // the prompt tier (shared prompt-scale views) is selected only around
+    // exclusive prompt/verifier passes.
+    void enable_small_tier(const Exl3SmallTierViews& views);
+    void set_prompt_tier(bool prompt) noexcept;
+    // Selects the shared batch views (views.batch) of the small tier.
+    void set_batch_tier(bool batch) noexcept;
     // Weights of the next layer's first projection, prefetched into L2 on a
     // side branch before this layer's down projection (M1 decode).
     void set_next_layer_prefetch(const std::uint16_t* trellis) noexcept { next_layer_prefetch_ = trellis; }
@@ -626,6 +667,15 @@ public:
         const Exl3GdnLayerCheckpoint& checkpoint,int position,
         std::uint64_t generation,cudaStream_t stream);
     void restore_checkpoint(const Exl3GdnLayerCheckpoint& checkpoint, cudaStream_t stream = nullptr);
+    // save_checkpoint / restore_checkpoint with the device copies returned
+    // instead of submitted: the caller submits every layer's copies in one
+    // exl3_gdn_launch_root_copies on `stream` before other work on it.
+    Exl3GdnRootCopy save_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint,int position,
+                                           cudaStream_t stream);
+    Exl3GdnRootCopy restore_checkpoint_copies(const Exl3GdnLayerCheckpoint& checkpoint);
+    // This layer's live state takes `source`'s (exact line sync); same
+    // bookkeeping as a restore.
+    Exl3GdnRootCopy live_state_copies_from(const Exl3GdnLayer& source);
     // Synchronous host checkpoint restore, preserving FP32 recurrent and all
     // four physical BF16 convolution slots. Invalidates retention capabilities.
     void restore_host_state(std::span<const float> recurrent,
@@ -775,6 +825,24 @@ public:
     std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
     static std::size_t fixed_owner_metadata_required() noexcept;
     std::size_t fixed_owner_metadata_bytes() const noexcept;
+    // Batched multi-agent rounds: while set, forward() runs its row-independent
+    // work over own_rows + every peer's rows, and each peer layer (another
+    // agent's context, same model layer) runs its own stateful core on its rows.
+    // stream: the peer's own (transaction) stream; launches use the owner's.
+    struct BatchPeer { Exl3GdnLayer* layer = nullptr; int rows = 0; cudaStream_t stream = nullptr; };
+    static constexpr std::size_t kMaxBatchPeers = 7;
+    struct Batch {
+        int own_rows = 0;
+        int peer_count = 0;
+        std::array<BatchPeer, kMaxBatchPeers> peers{};
+        // Optional: each peer's stateful core runs on its own forked stream
+        // (fork_event recorded on the owner stream, join_events back) so the
+        // agents' recurrence/attention kernels overlap.
+        std::array<cudaStream_t, kMaxBatchPeers> fork_streams{};
+        cudaEvent_t fork_event = nullptr;
+        std::array<cudaEvent_t, kMaxBatchPeers> join_events{};
+    };
+    void set_batch(const Batch* batch) noexcept { batch_ = batch; }
     // Borrowed child pointers for enclosing-context lifetime inventory only.
     std::array<Exl3CudaLinearWorkspace*,6> linear_workspace_owners() const noexcept {return linear_workspaces_;}
     std::array<Exl3LayerBufferRetirement*,34> buffer_retirement_owners() noexcept {
@@ -783,7 +851,8 @@ public:
         return result;
     }
     static std::size_t workspace_bytes_required(int rows,bool borrowed_accumulation,
-        bool borrowed_transform,bool borrowed_scratch,bool split_wide,bool resident);
+        bool borrowed_transform,bool borrowed_scratch,bool split_wide,bool resident,
+        int private_rows = 0);
     static constexpr std::size_t kStateElements = Exl3GdnRecurrentLayout::recurrent_elements;
     static constexpr std::size_t kStateBytes = Exl3GdnRecurrentLayout::recurrent_bytes;
     static constexpr std::size_t kConvStateElements = Exl3GdnRecurrentLayout::convolution_history_elements;
@@ -792,6 +861,41 @@ public:
     static constexpr std::size_t kConvStateStorageBytes = Exl3GdnRecurrentLayout::convolution_storage_bytes;
 
 private:
+    // Arguments of gdn_middle(): the stateful core between the input
+    // projections and the output projection (see gdn_layer.cu).
+    struct GdnMiddle {
+        std::uint16_t *qkv,*conv_input,*q,*k,*v,*conv_output,*z,*z_bf16,*core,*gdn_norm,*head_trace,*o_input;
+        float *g_trace,*beta_trace;
+        int rows;
+        cudaStream_t stream;
+        bool wide_prefill,preserve_m1_topology,merged_qkvz_side,eligible_retained_prefix;
+        const void* base_checkpoint_recurrent;
+        bool collect_stage_events;
+        cudaEvent_t* starts;
+        cudaEvent_t* ends;
+    };
+    void gdn_middle(const GdnMiddle& m);
+    struct SegmentState {
+        std::uint64_t base_generation = 0;
+        const void* base_recurrent = nullptr;
+        const void* base_conv = nullptr;
+        bool eligible = false;
+        Exl3GdnHistoryStorage storage{};
+    };
+    SegmentState begin_segment(int rows, cudaStream_t stream, bool preserve_m1_topology,
+                               cudaStream_t state_stream = nullptr);
+    void end_segment(const SegmentState& segment, int rows, cudaStream_t stream,
+                     bool preserve_m1_topology);
+    struct PeerSegmentSource {
+        const std::uint16_t *h,*qkv,*conv_input,*z;
+        const float *a,*b,*g_trace,*beta_trace;
+        std::uint16_t* o_input;
+        int rows;
+        bool merged_qkvz_side;
+    };
+    void run_peer_segment(const PeerSegmentSource& source, cudaStream_t stream,
+                          cudaStream_t state_stream, bool preserve_m1_topology);
+    const Batch* batch_ = nullptr;
     friend class Exl3TextContext;
     // The TextContext passes the bounded shared owner for this layer. Every
     // exposed history buffer is layer-owned, while model_owner separately
@@ -828,9 +932,25 @@ private:
     std::array<std::uint16_t*, 22> half_buffers_{};
     std::array<std::uint16_t*, 5> wide_half_buffers_{};
     std::array<float*, 6> float_buffers_{};
+    // Small tier for concurrent Engine lanes (see enable_small_tier).
+    std::array<std::uint16_t*, 22> small_half_buffers_{};
+    std::array<float*, 6> small_float_buffers_{};
+    std::array<std::uint16_t*, 22> batch_half_buffers_{};
+    std::array<float*, 6> batch_float_buffers_{};
+    std::array<std::size_t, 22> batch_half_buffer_bytes_{};
+    std::array<std::size_t, 6> batch_float_buffer_bytes_{};
+    int small_rows_ = 0;
+    int batch_rows_ = 0;
+    bool small_tier_active_ = false;
+    bool batch_tier_active_ = false;
+    void* small_trace_storage_ = nullptr;
+    void require_tier_rows(int rows) const;
+    // Extents of the selected tier's buffers (swapped with them, set_prompt_tier).
     std::array<std::size_t,22> half_buffer_bytes_{};
     std::array<std::size_t,5> wide_half_buffer_bytes_{};
     std::array<std::size_t,6> float_buffer_bytes_{};
+    std::array<std::size_t,22> small_half_buffer_bytes_{};
+    std::array<std::size_t,6> small_float_buffer_bytes_{};
     std::size_t prefill_normalized_bytes_ = 0;
     std::array<std::optional<Exl3LayerBufferRetirement>,34> buffer_retirements_{};
     std::array<bool, 22> half_buffer_owned_{};
@@ -848,6 +968,7 @@ private:
     std::uint16_t* conv_state_ = nullptr;
     std::uint16_t* conv_state_trace_ = nullptr;
     DeviceArena* op_workspace_ = nullptr;
+    bool op_workspace_released_ = false;
     std::array<Exl3CudaLinearWorkspace*, 6> linear_workspaces_{};
     Exl3CudaReconstructGemmWorkspace* reconstruct_gemm_ = nullptr;
     Exl3TargetProjectionTiming* projection_timing_ = nullptr;
@@ -862,6 +983,10 @@ private:
     Exl3ActivationLifetime mlp_activation_lifetime_;
     bool shared_gateup_enabled_=false,shared_down_enabled_=false;
     const int* chain_rows_device_ = nullptr;
+    // Device int read by continuation-forward recurrence kernels: 0 keeps the
+    // live recurrent state (live-alias transaction), nonzero writes it back.
+    const int* state_write_flag_ = nullptr;
+    bool live_transaction_ = false;
     bool capture_active_ = false;
     Exl3GdnGraphQkvzConcurrencyView graph_qkvz_concurrency_{};
     std::shared_ptr<const void> prefill_projection_chain_context_owner_ =
@@ -897,4 +1022,4 @@ private:
 
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

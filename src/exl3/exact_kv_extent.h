@@ -7,9 +7,74 @@
 #include <limits>
 #include <stdexcept>
 #include <functional>
+#include <atomic>
 #include "exl3/bounded_shared_owner.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
+class Exl3LaneKvSource;
+// Copyable atomic flag (pages are cloned by value).
+struct Exl3CopyableFlag {
+    std::atomic<bool> value{false};
+    Exl3CopyableFlag() = default;
+    Exl3CopyableFlag(const Exl3CopyableFlag& other) : value(other.value.load(std::memory_order_acquire)) {}
+    Exl3CopyableFlag& operator=(const Exl3CopyableFlag& other) {
+        value.store(other.value.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    bool load() const noexcept { return value.load(std::memory_order_acquire); }
+    void store(bool v) noexcept { value.store(v, std::memory_order_release); }
+};
+template <class T> struct Exl3CopyablePointer {
+    std::atomic<T*> value{nullptr};
+    Exl3CopyablePointer() = default;
+    Exl3CopyablePointer(const Exl3CopyablePointer& other) : value(other.value.load(std::memory_order_acquire)) {}
+    Exl3CopyablePointer& operator=(const Exl3CopyablePointer& other) {
+        value.store(other.value.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+    T* load() const noexcept { return value.load(std::memory_order_acquire); }
+    void store(T* v) noexcept { value.store(v, std::memory_order_release); }
+};
+// Disk slot of a page payload spilled by its lane source (lane_kv_source.h).
+// The slot is owned by exactly one page: copies start without one, and the
+// slot returns to the spill store when the page drops it.
+using Exl3SpillRelease = void (*)(std::int64_t) noexcept;
+inline std::atomic<Exl3SpillRelease>& exl3_spill_release_hook() {
+    static std::atomic<Exl3SpillRelease> hook{nullptr};
+    return hook;
+}
+struct Exl3SpillSlot {
+    std::atomic<std::int64_t> value{-1};
+    Exl3SpillSlot() = default;
+    Exl3SpillSlot(const Exl3SpillSlot&) noexcept {}
+    Exl3SpillSlot& operator=(const Exl3SpillSlot&) noexcept { reset(); return *this; }
+    ~Exl3SpillSlot() { reset(); }
+    std::int64_t load() const noexcept { return value.load(std::memory_order_acquire); }
+    void store(std::int64_t v) noexcept { value.store(v, std::memory_order_release); }
+    void reset() noexcept {
+        const auto slot = value.exchange(-1, std::memory_order_acq_rel);
+        if (slot >= 0)
+            if (const auto release = exl3_spill_release_hook().load(std::memory_order_acquire)) release(slot);
+    }
+};
+// L0 OSCAR codes and meta of one exact KV page's rows, per bank (layout of
+// Exl3ExactHostState::L0CodeChunk), pointing into page-locked chunks that
+// `owners` keep alive.
+struct Exl3PageCodes {
+    std::array<std::shared_ptr<const void>,16> owners;
+    std::array<const std::uint8_t*,16> k_codes{},v_codes{};
+    std::array<const std::uint16_t*,16> k_meta{},v_meta{};
+    int banks=0;
+};
+// Readers that are about to use a page's payload (a restore) pin it: pressure
+// spilling and re-homing leave pinned filled pages alone. Copies start unpinned.
+struct Exl3PinCount {
+    std::atomic<int> value{0};
+    Exl3PinCount() = default;
+    Exl3PinCount(const Exl3PinCount&) noexcept {}
+    Exl3PinCount& operator=(const Exl3PinCount&) noexcept { return *this; }
+    int load() const noexcept { return value.load(std::memory_order_acquire); }
+};
 // Internal backing. Published images expose only const page handles. A private
 // append may reserve a larger tail before upload; valid extents exclude it.
 struct Exl3ExactKVPage {
@@ -19,6 +84,26 @@ struct Exl3ExactKVPage {
     // 516 words: 1024 e4m3 bytes + 4 FP16 head scales.
     bool fp8=false;
     std::array<std::vector<std::uint16_t>,16> k,v;
+    // Lane-backed payload (lane_kv_source.h): while `deferred`, k/v are empty
+    // and the rows live only in `source`'s lane planes, which keep them
+    // unchanged until the source fills the page (before those rows change).
+    std::shared_ptr<Exl3LaneKvSource> source;
+    Exl3CopyablePointer<Exl3LaneKvSource> source_id;   // lock-free identity of `source`
+    Exl3CopyableFlag deferred;
+    // A deferred page whose rows left the source's planes for its spill file.
+    Exl3SpillSlot spill;
+    // L0 OSCAR codes of the page's rows (export assigns them while the page
+    // is lane-backed); the lossless packed payload (l0_kv_pack.cuh) is coded
+    // against them. A deferred page whose rows left the planes for `packed`
+    // (in RAM) or for a spill slot holding `spill_packed_bytes` of it.
+    std::shared_ptr<const Exl3PageCodes> codes;
+    std::vector<std::uint8_t> packed;
+    Exl3CopyableFlag packed_ram;
+    std::uint32_t spill_packed_bytes=0;
+    bool payload_deferred() const noexcept { return deferred.load(); }
+    bool spilled() const noexcept { return spill.load() >= 0; }
+    bool packed_in_ram() const noexcept { return packed_ram.load(); }
+    mutable Exl3PinCount pins;
     static std::shared_ptr<Exl3ExactKVPage> create(
         const std::function<RetainedDescriptorLedger::Ticket(std::uint64_t)>& reserve={}) {
         std::optional<RetainedDescriptorLedger::Ticket> credit;

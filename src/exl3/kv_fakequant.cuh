@@ -1,10 +1,10 @@
 #pragma once
 // Research instrument for the KV-tier (VeriCache) fidelity study. With
-// NINFER_EXL3_KV_FAKEQUANT=int2|turbo|fp8 the ordinary FP16 K/V cache rows
+// VOIDINFER_EXL3_KV_FAKEQUANT=int2|turbo|fp8 the ordinary FP16 K/V cache rows
 // that leave the exact window (positions >= prefix and older than `recent`
 // rows before the committed base) are replaced in place by their codec
 // reconstruction: OSCAR INT2 g128 in the calibrated rotation basis
-// (NINFER_EXL3_KV_FAKEQUANT_ROT), TurboAngle K7+8/V6+4, or FP8 E4M3 row
+// (VOIDINFER_EXL3_KV_FAKEQUANT_ROT), TurboAngle K7+8/V6+4, or FP8 E4M3 row
 // scale. Attention then runs unchanged over the represented values. Not a
 // production storage format.
 #include <cuda_fp16.h>
@@ -20,10 +20,11 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::exl3::kv_fakequant {
+namespace voidinfer::exl3::kv_fakequant {
 
 struct Config {
-    int mode = 0;  // 0 off, 1 OSCAR INT2, 2 TurboAngle, 3 FP8, 4 OSCAR INT4, 5 OSCAR INT3, 6 OScaR
+    int mode = 0;  // 0 off, 1 OSCAR INT2, 2 TurboAngle, 3 FP8, 4 OSCAR INT4, 5 OSCAR INT3, 6 OScaR,
+                   // 7 KVarN K2/V2, 8 KVarN K4/V2
     int block = 256;  // OScaR residual flush block
     bool lloyd_max = false;            // FutureMLS SGLANG_LLOYD_MAX levels (single 256 group)
     const float* perhead = nullptr;    // device [2][16][4][256][256] per-KV-head rotations
@@ -37,7 +38,7 @@ struct Config {
 inline const Config& config() {
     static const Config value = [] {
         Config c;
-        const char* mode = std::getenv("NINFER_EXL3_KV_FAKEQUANT");
+        const char* mode = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT");
         if (!mode || !*mode || std::strcmp(mode, "0") == 0) return c;
         if (std::strcmp(mode, "int2") == 0) c.mode = 1;
         else if (std::strcmp(mode, "turbo") == 0) c.mode = 2;
@@ -46,13 +47,15 @@ inline const Config& config() {
         else if (std::strcmp(mode, "int3") == 0) { c.mode = 5; c.levels = 7.0f; }
         else if (std::strcmp(mode, "oscar") == 0) { c.mode = 6; c.prefix = 0; }
         else if (std::strcmp(mode, "int2lm") == 0) { c.mode = 1; c.lloyd_max = true; }
-        else throw std::invalid_argument("NINFER_EXL3_KV_FAKEQUANT must be int2, int2lm, int3, int4, oscar, turbo or fp8");
-        if (const char* r = std::getenv("NINFER_EXL3_KV_FAKEQUANT_RECENT")) c.recent = std::atoi(r);
-        if (const char* p = std::getenv("NINFER_EXL3_KV_FAKEQUANT_PREFIX")) c.prefix = std::atoi(p);
+        else if (std::strcmp(mode, "kvarn2") == 0) c.mode = 7;
+        else if (std::strcmp(mode, "kvarn42") == 0) c.mode = 8;
+        else throw std::invalid_argument("VOIDINFER_EXL3_KV_FAKEQUANT must be int2, int2lm, int3, int4, oscar, turbo, fp8, kvarn2 or kvarn42");
+        if (const char* r = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_RECENT")) c.recent = std::atoi(r);
+        if (const char* p = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_PREFIX")) c.prefix = std::atoi(p);
         std::vector<float> rot(2ull * 16 * 256 * 256);
-        if (c.mode == 1 || c.mode == 4 || c.mode == 5) {
-            const char* dir = std::getenv("NINFER_EXL3_KV_FAKEQUANT_ROT");
-            if (!dir) throw std::invalid_argument("int2 fake-quant requires NINFER_EXL3_KV_FAKEQUANT_ROT");
+        if ((c.mode == 1 || c.mode == 4 || c.mode == 5) && !std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
+            const char* dir = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_ROT");
+            if (!dir) throw std::invalid_argument("int2 fake-quant requires VOIDINFER_EXL3_KV_FAKEQUANT_ROT or _PERHEAD");
             const char* names[2] = {"/runtime/k_rotation_fp32.bin", "/runtime/v_rotation_fp32.bin"};
             for (int kind = 0; kind < 2; ++kind) {
                 std::ifstream f(std::string(dir) + names[kind], std::ios::binary);
@@ -75,7 +78,7 @@ inline const Config& config() {
         cudaMemcpy(device + rot.size(), signs.data(), 256 * 4, cudaMemcpyHostToDevice);
         c.rotations = device;
         c.signs = device + rot.size();
-        if (const char* dir = std::getenv("NINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
+        if (const char* dir = std::getenv("VOIDINFER_EXL3_KV_FAKEQUANT_PERHEAD")) {
             // Per-KV-head rotations (x' = x R per head) and key means, FutureMLS OSCAR-2 "center".
             std::vector<float> ph(2ull * 16 * 4 * 65536), mean(16ull * 4 * 256);
             const char* names[2] = {"/k_rot_perhead.bin", "/v_rot_perhead.bin"};
@@ -371,6 +374,133 @@ __global__ void oscar_plan_kernel(const int* position_device, int position, int*
 }
 
 
+// ---------------------------------------------------------------------------
+// KVarN (arXiv 2606.03458, Huawei CSL): history rows are committed in
+// 128-token tiles (from `prefix`, once older than `recent`). Per tile, KV head
+// and K|V: randomized Hadamard rotation of every token row (QuaRot layout),
+// Sinkhorn variance normalization (log domain, 16 alternating row / column
+// RMS steps, clamped), asymmetric RTN quantization of the normalized tile -
+// K per channel over the 128 tokens (2 or 4 bits), V per token over
+// 128-channel groups (2 bits) - with the token and channel factors stored as
+// FP8 E4M3 (relative to their tile maximum); reconstruction in the original
+// basis.
+constexpr int kKvarnTile = 128;
+constexpr std::size_t kvarn_smem_bytes() {
+    return static_cast<std::size_t>(kKvarnTile) * 256 * sizeof(__half) + (256 + kKvarnTile + 256 + 16) * sizeof(float);
+}
+__device__ __forceinline__ float kvarn_fp8_relative(float v, float vmax) {
+    if (!(vmax > 0.0f)) return v;
+    const __nv_fp8_e4m3 q(fminf(v / vmax * 448.0f, 448.0f));
+    return static_cast<float>(q) / 448.0f * vmax;
+}
+// One CTA (256 threads = channels) per (tile, KV head, K|V).
+__global__ void __launch_bounds__(256) kvarn_kernel(std::uint16_t* k_cache, std::uint16_t* v_cache,
+                                                   const int* plan, Config c) {
+    extern __shared__ __align__(16) unsigned char kvarn_smem[];
+    __half* tile = reinterpret_cast<__half*>(kvarn_smem);                 // [128][256] rotated
+    float* row = reinterpret_cast<float*>(tile + kKvarnTile * 256);      // [256] Hadamard scratch
+    float* rs = row + 256;                                               // [128] token factors
+    float* cs = rs + kKvarnTile;                                         // [256] channel factors
+    float* scratch = cs + 256;                                           // [16]
+    const int first = plan[0], tiles = plan[1] / kKvarnTile;
+    const int j = threadIdx.x, lane = j & 31, warp = j >> 5;
+    const int key_bits = c.mode == 8 ? 4 : 2;
+    for (int task = blockIdx.x; task < tiles * 8; task += gridDim.x) {
+        const int t0 = first + (task / 8) * kKvarnTile, head = (task / 2) % 4, kind = task % 2;
+        std::uint16_t* cache = kind ? v_cache : k_cache;
+        for (int t = 0; t < kKvarnTile; ++t) {
+            __syncthreads();
+            row[j] = __half2float(__ushort_as_half(cache[(static_cast<std::size_t>(t0 + t) * 4 + head) * 256 + j])) * c.signs[j];
+            hadamard256(row);
+            tile[t * 256 + j] = __float2half_rn(row[j]);
+        }
+        if (j < kKvarnTile) rs[j] = 1.0f;
+        cs[j] = 1.0f;
+        __syncthreads();
+        for (int it = 0; it < 16; ++it) {
+            for (int t = warp; t < kKvarnTile; t += 8) {
+                float acc = 0.0f;
+                for (int ch = lane; ch < 256; ch += 32) {
+                    const float y = __half2float(tile[t * 256 + ch]) / (rs[t] * cs[ch]);
+                    acc += y * y;
+                }
+                for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                if (lane == 0) rs[t] = fminf(fmaxf(rs[t] * sqrtf(acc / 256.0f + 1e-30f), 1e-8f), 1e8f);
+            }
+            __syncthreads();
+            float acc = 0.0f;
+            for (int t = 0; t < kKvarnTile; ++t) {
+                const float y = __half2float(tile[t * 256 + j]) / (rs[t] * cs[j]);
+                acc += y * y;
+            }
+            cs[j] = fminf(fmaxf(cs[j] * sqrtf(acc / kKvarnTile + 1e-30f), 1e-8f), 1e8f);
+            __syncthreads();
+        }
+        const float cmax = block_reduce(cs[j], true, scratch);
+        const float rmax = block_reduce(j < kKvarnTile ? rs[j] : 0.0f, true, scratch);
+        __syncthreads();
+        cs[j] = kvarn_fp8_relative(cs[j], cmax);
+        if (j < kKvarnTile) rs[j] = kvarn_fp8_relative(rs[j], rmax);
+        __syncthreads();
+        if (kind == 0) {
+            const float levels = static_cast<float>((1 << key_bits) - 1);
+            float mn = INFINITY, mx = -INFINITY;
+            for (int t = 0; t < kKvarnTile; ++t) {
+                const float y = __half2float(tile[t * 256 + j]) / (rs[t] * cs[j]);
+                mn = fminf(mn, y); mx = fmaxf(mx, y);
+            }
+            const float scale = fmaxf(mx - mn, 1e-12f) / levels;
+            for (int t = 0; t < kKvarnTile; ++t) {
+                const float y = __half2float(tile[t * 256 + j]) / (rs[t] * cs[j]);
+                const float q = fminf(fmaxf(rintf((y - mn) / scale), 0.0f), levels);
+                tile[t * 256 + j] = __float2half_rn((q * scale + mn) * rs[t] * cs[j]);
+            }
+        } else {
+            for (int t = warp; t < kKvarnTile; t += 8) {
+                for (int g = 0; g < 2; ++g) {
+                    float mn = INFINITY, mx = -INFINITY;
+                    for (int ch = g * 128 + lane; ch < g * 128 + 128; ch += 32) {
+                        const float y = __half2float(tile[t * 256 + ch]) / (rs[t] * cs[ch]);
+                        mn = fminf(mn, y); mx = fmaxf(mx, y);
+                    }
+                    for (int o = 16; o > 0; o >>= 1) {
+                        mn = fminf(mn, __shfl_xor_sync(0xffffffffu, mn, o));
+                        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                    }
+                    const float scale = fmaxf(mx - mn, 1e-12f) / 3.0f;
+                    for (int ch = g * 128 + lane; ch < g * 128 + 128; ch += 32) {
+                        const float y = __half2float(tile[t * 256 + ch]) / (rs[t] * cs[ch]);
+                        const float q = fminf(fmaxf(rintf((y - mn) / scale), 0.0f), 3.0f);
+                        tile[t * 256 + ch] = __float2half_rn((q * scale + mn) * rs[t] * cs[ch]);
+                    }
+                }
+            }
+        }
+        for (int t = 0; t < kKvarnTile; ++t) {
+            __syncthreads();
+            row[j] = __half2float(tile[t * 256 + j]);
+            hadamard256(row);
+            cache[(static_cast<std::size_t>(t0 + t) * 4 + head) * 256 + j] =
+                __half_as_ushort(__float2half_rn(row[j] * c.signs[j]));
+        }
+        __syncthreads();
+    }
+}
+
+// Commits whole tiles of [prefix, base - recent] once; updates the watermark.
+__global__ void kvarn_plan_kernel(const int* position_device, int position, int* watermark, Config c,
+                                  int capacity, int* plan) {
+    const int base = position_device ? *position_device : position;
+    int wm = *watermark;
+    if (wm < c.prefix) wm = c.prefix;
+    const int limit = min(base - c.recent + 1, capacity);
+    const int end = limit > c.prefix ? c.prefix + ((limit - c.prefix) / kKvarnTile) * kKvarnTile : c.prefix;
+    if (end < wm) wm = c.prefix;
+    plan[0] = wm;
+    plan[1] = max(end - wm, 0);
+    *watermark = max(wm, end);
+}
+
 __global__ void advance_kernel(const int* position_device, int position, int* watermark, Config c,
                                int capacity) {
     const int base = position_device ? *position_device : position;
@@ -393,9 +523,20 @@ inline void age(std::uint16_t* k_cache, std::uint16_t* v_cache, int capacity,
         oscar_v_kernel<<<512, 256, 0, stream>>>(v_cache, watermark + 1);
         return;
     }
+    if (c.mode == 7 || c.mode == 8) {
+        static const bool configured = [] {
+            cudaFuncSetAttribute(kvarn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(kvarn_smem_bytes()));
+            return true;
+        }();
+        (void)configured;
+        kvarn_plan_kernel<<<1, 1, 0, stream>>>(position_device, position, watermark, c, capacity, watermark + 1);
+        kvarn_kernel<<<256, 256, kvarn_smem_bytes(), stream>>>(k_cache, v_cache, watermark + 1, c);
+        return;
+    }
     age_kernel<<<256, 256, 0, stream>>>(k_cache, v_cache, capacity, position_device, position,
                                         watermark, c, bank);
     advance_kernel<<<1, 1, 0, stream>>>(position_device, position, watermark, c, capacity);
 }
 
-} // namespace ninfer::exl3::kv_fakequant
+} // namespace voidinfer::exl3::kv_fakequant

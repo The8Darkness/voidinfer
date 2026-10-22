@@ -3,8 +3,8 @@
 void run_oscar_fused_kv_screen(Exl3TextModel& target,
                                const std::vector<std::int64_t>& code,
                                const std::vector<std::int64_t>& prose) {
-    require(env("NINFER_OSCAR_EXL3") == "1", "fused KV screen requires OSCAR");
-    require(env("NINFER_EXL3_PREFILL_BATCH_ROTATIONS") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1", "fused KV screen requires OSCAR");
+    require(env("VOIDINFER_EXL3_PREFILL_BATCH_ROTATIONS") == "1",
             "fused KV screen requires batch rotations");
     const int prefix = target.max_context() >= 4352 ? 4096 : 96;
     constexpr int decode_rows = 32;
@@ -12,21 +12,21 @@ void run_oscar_fused_kv_screen(Exl3TextModel& target,
                 code.size() >= static_cast<std::size_t>(prefix) &&
                 prose.size() >= static_cast<std::size_t>(prefix),
             "fused KV fixture/context extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
 
     for (const auto& fixture : std::array<
              std::pair<const char*, const std::vector<std::int64_t>*>, 2>{
              std::pair{"code", &code}, std::pair{"prose", &prose}}) {
-        _putenv_s("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
+        _putenv_s("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
         auto control = target.create_context(true);
         require(control->try_enable_oscar_from_environment(), "control OSCAR enable");
-        _putenv_s("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "1");
+        _putenv_s("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "1");
         auto candidate = target.create_context(true);
         require(candidate->try_enable_oscar_from_environment(), "candidate OSCAR enable");
         // Prove the switch is construction-latched: subsequent environment
         // changes cannot alter either live context.
-        _putenv_s("NINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
+        _putenv_s("VOIDINFER_OSCAR_DECODE_FUSED_KV_ROTATIONS", "0");
 
         const std::span<const std::int64_t> input(fixture.second->data(), prefix);
         const auto prefill = [&](Exl3TextContext& context) {

@@ -37,10 +37,10 @@
 
  namespace {
 
- using ninfer::exl3::Exl3TextModel;
- using ninfer::exl3::Exl3TextContext;
- using ninfer::exl3::Exl3Dflash2DraftModel;
- using ninfer::exl3::Exl3Dflash2TapHistory;
+ using voidinfer::exl3::Exl3TextModel;
+ using voidinfer::exl3::Exl3TextContext;
+ using voidinfer::exl3::Exl3Dflash2DraftModel;
+ using voidinfer::exl3::Exl3Dflash2TapHistory;
 
  constexpr int kHidden = 5120;
  constexpr int kVocab = 248320;
@@ -125,10 +125,10 @@
  } // namespace
  int main() {
      try {
-         const auto target_path = env("NINFER_EXL3_TARGET_PATH");
-         const auto draft_path = env("NINFER_EXL3_DFLASH2_PATH");
+         const auto target_path = env("VOIDINFER_EXL3_TARGET_PATH");
+         const auto draft_path = env("VOIDINFER_EXL3_DFLASH2_PATH");
          if (target_path.empty() || draft_path.empty()) {
-             std::cerr << "E5A3 skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_DFLASH2_PATH\n";
+             std::cerr << "E5A3 skipped: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_DFLASH2_PATH\n";
              return 77;
          }
          const std::string results_dir = "results/dflash2";
@@ -669,7 +669,7 @@
                    << batch_wall_us << std::defaultfloat << "\n";
          latency_csv << "batch_wall_12_calls," << batch_wall_us << ",chrono wall for 12 proposes" << "\n";
          (void)legacy_us; (void)ring_us;
-         _putenv_s("NINFER_DFLASH2_TIMING", "1");
+         _putenv_s("VOIDINFER_DFLASH2_TIMING", "1");
          (void)draft->propose(block14, P, bulk_ptrs.data(), P, static_cast<int>(ctx_pos0), P,
                               tap_ctx->target_embedding(), tap_ctx->target_lm_head_weights(),
                               tap_ctx->target_lm_head_metadata(), kMaskToken);

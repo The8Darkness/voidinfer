@@ -3,12 +3,12 @@
 // screens, and the same final L2 authority. No approximate external publication.
 void run_real_dflash_screens(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose){
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
     using Clock=std::chrono::steady_clock;
     const auto ms=[](auto t){return std::chrono::duration<double,std::milli>(Clock::now()-t).count();};
     const int prefix=512,outputs=32;
-    const std::filesystem::path dir=env("NINFER_REAL_DFLASH_OUT");require(!std::filesystem::exists(dir),"preserve screens receipt");std::filesystem::create_directories(dir);
+    const std::filesystem::path dir=env("VOIDINFER_REAL_DFLASH_OUT");require(!std::filesystem::exists(dir),"preserve screens receipt");std::filesystem::create_directories(dir);
     std::ofstream timing(dir/"workloads.csv"),checks(dir/"checks.csv"),requests(dir/"requests.csv");
     timing<<"fixture,pair,arm,wall_ms,setup_ms,teardown_ms,proposals,l0_rows,l0_rejections,l1_rows,l1_replay,l1_rejections,l2_rows,l2_replay,l0_ms,l1_ms,rebase_ms,persistent_bytes,exact\n";
     requests<<"fixture,pair,arm,request,wall_ms,first_release_ms\n";checks<<"fixture,case,pass\n";
@@ -36,9 +36,9 @@ void run_real_dflash_screens(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
                 // Constructor-only context flags, restored before any L2 execution.
                 std::vector<std::pair<std::string,std::string>> saved;
                 const auto set=[&](const char* k,const char* v){saved.emplace_back(k,env(k));_putenv_s(k,v);};
-                set("NINFER_EXL3_NATIVE_CONTINUATION16","0");set("NINFER_EXL3_PINNED_RECURRENT_EXPORT","0");
-                for(const char* k:{"NINFER_EXL3_WIDE_PREFILL","NINFER_EXL3_PREFILL_STAGED_REDUCTION","NINFER_EXL3_SHARED_ACCUM","NINFER_EXL3_SHARED_TRANSFORM","NINFER_EXL3_SHARED_LAYER_SCRATCH","NINFER_EXL3_GDN_WIDE_SLAB","NINFER_EXL3_EXACT_HOST_KV"})set(k,"0");
-                set("NINFER_EXL3_OSCAR_L0_ONLY","1");
+                set("VOIDINFER_EXL3_NATIVE_CONTINUATION16","0");set("VOIDINFER_EXL3_PINNED_RECURRENT_EXPORT","0");
+                for(const char* k:{"VOIDINFER_EXL3_WIDE_PREFILL","VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","VOIDINFER_EXL3_SHARED_ACCUM","VOIDINFER_EXL3_SHARED_TRANSFORM","VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","VOIDINFER_EXL3_GDN_WIDE_SLAB","VOIDINFER_EXL3_EXACT_HOST_KV"})set(k,"0");
+                set("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
                 try {
                     l0=target.create_context(true);auto native=target.create_context(true);
                     require(l0->try_enable_oscar_from_environment() && native->try_enable_oscar_from_environment(),"screen OSCAR contexts");

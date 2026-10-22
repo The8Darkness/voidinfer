@@ -3,20 +3,20 @@
 void run_exact_attention_gqa_six_packed_triples_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352,
         "GQA-six packed triples screen context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE","");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED","");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE","");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED","");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","0");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
@@ -36,14 +36,14 @@ void run_exact_attention_gqa_six_packed_triples_screen(
             "GQA-six packed triples fixture extent");
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES","0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES","1");
+        _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         struct Result {
             double prefill_ms=0;
             std::vector<std::int64_t> tokens;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
         };
         const auto run=[&](Exl3TextContext& context) {
             const auto started=std::chrono::steady_clock::now();

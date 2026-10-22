@@ -4,11 +4,11 @@
 void run_t90_allocation_churn(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using Coordinator = ninfer::exl3::Exl3VeriCacheServingCoordinator;
-    using Domains = ninfer::exl3::Exl3ExactAllocationDomainStats;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using Coordinator = voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+    using Domains = voidinfer::exl3::Exl3ExactAllocationDomainStats;
     constexpr std::size_t kPrompt = 4096;
     constexpr std::size_t kPrefix = 3968;
     constexpr int kOutputs = 8;
@@ -17,8 +17,8 @@ void run_t90_allocation_churn(
     require(!output.empty() && !std::filesystem::exists(output),
             "T90 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib = std::stoull(env("NINFER_T90_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T90_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T90_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T90_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024, "T90 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
     const std::uint64_t cache_budget = cache_mib * (1ULL << 20);
@@ -33,11 +33,11 @@ void run_t90_allocation_churn(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T90_NAMESPACE"), env("NINFER_T90_ARTIFACT_ID"),
-        env("NINFER_T90_TOKENIZER_ID"), env("NINFER_T90_CONFIGURATION_ID"),
-        env("NINFER_T90_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T90_NAMESPACE"), env("VOIDINFER_T90_ARTIFACT_ID"),
+        env("VOIDINFER_T90_TOKENIZER_ID"), env("VOIDINFER_T90_CONFIGURATION_ID"),
+        env("VOIDINFER_T90_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{4, 64, cache_budget, reserve}, identity);
     auto context = target.create_context(true);
     context->prepare_continuation(8);
@@ -102,15 +102,15 @@ void run_t90_allocation_churn(
         const auto parent = lease.root;
         const std::array<std::int64_t,1> token{pending};
         auto [child, verified] = parent->verify(*context, token, {}, stream.value);
-        const std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>,1>
+        const std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>,1>
             parent_states{parent->state()}, child_states{child->state()};
-        const std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>,2>
+        const std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>,2>
             union_states{parent->state(), child->state()};
-        const auto parent_domain = ninfer::exl3::Exl3ExactHostState::
+        const auto parent_domain = voidinfer::exl3::Exl3ExactHostState::
             allocation_domain_stats(parent_states);
-        const auto child_domain = ninfer::exl3::Exl3ExactHostState::
+        const auto child_domain = voidinfer::exl3::Exl3ExactHostState::
             allocation_domain_stats(child_states);
-        const auto union_domain = ninfer::exl3::Exl3ExactHostState::
+        const auto union_domain = voidinfer::exl3::Exl3ExactHostState::
             allocation_domain_stats(union_states);
         const std::array<std::shared_ptr<const Request>,1> parent_requests{parent};
         const std::array<std::shared_ptr<const Request>,1> child_requests{child};

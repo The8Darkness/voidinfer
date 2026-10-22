@@ -24,7 +24,7 @@ models
 *.gguf
 *.log
 *.ncu-rep
-*.ninfer
+*.voidinfer
 *.nsys-rep
 *.pyc
 *.qdrep

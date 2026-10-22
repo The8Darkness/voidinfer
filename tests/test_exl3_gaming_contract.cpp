@@ -1,6 +1,6 @@
 #include "exl3/gaming_optimizations.h"
 #include <iostream>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void require(bool ok) { if(!ok)throw std::runtime_error("gaming option contract"); }
 int main() {
     try {
@@ -21,7 +21,7 @@ int main() {
             try{(void)Exl3GamingOptions::from_environment();}catch(const std::invalid_argument&){refused=true;}
             require(refused);_putenv_s(flag,"0");
         }
-        _putenv_s("NINFER_GOPT_007","1");_putenv_s("NINFER_GOPT_008","1");
+        _putenv_s("VOIDINFER_GOPT_007","1");_putenv_s("VOIDINFER_GOPT_008","1");
         bool refused=false;
         try{(void)Exl3GamingOptions::from_environment();}catch(const std::invalid_argument&){refused=true;}
         require(refused);

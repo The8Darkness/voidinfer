@@ -25,7 +25,7 @@ void run_numeric_attention_tiled_t71_oracle(bool splitk=false,bool rows2=false) 
         constexpr std::uint16_t guard=0x5b7d;
         DeviceBuffer dq(q.size()*2),dk(k.size()*2),dv(v.size()*2);
         const std::size_t split_workspace_bytes=splitk?
-            ninfer::exl3::exl3_numeric_attention_splitk_workspace_bytes(rows,capacity):0;
+            voidinfer::exl3::exl3_numeric_attention_splitk_workspace_bytes(rows,capacity):0;
         DeviceBuffer baseline((output_elements+2)*2),candidate((output_elements+2)*2),
             repeat((output_elements+2)*2),scores(score_elements*4),
             split_workspace(split_workspace_bytes+2*sizeof(float));
@@ -41,7 +41,7 @@ void run_numeric_attention_tiled_t71_oracle(bool splitk=false,bool rows2=false) 
             &workspace_guard,sizeof(float),cudaMemcpyHostToDevice),"T71 workspace back canary");
 
         const auto run_baseline=[&] {
-            ninfer::exl3::exl3_exact_attention_for_test(
+            voidinfer::exl3::exl3_exact_attention_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),
@@ -51,20 +51,20 @@ void run_numeric_attention_tiled_t71_oracle(bool splitk=false,bool rows2=false) 
                 false,false,true);
         };
         const auto run_candidate=[&](DeviceBuffer& destination) {
-            if(splitk) ninfer::exl3::exl3_numeric_attention_splitk_for_test(
+            if(splitk) voidinfer::exl3::exl3_numeric_attention_splitk_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),
                 static_cast<std::uint16_t*>(destination.get())+1,
                 static_cast<float*>(split_workspace.get())+1,split_workspace_bytes,
                 rows,position,capacity);
-            else if(rows2) ninfer::exl3::exl3_numeric_attention_rows2_for_test(
+            else if(rows2) voidinfer::exl3::exl3_numeric_attention_rows2_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),
                 static_cast<std::uint16_t*>(destination.get())+1,
                 rows,position,capacity);
-            else ninfer::exl3::exl3_numeric_attention_tiled_for_test(
+            else voidinfer::exl3::exl3_numeric_attention_tiled_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),

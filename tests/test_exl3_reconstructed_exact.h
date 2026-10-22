@@ -6,12 +6,12 @@
 // Uses the T69 capture value type and independent sampled FP64 oracle.
 void run_reconstructed_exact_projection(
     Exl3TextModel& target, const std::vector<std::int64_t>& source) {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
-    if(const auto residual=env("NINFER_TEST_RESIDUAL_NORM_OPERATOR");!residual.empty()) {
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
+    if(const auto residual=env("VOIDINFER_TEST_RESIDUAL_NORM_OPERATOR");!residual.empty()) {
         require(residual=="1","residual norm fixture option");
         run_residual_norm_operator_comparison();
     }
-    const std::filesystem::path directory = env("NINFER_RECON_EXACT_OUT");
+    const std::filesystem::path directory = env("VOIDINFER_RECON_EXACT_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory),
             "reconstructed exact output directory must be new");
     std::filesystem::create_directories(directory);
@@ -21,7 +21,7 @@ void run_reconstructed_exact_projection(
     pairs << "rows,pair,order,repetitions,direct_us,candidate_us\n";
     require(target.max_context() >= 1040 && source.size() >= 1040,
             "reconstructed exact source/context extent");
-    const auto offset_text=env("NINFER_TEST_RECON_EXACT_SOURCE_OFFSET");
+    const auto offset_text=env("VOIDINFER_TEST_RECON_EXACT_SOURCE_OFFSET");
     std::size_t source_offset=0;
     require(offset_text.size()<=6,"reconstructed exact source offset length");
     for(char c:offset_text) {
@@ -30,18 +30,18 @@ void run_reconstructed_exact_projection(
     }
     require(source_offset<=source.size()-1040,"reconstructed exact source offset extent");
     const auto* prompt_source=source.data()+source_offset;
-    for (const char* key : {"NINFER_EXL3_WIDE_PREFILL",
-                            "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-                            "NINFER_EXL3_PREFILL_WIDE1024",
-                            "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-                            "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
+    for (const char* key : {"VOIDINFER_EXL3_WIDE_PREFILL",
+                            "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+                            "VOIDINFER_EXL3_PREFILL_WIDE1024",
+                            "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+                            "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
         require(env(key) == "1", std::string("reconstructed exact direct flag ") + key);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     T69ProjectionCapture capture;
-    const auto family=env("NINFER_TEST_RECON_EXACT_FAMILY");
+    const auto family=env("VOIDINFER_TEST_RECON_EXACT_FAMILY");
     require(family.empty() || family=="k7" || family=="k6_down",
             "reconstructed exact fixture family");
-    const auto ordinal_text=env("NINFER_TEST_RECON_EXACT_SITE");
+    const auto ordinal_text=env("VOIDINFER_TEST_RECON_EXACT_SITE");
     unsigned ordinal=0;
     require(ordinal_text.size()<=2,"reconstructed exact site ordinal length");
     for(char c:ordinal_text) {
@@ -49,20 +49,20 @@ void run_reconstructed_exact_projection(
         ordinal=ordinal*10+static_cast<unsigned>(c-'0');
     }
     require(ordinal<64,"reconstructed exact site ordinal bound");
-    const auto async_all=env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
+    const auto async_all=env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_ALL");
     if(family=="k6_down")
         require(async_all=="0" || async_all=="1","K6 fixture requires explicit async/direct selection");
-    const auto changed_option=env("NINFER_TEST_RECON_CHANGED_WEIGHTS");
+    const auto changed_option=env("VOIDINFER_TEST_RECON_CHANGED_WEIGHTS");
     require(changed_option.empty() || changed_option=="0" || changed_option=="1","changed-weight fixture option");
     struct CaptureSelection {
         T69ProjectionCapture* capture;int k;unsigned ordinal,seen=0;
-        ninfer::exl3::Exl3CudaLinearWeights next_weights{};
+        voidinfer::exl3::Exl3CudaLinearWeights next_weights{};
         int next_layer=-1;
     };
     CaptureSelection selection{&capture,family=="k6_down"?6:7,ordinal};
-    const auto fused_option=env("NINFER_TEST_FUSED_GATE_UP_OPERATOR");
+    const auto fused_option=env("VOIDINFER_TEST_FUSED_GATE_UP_OPERATOR");
     require(fused_option.empty() || fused_option=="1","fused gate/up operator option");
-    const auto fused_wide=env("NINFER_TEST_FUSED_GATE_UP_WIDE");
+    const auto fused_wide=env("VOIDINFER_TEST_FUSED_GATE_UP_WIDE");
     require(fused_wide.empty() || (fused_wide=="1" && fused_option=="1"),
         "fused wide fixture requires held fused operator mode");
     struct GateUpCapture {
@@ -76,7 +76,7 @@ void run_reconstructed_exact_projection(
         !retained_metadata.owner_before(context_metadata) && !context_metadata.owner_before(retained_metadata),
         "context duplicated immutable metadata backing or lost strong model owner");
     if(fused_option=="1")context->set_layer_observer_for_test(
-        [](const ninfer::exl3::Exl3LayerObservation& x,void* user) {
+        [](const voidinfer::exl3::Exl3LayerObservation& x,void* user) {
             auto& held=*static_cast<GateUpCapture*>(user);
             const auto& site=held.selection->capture->items[1];
             if(!site.input || x.layer!=site.layer || x.rows!=1024 || !held.gate.empty())return;
@@ -95,7 +95,7 @@ void run_reconstructed_exact_projection(
     context->prefill(std::span<const std::int64_t>(prompt_source, 16));
     // Do not inherit T69's const-char-pointer operation comparison.
     context->set_target_projection_observer_for_test(
-        [](const ninfer::exl3::Exl3TargetProjectionObservation& x, void* user) {
+        [](const voidinfer::exl3::Exl3TargetProjectionObservation& x, void* user) {
             auto& selection=*static_cast<CaptureSelection*>(user);
             auto& site = selection.capture->items[1];
             if (x.rows != 1024 || x.metadata.mcg || !x.metadata.mul1 ||
@@ -114,7 +114,7 @@ void run_reconstructed_exact_projection(
             site.layer = x.layer; site.operation = x.operation;
             site.weights = x.weights; site.metadata = x.metadata;
         }, &selection, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(
         std::span<const std::int64_t>(prompt_source + 16, 1024));
     cuda_check(cudaDeviceSynchronize(), "reconstructed exact capture complete");
@@ -133,8 +133,8 @@ void run_reconstructed_exact_projection(
     prompt_identity.flush();require(prompt_identity.good(),"reconstructed exact prompt identity write");
     constexpr int ni = 17408, no = 5120;
     constexpr std::size_t guard = 128, maximum = 1024ull * no;
-    const int slice_columns=ninfer::exl3::exl3_reconstruction_slice_columns(
-        std::getenv("NINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
+    const int slice_columns=voidinfer::exl3::exl3_reconstruction_slice_columns(
+        std::getenv("VOIDINFER_EXL3_RECONSTRUCTION_SLICE_COLUMNS"));
     const std::size_t decoded_bytes = static_cast<std::size_t>(ni) * slice_columns * 2;
     Exl3CudaLinearWorkspace direct(ni, no, 1024, false, false, false, false, false, true);
     const std::size_t retained_bytes = decoded_bytes + 4*guard + direct.workspace_bytes() +
@@ -147,7 +147,7 @@ void run_reconstructed_exact_projection(
         120ull*1024*1024 < 600ull*1024*1024,"fused wide diagnostic scratch budget; select a smaller reconstruction slice");
     struct DecodedBacking {
         DeviceBuffer allocation;
-        ninfer::exl3::Exl3ReconstructionStream stream;
+        voidinfer::exl3::Exl3ReconstructionStream stream;
         explicit DecodedBacking(std::size_t bytes):allocation(bytes){}
     };
     auto decoded_owner=std::make_shared<DecodedBacking>(decoded_bytes+4*guard);
@@ -184,7 +184,7 @@ void run_reconstructed_exact_projection(
         cuda_check(cudaMemcpy(expected.data(),static_cast<std::uint16_t*>(direct_out.get())+guard,
             count*2,cudaMemcpyDeviceToHost),"strategy direct reference");
         for(const auto bytes:{std::size_t(0),decoded_bytes-1,decoded_bytes+1}) {
-            ninfer::exl3::Exl3ReconstructedExactView unavailable;
+            voidinfer::exl3::Exl3ReconstructedExactView unavailable;
             unavailable.data=decoded_data;unavailable.bytes=bytes;
             unavailable.allow_k6_down=true;
             unavailable.backing_owner=decoded_owner;unavailable.model_owner=model_identity;
@@ -198,7 +198,7 @@ void run_reconstructed_exact_projection(
             require(actual==expected,"reservation fallback changed direct output");
         }
         direct.set_reconstructed_exact({});
-        ninfer::exl3::Exl3ReconstructedExactView restored;
+        voidinfer::exl3::Exl3ReconstructedExactView restored;
         restored.data=decoded_data;restored.bytes=decoded_bytes;
         restored.allow_k6_down=true;restored.backing_owner=decoded_owner;
         restored.model_owner=model_identity;
@@ -211,7 +211,7 @@ void run_reconstructed_exact_projection(
     }
     auto invoke = [&](bool candidate, int rows) {
         if(candidate && selection.k==6) {
-            ninfer::exl3::Exl3ReconstructedExactView view;
+            voidinfer::exl3::Exl3ReconstructedExactView view;
             view.data=decoded_data;view.bytes=decoded_bytes;
             view.allow_k6_down=true;
             view.ordered_stream=&decoded_owner->stream;
@@ -289,7 +289,7 @@ void run_reconstructed_exact_projection(
         require(summary.good(), "reconstructed exact evidence write");
         require(pass, "reconstructed exact correctness gate failed; see summary.csv");
     }
-    if(const char* alignment=std::getenv("NINFER_TEST_RECON_PACKED_ALIGNMENT")) {
+    if(const char* alignment=std::getenv("VOIDINFER_TEST_RECON_PACKED_ALIGNMENT")) {
         require(std::string(alignment)=="1","packed alignment fixture option");
         const std::size_t packed_words=std::size_t(ni/16)*(no/16)*(16*selection.k);
         const std::size_t copy_bytes=(packed_words+2*guard+3)*2;
@@ -348,7 +348,7 @@ void run_reconstructed_exact_projection(
             auto observed_weights=original;observed_weights.trellis=misaligned;
             for(int tile_k:{0,ni/16-1})for(int tile_n:{0,no/16-1}) {
                 cuda_check(cudaMemset(decoded_data,0x5a,288*2),"native fragment output guards");
-                ninfer::exl3::exl3_reconstruct_native_tile_for_test(observed_weights,site.metadata,
+                voidinfer::exl3::exl3_reconstruct_native_tile_for_test(observed_weights,site.metadata,
                     tile_k,tile_n,decoded_data+16);
                 std::array<std::uint16_t,288> guarded_fragment{};
                 cuda_check(cudaMemcpy(guarded_fragment.data(),decoded_data,288*2,cudaMemcpyDeviceToHost),
@@ -380,7 +380,7 @@ void run_reconstructed_exact_projection(
                 if(invalid==8)metadata.out_features-=16;
                 cuda_check(cudaMemset(decoded_data,0x5a,288*2),"invalid fragment output sentinel");
                 bool refused=false;
-                try{ninfer::exl3::exl3_reconstruct_native_tile_for_test(weights,metadata,tile_k,tile_n,decoded_data+16);}
+                try{voidinfer::exl3::exl3_reconstruct_native_tile_for_test(weights,metadata,tile_k,tile_n,decoded_data+16);}
                 catch(const std::invalid_argument&){refused=true;}
                 require(refused,"invalid native fragment observation admitted");
                 std::array<std::uint16_t,288> unchanged{};
@@ -551,13 +551,13 @@ void run_reconstructed_exact_projection(
             check(activations.get(),gate_up_capture.activation);
         }
     }
-    if(const auto reuse=env("NINFER_TEST_EQUAL_TRANSFORM_REUSE");!reuse.empty()) {
+    if(const auto reuse=env("VOIDINFER_TEST_EQUAL_TRANSFORM_REUSE");!reuse.empty()) {
         require(reuse=="1","equal transform reuse fixture option");
         struct RestoreReuse {
             std::string value;
-            ~RestoreReuse(){_putenv_s("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS",value.c_str());}
-        } restore{env("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS")};
-        _putenv_s("NINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS","1");
+            ~RestoreReuse(){_putenv_s("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS",value.c_str());}
+        } restore{env("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS")};
+        _putenv_s("VOIDINFER_EXL3_REUSE_EQUAL_INPUT_TRANSFORMS","1");
         DeviceBuffer second_scale(ni*2);
         std::vector<std::uint16_t> scales(ni);
         cuda_check(cudaMemcpy(scales.data(),site.weights.suh,ni*2,cudaMemcpyDeviceToHost),"equal-transform scale baseline");
@@ -586,7 +586,7 @@ void run_reconstructed_exact_projection(
             cuda_check(cudaMemcpy(expected_second.data(),direct.transformed_device(),elements*2,cudaMemcpyDeviceToHost),"equal-transform second reference");
             cuda_check(cudaMemset(direct_out.get(),0x5a,got.size()*2),"equal-transform first guards");
             cuda_check(cudaMemset(candidate_out.get(),0x5a,got.size()*2),"equal-transform second guards");
-            ninfer::exl3::exl3_transform_input_pair(site.weights,site.metadata,second,site.metadata,transform_input,
+            voidinfer::exl3::exl3_transform_input_pair(site.weights,site.metadata,second,site.metadata,transform_input,
                 static_cast<std::uint16_t*>(direct_out.get())+guard,static_cast<std::uint16_t*>(candidate_out.get())+guard,transform_rows);
             auto check_output=[&](const void* output,const std::vector<std::uint16_t>& expected) {
                 cuda_check(cudaMemcpy(got.data(),output,got.size()*2,cudaMemcpyDeviceToHost),"equal-transform guarded result");
@@ -612,7 +612,7 @@ void run_reconstructed_exact_projection(
         // All comparisons above performed blocking readback. Exercise retention
         // only after those consumers have completed, not as a GPU retirement test.
         std::weak_ptr<DecodedBacking> weak=decoded_owner;
-        ninfer::exl3::Exl3ReconstructedExactView retained;
+        voidinfer::exl3::Exl3ReconstructedExactView retained;
         retained.data=decoded_data;retained.bytes=decoded_bytes;
         retained.ordered_stream=&decoded_owner->stream;retained.backing_owner=decoded_owner;
         retained.model_owner=model_identity;

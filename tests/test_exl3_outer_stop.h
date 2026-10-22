@@ -1,7 +1,7 @@
 #pragma once
 
 void run_outer_stop_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     std::vector<std::int64_t> path{10,11,12,13,14,15,16,17};
     int tables=0;
     // Identical head winners do not imply identical per-request stop policy.
@@ -28,7 +28,7 @@ void run_outer_stop_qualification(Exl3TextModel& target,const std::vector<std::i
             result.stopped==(stop<8 && stop<=reject),"outer terminal algebraic decision oracle");
         ++tables;
     }
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto scalar=target.create_context(true),packed=target.create_context(true);
     scalar->prepare_continuation(8);packed->prepare_continuation(8);
     int cases=0;

@@ -12,26 +12,26 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                                       std::ostream& out) {
     require(prompt.size() == 512, "target down K6 qualification requires ctx512");
     require(oscar, "target down K6 qualification requires canonical OSCAR");
-    require(env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "0" &&
-                env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0" &&
-                env("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A") == "0" &&
-                env("NINFER_EXL3_EXTENDED_STREAM_REDUCTION") == "0",
+    require(env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "0" &&
+                env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "0" &&
+                env("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A") == "0" &&
+                env("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION") == "0",
             "target down K6 capture requires all candidates explicit flag0");
-    ninfer::test::ScopedEnvironmentRestore restore_environment{
-        "NINFER_EXL3_TARGET_DOWN_SMALL_M",
-        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
-        "NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A",
-        "NINFER_EXL3_EXTENDED_STREAM_REDUCTION",
-        "NINFER_EXL3_LARGE_DOWN_TOPOLOGY",
-        "NINFER_EXL3_LARGE_DOWN_SPLITS"};
-    _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
-    _putenv_s("NINFER_EXL3_LARGE_DOWN_SPLITS", "");
+    voidinfer::test::ScopedEnvironmentRestore restore_environment{
+        "VOIDINFER_EXL3_TARGET_DOWN_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A",
+        "VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION",
+        "VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY",
+        "VOIDINFER_EXL3_LARGE_DOWN_SPLITS"};
+    _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
+    _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_SPLITS", "");
     auto captured = run_target_down_k6_capture(
         target, draft, prompt, std::filesystem::path{}, oscar);
     require(captured.size() == 43,
             "target down K6 qualification capture count mismatch");
 
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     constexpr Admission admit = Admission::target_continuation_down;
     constexpr Admission ordinary = Admission::ordinary;
     constexpr int input_features = 17408;
@@ -41,9 +41,9 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
     const std::vector<int> oracle_groups = {0, 1, 2, 19, 20, 39};
     const auto& representative = captured.front();
 
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
-    _putenv_s("NINFER_EXL3_EXTENDED_STREAM_REDUCTION", "1");
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "0");
     Exl3CudaLinearWorkspace stream_control(
         input_features, output_features, 8, false, false, true,
         false, false, true);
@@ -54,7 +54,7 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                     representative.metadata, 1, ordinary)) ==
                 "target_extended_stream_reduction",
             "target down K6 async-A flag0 changed the selected stream route");
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "1");
     Exl3CudaLinearWorkspace enabled(
         input_features, output_features, 8, false, false, true,
         false, false, true);
@@ -70,16 +70,16 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                 std::string(generic_owner.dispatch_name(
                     representative.metadata, 8, admit)) == "generic_tile",
             "target down K6 candidate escaped ownership/admission");
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M", "0");
     Exl3CudaLinearWorkspace off(
         input_features, output_features, 8, false, false, true,
         false, false, true);
     require(std::string(off.dispatch_name(representative.metadata, 8, admit)) ==
                 "generic_tile",
             "target down K6 explicit flag0 did not disable the inherited route");
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
     for (const char* invalid : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", invalid);
+        _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", invalid);
         bool rejected=false;
         try {
             Exl3CudaLinearWorkspace invalid_async(
@@ -88,8 +88,8 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
         } catch(const std::invalid_argument&) { rejected=true; }
         require(rejected,"target down K6 async-A accepted a non-exact opt-in value");
     }
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "1");
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M", "0");
     Exl3CudaLinearWorkspace latched_off(
         input_features, output_features, 8, false, false, true,
         false, false, true);
@@ -97,7 +97,7 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                 representative.metadata, 8, admit)) ==
                     "target_down_k6_async_a_stream_reduction",
             "target down K6 enabled workspace did not retain latched flag1");
-    _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
     require(std::string(latched_off.dispatch_name(
                 representative.metadata, 8, admit)) == "generic_tile" &&
                 std::string(enabled.dispatch_name(
@@ -116,7 +116,7 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                     representative.metadata, 9, admit),
             "target down K6 admitted unsupported row count");
     for (const char* declined : {"8", "32", "off", "16-k7"}) {
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", declined);
+        _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", declined);
         require(!enabled.target_down_small_m_candidate(
                     representative.metadata, 8, admit) &&
                     std::string(enabled.dispatch_name(
@@ -124,12 +124,12 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                 "target down K6 admitted a declined topology");
     }
     for (const char* admitted : {"", "16", "16-k6"}) {
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", admitted);
+        _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", admitted);
         require(enabled.target_down_small_m_candidate(
                     representative.metadata, 8, admit),
                 "target down K6 declined an allowed 16-tile topology");
     }
-    _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
+    _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
     for (int variant = 0; variant < 6; ++variant) {
         auto unsupported = representative.metadata;
         if (variant == 0) unsupported.K = 5;
@@ -170,11 +170,11 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
                               item.input.size() * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice),
                    "target down K6 input upload");
-        _putenv_s("NINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
-        _putenv_s("NINFER_EXL3_EXTENDED_STREAM_REDUCTION", "1");
-        _putenv_s("NINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "1");
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_SPLITS", "");
+        _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M", "1");
+        _putenv_s("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_DOWN_K6_ASYNC_A", "1");
+        _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", "16");
+        _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_SPLITS", "");
         Exl3CudaLinearWorkspace candidate(
             input_features, output_features, 8, false, false, true,
             false, false, true);
@@ -343,7 +343,7 @@ void run_target_down_k6_qualification(Exl3TextModel& target,
 
     // Explicit S1 differential: one real GDN layer (2) and one real full layer
     // (3), each at M2 and M8, with candidate/reference sharing the override.
-    _putenv_s("NINFER_EXL3_LARGE_DOWN_SPLITS", "1");
+    _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_SPLITS", "1");
     for (const int layer : {2, 3}) {
         const auto found = std::find_if(captured.begin(), captured.end(),
             [layer](const auto& item) { return item.layer == layer; });

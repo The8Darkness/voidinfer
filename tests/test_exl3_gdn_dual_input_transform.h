@@ -3,12 +3,12 @@
 void run_gdn_dual_input_transform_qualification(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4352,"GDN dual-transform context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","invalid");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","invalid");
     bool invalid_rejected=false;
     try { auto invalid=target.create_context(true); }
     catch(const std::invalid_argument&) { invalid_rejected=true; }
@@ -27,16 +27,16 @@ void run_gdn_dual_input_transform_qualification(
         std::pair<const char*,const std::vector<std::int64_t>*>,2>{
             std::pair{"code",&code},std::pair{"prose",&prose}}) {
         require(fixture.second->size()>=512,"GDN dual-transform fixture extent");
-        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
+        _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","1");
+        _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         for(const int prefix:std::array<int,3>{96,321,512}) {
             const std::vector<std::int64_t> input(
                 fixture.second->begin(),fixture.second->begin()+prefix);
             struct Result {
                 std::vector<std::int64_t> tokens;
-                std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+                std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
             };
             const auto run=[&](Exl3TextContext& context) {
                 const auto request=Request::initialize(context,input,1024);
@@ -68,12 +68,12 @@ void run_gdn_dual_input_transform_qualification(
 void run_gdn_dual_input_transform_route_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4352,"GDN dual-transform route context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    const int measured_pairs=env_int("NINFER_T26_MEASURED_PAIRS",4);
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    const int measured_pairs=env_int("VOIDINFER_T26_MEASURED_PAIRS",4);
     require(measured_pairs>=1&&measured_pairs<=4,
         "GDN dual-transform route measured pair extent");
     const auto greedy=[](Exl3TextContext& context) {
@@ -88,7 +88,7 @@ void run_gdn_dual_input_transform_route_screen(
         double prefill_ms=0;
         double route_ms=0;
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
     };
     constexpr int prefix=4096;
     for(const auto& fixture:std::array<
@@ -98,9 +98,9 @@ void run_gdn_dual_input_transform_route_screen(
             "GDN dual-transform route fixture extent");
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
+        _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","1");
+        _putenv_s("VOIDINFER_EXL3_GDN_DUAL_INPUT_TRANSFORM","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         const auto run=[&](Exl3TextContext& context) {
             const auto route_started=std::chrono::steady_clock::now();

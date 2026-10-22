@@ -4,7 +4,7 @@
 #include <cstring>
 #include <iostream>
 
-using Set=ninfer::exl3::Exl3HostResidentSet;
+using Set=voidinfer::exl3::Exl3HostResidentSet;
 void require(bool value,const char* message) {if(!value) throw std::runtime_error(message);}
 struct Block {
     static constexpr std::size_t bytes=128*1024;

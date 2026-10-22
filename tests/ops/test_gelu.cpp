@@ -1,4 +1,4 @@
-#include "ninfer/ops/gelu.h"
+#include "voidinfer/ops/gelu.h"
 #include "ops/op_tester.h"
 
 #include <cmath>
@@ -6,8 +6,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace voidinfer;
+using namespace voidinfer::test;
 
 namespace {
 

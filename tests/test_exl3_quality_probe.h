@@ -1,14 +1,14 @@
 #pragma once
 
 void run_quality_probe(Exl3TextModel& target,Exl3Dflash2DraftModel& draft) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    const std::filesystem::path fixtures=env("NINFER_QUALITY_DIR"),output=env("NINFER_QUALITY_OUTPUT");
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    const std::filesystem::path fixtures=env("VOIDINFER_QUALITY_DIR"),output=env("VOIDINFER_QUALITY_OUTPUT");
     require(!fixtures.empty() && !output.empty(),"quality fixture/output paths");
     const auto terminal=load_ids((fixtures/"stop.ids").string());
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");_putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto inner=target.create_context(true);require(inner->try_enable_oscar_from_environment(),"quality OSCAR");
     inner->prepare_transaction();inner->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true),reference=target.create_context(true);
     exact->prepare_continuation(8);reference->prepare_continuation(8);
     TapStage stage;std::array<std::uint16_t*,5> staging{};
@@ -51,12 +51,12 @@ void run_quality_probe(Exl3TextModel& target,Exl3Dflash2DraftModel& draft) {
         auto oracle=Request::initialize(*reference,ids);
         for(std::size_t i=0;i<generated.size();++i) {
             require(sample_target(*reference)==generated[i],"quality changed authoritative greedy output");
-            if(ninfer::exl3::exl3_terminal_token(generated[i],terminal)) require(i+1==generated.size(),"quality published post-EOS output");
+            if(voidinfer::exl3::exl3_terminal_token(generated[i],terminal)) require(i+1==generated.size(),"quality published post-EOS output");
             oracle=oracle->append_prompt(*reference,std::span<const std::int64_t>(&generated[i],1));
         }
         require(request->state()->same_payload(*oracle->state()) && request->same_taps(*oracle),"quality final authoritative state");
         std::ofstream file(destination);for(auto token:generated) file<<token<<'\n';file.close();require(file.good(),"quality output write");
-        const auto visible=std::count_if(generated.begin(),generated.end(),[&](auto token){return !ninfer::exl3::exl3_terminal_token(token,terminal);});
+        const auto visible=std::count_if(generated.begin(),generated.end(),[&](auto token){return !voidinfer::exl3::exl3_terminal_token(token,terminal);});
         std::cout << "QUALITY_PROBE name=" << name << " prompt_tokens=" << ids.size() << " committed_tokens=" << generated.size()
             << " visible_tokens=" << visible << " stopped=" << stopped << " prefill_ms=" << prefill_ms
             << " ttft_ms=" << ttft_ms << " decode_ms=" << decode_ms << " visible_tps=" << visible*1000/decode_ms << '\n';

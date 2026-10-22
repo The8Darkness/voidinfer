@@ -15,7 +15,7 @@
 #include "exl3/safetensors.h"
 #include "exl3/recurrent_export_pool.h"
 #include "exl3/greedy_packet.h"
-#include "exl3/mtp_runner.h"
+#include "exl3/sampled_select.h"
 #include "exl3/l0_pinned_pool.h"
 
 #include <cstddef>
@@ -30,9 +30,49 @@
 #include <vector>
 #include <functional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3TextContext;
+// A lane's parked exact-line state (the Engine's one exact VeriCache line
+// verifies every lane's blocks): the line's GDN recurrent/convolution root and
+// frontier metadata at a frontier of that lane, saved and restored by
+// Exl3TextContext::save_exact_line_root / bind_exact_line. Empty until saved.
+class Exl3ExactLineSlot {
+public:
+    Exl3ExactLineSlot();
+    ~Exl3ExactLineSlot();
+    Exl3ExactLineSlot(Exl3ExactLineSlot&&) noexcept;
+    Exl3ExactLineSlot& operator=(Exl3ExactLineSlot&&) noexcept;
+    Exl3ExactLineSlot(const Exl3ExactLineSlot&) = delete;
+    Exl3ExactLineSlot& operator=(const Exl3ExactLineSlot&) = delete;
+    // Frontier of the saved root; -1 when empty.
+    int position() const noexcept;
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+    friend class Exl3TextContext;
+};
+// The Engine's single-lane exact VeriCache line shares the prompt-scale
+// workspaces with its drafting context (set before the contexts are built).
+void exl3_set_exact_line_workspace_sharing(bool enabled) noexcept;
+// Asynchronous exact line (no decode rounds, no folded rows): its GDN layers
+// keep only the private rows of its <= 8-row forwards beside the shared wide
+// slab (set before the line is built; folded VeriCache keeps the default).
+void exl3_set_exact_line_compact_gdn(bool enabled) noexcept;
+// Small device->host readback without a copy engine (exl3_copy_async rationale:
+// the asynchronous VeriCache line's history stream occupies the copy engines
+// and a decode readback queued behind one of its pieces waits ~0.5 ms). A
+// pinned destination is written by a kernel, stream-ordered; a pageable one
+// goes through a pinned bounce buffer and returns after the stream drains,
+// like cudaMemcpyAsync to pageable memory. VOIDINFER_EXL3_KERNEL_COPIES=0 keeps
+// cudaMemcpyAsync.
+cudaError_t exl3_d2h_async(void* host, const void* device, std::size_t bytes, cudaStream_t stream);
+// Small host->device upload without a copy engine (same rationale): a pinned
+// source is read by a kernel, stream-ordered; a pageable one is staged into a
+// pinned slot that is reused only after its copy kernel ran. Captured streams
+// and uploads above 256 KiB keep cudaMemcpyAsync.
+cudaError_t exl3_h2d_async(void* device, const void* host, std::size_t bytes, cudaStream_t stream);
+class Exl3BatchedVerifyCoordinator;
 class Exl3VeriCacheServingCoordinator;
 struct Exl3GreedyPacketTransfer;
 
@@ -274,7 +314,7 @@ struct Exl3HostKVStats {
     std::uint64_t banked_d2h_rows = 0, banked_d2h_bytes = 0;
     std::uint64_t banked_d2h_drains = 0;
     // Opt-in T24 attribution. Times are host steady-clock nanoseconds and are
-    // collected only when NINFER_EXL3_HOST_KV_CPU_PROFILE=1.
+    // collected only when VOIDINFER_EXL3_HOST_KV_CPU_PROFILE=1.
     std::uint64_t page_extension_calls = 0, page_prefix_refs = 0;
     std::uint64_t page_clone_bytes = 0, page_extension_cpu_ns = 0;
     std::uint64_t page_unique_tail_reuses = 0, page_unique_tail_reuse_bytes = 0;
@@ -367,6 +407,11 @@ public:
     static void visit_host_allocations(
         std::span<const std::shared_ptr<const Exl3ExactHostState>> requests,
         const std::function<void(const void*,std::size_t)>& visitor,bool include_unused_capacity=true);
+    // Logical exact-KV bytes of the lane-backed pages (deduplicated), which
+    // visit_host_allocations skips: wherever their rows live (lane planes,
+    // filled host planes, packed RAM or the spill file), retaining them costs
+    // this much, so retention budgets count it.
+    static std::uint64_t lane_backed_kv_bytes(std::span<const std::shared_ptr<const Exl3ExactHostState>> requests);
 private:
     static std::shared_ptr<Exl3ExactHostState> create();
     std::shared_ptr<const int> model_identity_;
@@ -384,9 +429,9 @@ private:
     std::array<std::vector<std::uint16_t>, 48> convolution_;
     std::vector<std::uint16_t> logits_, embedding_;
     std::array<std::vector<std::uint16_t>, 5> taps_;
-    // L0 OSCAR INT2 history parked with the state, so a resume skips
+    // L0 OSCAR INT4 history parked with the state, so a resume skips
     // re-encoding: per full-attention layer, immutable chunks of
-    // kL0ChunkRows encoded rows (codes [rows][4][64] K then V, FP16 meta
+    // kL0ChunkRows encoded rows (codes [rows][4][code bytes] K then V, FP16 meta
     // [rows][4][4] K then V) covering [0, l0_rows_). Complete chunks are
     // shared with later states of the same lineage.
 public:
@@ -398,8 +443,8 @@ public:
         std::uint16_t* meta() const noexcept {
             return reinterpret_cast<std::uint16_t*>(block.data + code_bytes());
         }
-        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 64; }
-        std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * 2 * 4 * 4 * 2; }
+        std::size_t code_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::row_code_bytes(); }
+        std::size_t meta_bytes() const noexcept { return static_cast<std::size_t>(rows) * l0_oscar_format::kRowMetaBytes; }
     };
 private:
     int l0_rows_ = 0;
@@ -506,7 +551,7 @@ public:
     std::shared_ptr<Exl3TextContext> create_context_reserved(
         Exl3VeriCacheServingCoordinator&,bool capture_taps=true,
         unsigned startup_fault_for_test=0,bool enable_qualified_media=false,
-        bool allow_ordinary_graphs=true) const;
+        bool allow_ordinary_graphs=true,bool exact_line=false) const;
     int layer_count() const noexcept { return 64; }
     int full_attention_layer_count() const noexcept { return 16; }
     int gdn_layer_count() const noexcept { return 48; }
@@ -528,7 +573,7 @@ private:
         bool defer_reconstruction,Exl3VeriCacheServingCoordinator* authority,unsigned startup_fault=0,
         const std::function<void(const Exl3ResourceInventory::Requirement&)>& extend={},
         Exl3ResourceInventory* actual_result=nullptr,bool enable_qualified_media=false,
-        bool allow_ordinary_graphs=true) const;
+        bool allow_ordinary_graphs=true,bool exact_line=false) const;
     struct Impl;
     explicit Exl3TextModel(std::unique_ptr<Impl> impl);
     std::shared_ptr<Impl> impl_; // immutable uploaded backing also retained by contexts
@@ -672,6 +717,19 @@ public:
     void append_media_embeddings_numeric(std::span<const float> embeddings,
         std::span<const std::int32_t> positions_xyz,cudaStream_t stream=nullptr);
     int rope_offset() const noexcept;
+    // Vision prompts on the device-round route. Cache rows [0,rows_thw.size()/3)
+    // rotate at the frontend's row-major (t,h,w) M-RoPE positions and later
+    // rows at row+delta, in every layer (verifier and exact line included);
+    // an empty table with delta 0 restores text positions. Stream-ordered;
+    // set between requests.
+    void set_rope_map(std::span<const std::int32_t> rows_thw,int delta,cudaStream_t stream);
+    // Prompt rows [first,first+rows) of each span take FP16 [rows,5120]
+    // embeddings from the context's media buffer (starting at span row
+    // `offset`) instead of their token embeddings; an empty list clears.
+    // media_rows_buffer grows the buffer (fenced on `stream`).
+    struct MediaRowSpan {int first=0;int rows=0;std::size_t offset=0;};
+    std::uint16_t* media_rows_buffer(std::size_t rows,cudaStream_t stream);
+    void set_media_rows(std::vector<MediaRowSpan> spans);
     GoptSubmissions gaming_submissions() const noexcept;
     Exl3HostKVStats host_kv_stats() const noexcept;
     struct DeviceTransactionCheckpointGraphStats {
@@ -785,6 +843,35 @@ public:
     // equal-payload but different immutable image; true only after this context
     // successfully restored or exported this exact state identity.
     bool exact_host_state_resident(const Exl3ExactHostState& state) const noexcept;
+    // The L0 planes of this context still hold every KV row of `state`
+    // (its pages are lane-backed by this context; lane_kv_source.h).
+    bool kv_lane_resident(const Exl3ExactHostState& state) const noexcept;
+    // Between requests: returns the device backing of the L0 INT4 codes (the
+    // exported root keeps their pinned copy) and clears exact residency, so
+    // the next request restores them; the lane-backed FP16 planes stay.
+    void park_l0_codes() noexcept;
+    // Device bytes backing this context's L0 INT4 code planes (any thread).
+    std::size_t l0_code_device_bytes() const noexcept;
+    // Retained layer-major projection cache (reconstructed FP16 weights) of
+    // this context's prompt workspace, shared by concurrent lanes; any thread.
+    std::size_t prompt_projection_cache_bytes() const noexcept;
+    // Frees the cache down to keep_bytes and caps its regrowth by the next
+    // layer-major blocks at that size (returns the bytes released; 0 while a
+    // layer-major block holds the cache). Waits for the device.
+    std::size_t release_prompt_projection_cache(std::size_t keep_bytes);
+    // Device bytes the Engine has promised to admitted lanes' L0 code growth
+    // (projections not yet backed); layer-major blocks size their cache and
+    // headroom beside it.
+    static void set_reserved_l0_code_growth(std::uint64_t bytes) noexcept;
+    static std::uint64_t reserved_l0_code_growth() noexcept;
+    // Concurrent lanes under device-memory pressure, between rounds: moves
+    // the L0 INT4 code/meta rows [0,position) to pinned host memory and
+    // returns all their device backing (returns the device bytes released).
+    // Nothing may run on this context until resume_l0_codes brought them back;
+    // the caller drains every stream that could still read them first.
+    std::size_t suspend_l0_codes(cudaStream_t stream);
+    void resume_l0_codes(cudaStream_t stream);
+    bool l0_codes_suspended() const noexcept;
     // Returns true only when a restore was submitted. A resident hit still
     // passes retirement/failed-lineage gates; callers own acquisition identity.
     bool restore_exact_host_state_if_needed(const Exl3ExactHostState& state,cudaStream_t stream=0);
@@ -828,7 +915,7 @@ public:
     // or128 with PREFILL_WIDE128=1 and shared accumulation;256 additionally
     // requires PREFILL_WIDE256=1 and shared input transforms.
     //512/1024 additionally require their exact flags and shared layer scratch.
-    // Requires a context constructed with NINFER_EXL3_WIDE_PREFILL=1.
+    // Requires a context constructed with VOIDINFER_EXL3_WIDE_PREFILL=1.
     void append_prefill_wide(std::span<const std::int64_t> token_ids,
                              cudaStream_t stream = nullptr);
     // Experimental ordinary device-KV suffix schedule: process each layer's
@@ -848,7 +935,7 @@ public:
     void append_prefill_layer_major(std::span<const std::int64_t> token_ids,
                                     cudaStream_t stream = nullptr,
                                     const RetainedTapTail* retained_taps = nullptr);
-    // Fresh-prompt layer-major policy (NINFER_EXL3_LAYER_MAJOR_FROM_ZERO, default
+    // Fresh-prompt layer-major policy (VOIDINFER_EXL3_LAYER_MAJOR_FROM_ZERO, default
     // 1, process latched; 0 = initial16 control): a reset context admits
     // layer-major prefill at position 0, so the
     // whole prompt runs as 1024-row layer-major chunks instead of an ordered
@@ -911,6 +998,17 @@ public:
     std::size_t greedy_transfer_pool_available_for_test() const noexcept;
     static std::uintptr_t greedy_transfer_identity_for_test(
         const Exl3PendingGreedyPacket&) noexcept;
+    // Coupled sampled selection for every later packet and VeriCache row
+    // score of this context (temperature 0 restores greedy argmax).
+    void set_device_sampling(const Exl3DeviceSampling& sampling) noexcept;
+    const Exl3DeviceSampling& device_sampling() const noexcept;
+    // Logical depth of each verifier row (verification tree) for the coupled
+    // draw keys of packets with exactly that many rows; empty = plain chain.
+    void set_sampling_row_depths(std::span<const int> depths);
+    // Input tokens of the verifier rows of packets with exactly that many rows
+    // ([seed, chain drafts, sibling leaves]): their drafted history for the
+    // presence penalty; empty = rows see only the committed output.
+    void set_sampling_row_inputs(std::span<const std::int64_t> inputs);
     Exl3GreedyPacket greedy_packet(bool continuation, cudaStream_t stream = nullptr);
     Exl3PendingGreedyPacket submit_greedy_packet(
         bool continuation,std::uint64_t acquisition,std::uint64_t execution,
@@ -968,8 +1066,51 @@ public:
 
     // L0 OSCAR exact history (VeriCache verifier, lossless ingestion): while
     // set, every full-attention layer attends to its history from the FP16 L2
-    // planes instead of the INT2 codes and hot rows.
+    // planes instead of the INT4 codes and hot rows.
     void set_l0_exact_history(bool exact) noexcept;
+    // Called between the blocks of a multi-block L0 prompt ingestion, outside
+    // the prompt tier (concurrent Engine lanes: other lanes' verification
+    // passes run there). Empty: no yield.
+    void set_prefill_yield(std::function<void(cudaStream_t)> yield);
+    // Batched multi-agent rounds: one target forward over this context's
+    // verifier rows followed by the peer's (each 2..8 rows), sharing every
+    // row-independent projection; each context keeps its own KV, recurrent
+    // state, taps, logits, positions and transaction exactly as continue_rows
+    // would leave them.
+    // Launches on `stream`; the peer's transaction state belongs to
+    // `peer_stream` (defaults to `stream`), which must wait for this forward.
+    void continue_rows_batched(Exl3TextContext& peer, std::span<const std::int64_t> own_tokens,
+                               std::span<const std::int64_t> peer_tokens,
+                               cudaStream_t stream = nullptr, cudaStream_t peer_stream = nullptr);
+    // Captures the batched layer stack for this (peer, own_rows, peer_rows)
+    // shape while both contexts are idle; continue_rows_batched replays it.
+    void prepare_batched_continuation_graph(Exl3TextContext& peer, int own_rows, int peer_rows);
+    // N-agent batched rounds: up to kMaxBatchedPeers peers follow the owner's
+    // rows in order (each 2..8 rows); each peer's transaction state belongs to
+    // its `stream` (defaults to the owner's stream).
+    static constexpr std::size_t kMaxBatchedPeers = 7;
+    struct BatchedPeer {
+        Exl3TextContext* context = nullptr;
+        std::span<const std::int64_t> tokens;
+        cudaStream_t stream = nullptr;
+    };
+    void continue_rows_batched(std::span<const BatchedPeer> peers,
+                               std::span<const std::int64_t> own_tokens,
+                               cudaStream_t stream = nullptr);
+    void prepare_batched_continuation_graph(std::span<Exl3TextContext* const> peers, int own_rows,
+                                            std::span<const int> peer_rows);
+    // Whether an L0 OSCAR prompt block can take the layer-major schedule now.
+    bool l0_layer_major_headroom() const;
+    // Batched multi-agent rounds: the DFlash2 verifier's target continuation
+    // goes through this coordinator (shared by the Engine's lanes) when set.
+    // Overlapped (side-stream) GDN retained-prefix repair; concurrent Engine
+    // lanes disable it.
+    void set_gdn_repair_overlap(bool enabled) noexcept;
+    void set_batched_verify(Exl3BatchedVerifyCoordinator* coordinator) noexcept {
+        batched_verify_ = coordinator;
+    }
+    void continue_rows_for_verification(std::span<const std::int64_t> token_ids,
+                                        cudaStream_t stream = nullptr);
 
     // Greedy token and logit gap of each row of the last completed forward:
     // row i yields its argmax and max_logit - logit(next[i]) (0 when next[i]
@@ -980,12 +1121,58 @@ public:
     void save_verified_root(cudaStream_t stream = nullptr);
     void restore_verified_root(cudaStream_t stream = nullptr);
     int verified_root_position() const noexcept;
+    // Folded VeriCache (drafting line): a second root slot saved where the
+    // next block's verification starts; promoted to the verified root when
+    // that block is accepted.
+    void save_verified_root_pending(cudaStream_t stream = nullptr);
+    void promote_verified_root_pending();
+
+    // Folded exact VeriCache: an exact line is a second context of the same
+    // model that verifies a drafting context's blocks inside the drafting
+    // rounds' batched target forwards. Its full-attention layers read and
+    // write the drafting context's FP16 planes with exact history only (no
+    // INT4 codes, hot rows or KV pages of its own); its GDN state, window
+    // ring and position are its own.
+    void make_exact_line(Exl3TextContext& drafting);
+    bool exact_line() const noexcept;
+    // An exact line verifying another lane: reads and writes `drafting`'s FP16
+    // planes and M-RoPE map from now on (no device work, no allocation).
+    void bind_exact_line(Exl3TextContext& drafting);
+    // The line's GDN root and frontier metadata at its position, into `slot`
+    // (allocated on first use, beside the verified roots).
+    void save_exact_line_root(Exl3ExactLineSlot& slot, cudaStream_t stream = nullptr) const;
+    // The line back to `slot`'s frontier of the drafting context it is bound
+    // to: GDN state, position, and (with `rebuild_window`, after the line
+    // served another lane) its sink and window rows from that lane's planes.
+    void restore_exact_line_root(const Exl3ExactLineSlot& slot, bool rebuild_window,
+                                 cudaStream_t stream = nullptr);
+    // A drafting context about to take its exact line's state at `position`
+    // (sync_exact_line_from): rows from `position` on will be rewritten, and
+    // L0 aging and hot rows rewind there (restore_verified_root without its
+    // own GDN root).
+    void rewind_l0_to(int position, cudaStream_t stream = nullptr);
+    // Takes `source`'s current state (GDN, L0 window, position; with
+    // `outputs` also its last logits, taps and embedding rows): an exact line
+    // from its drafting context, or a drafting context from its exact line.
+    void sync_exact_line_from(Exl3TextContext& source, cudaStream_t stream = nullptr,
+                              bool outputs = false);
+    // The next continue_rows_for_verification also runs `line` over `tokens`
+    // (its rows follow this context's in one batched forward).
+    void set_fold_peer(Exl3TextContext* line, std::span<const std::int64_t> tokens,
+                       cudaStream_t line_stream = nullptr);
+    bool fold_pending() const noexcept { return fold_peer_ != nullptr; }
+    // Diagnostic: the decode round (base, rows, batched members, graph) that
+    // produced absolute `position` (recent rounds only).
+    std::string round_trace(int position) const;
     struct RowScore {
         std::int64_t greedy = -1;
         float gap = 0.0f;
     };
+    // `tolerance` (sampled rows): a next token just outside the exact
+    // top-k/top-p/min-p support still gets a finite gap when raising its
+    // logit by `tolerance` would bring it into the support.
     std::vector<RowScore> exact_row_scores(std::span<const std::int64_t> next,
-                                           cudaStream_t stream = nullptr);
+                                           cudaStream_t stream = nullptr,float tolerance = 0.0f);
     int position() const noexcept { return position_; }
     const std::uint16_t* logits_device() const noexcept;
     std::vector<float> logits_host(cudaStream_t stream = nullptr) const;
@@ -1025,7 +1212,7 @@ public:
     std::vector<std::uint16_t> full_attention_k_host(int layer, int position,
                                                       cudaStream_t stream = nullptr) const;
     // E4C1: attach resident OSCAR to the 16 full-attention layers using
-    // environment configuration (NINFER_OSCAR_EXL3=1 plus asset paths).
+    // environment configuration (VOIDINFER_OSCAR_EXL3=1 plus asset paths).
     // Returns false when OSCAR is not requested. Throws fail-closed on bad
     // assets. Ordinary F16 attention stays the path until this succeeds.
     bool try_enable_oscar_from_environment();
@@ -1136,39 +1323,6 @@ public:
     const Exl3CudaLinearWeights& target_lm_head_weights() const noexcept;
     const Exl3CudaLinearMetadata& target_lm_head_metadata() const noexcept;
     const std::uint16_t* target_embedding() const noexcept;
-    // Explicit, default-off capture for a native MTP bridge.  Preparation
-    // must happen on a pristine context, before the first target forward.
-    // Once prepared, ordinary eager prefill/decode forwards copy their exact
-    // final-normalized hidden rows into a separate position-indexed device
-    // allocation.  The capture never changes target authority or target head
-    // selection; callers still obtain independent handoff copies below.
-    void prepare_native_mtp_hidden_capture(int capacity);
-    bool native_mtp_hidden_capture_prepared() const noexcept;
-    int native_mtp_hidden_capture_capacity() const noexcept;
-    int native_mtp_hidden_capture_rows() const noexcept;
-    int native_mtp_hidden_capture_first_position() const noexcept;
-    std::uint64_t native_mtp_hidden_capture_generation() const noexcept;
-    // Copies the exact final-normalized target hidden row into an owned device
-    // allocation for a native MTP bridge. The source final-norm/ping-pong
-    // buffers are never borrowed by the caller and may be reused immediately
-    // after the stream-ordered copy is enqueued.
-    Exl3MtpTargetHiddenHandoff target_hidden_handoff(
-        int row = 0, cudaStream_t stream = nullptr) const;
-    // Bounded batch copy of exact final-normalized target rows.  When the
-    // explicit native-MTP capture is prepared and covers the requested range,
-    // first_row/rows address that position-indexed capture; otherwise they
-    // retain the legacy most-recent-forward meaning.  All returned row views
-    // alias one separately owned allocation, so the transient hidden
-    // ping-pong/capture buffers may be reused after the producer stream reaches
-    // the MTP consumer.  Rows retain absolute positions and one generation.
-    std::vector<Exl3MtpTargetHiddenHandoff> target_hidden_handoffs(
-        int first_row, int rows, cudaStream_t stream = nullptr) const;
-    // Explicit default-off native MTP materialization.  This validates and
-    // uploads the closed 39-tensor manifest, binds the resident target
-    // embedding/H6 head, and allocates a separate bounded MTP KV frontier.
-    // It never changes target authority or enables MTP for ordinary requests.
-    std::shared_ptr<Exl3MtpPrefixState> create_native_mtp_prefix_state(
-        std::uint32_t kv_capacity = 4'096) const;
     std::size_t persistent_bytes() const noexcept { return persistent_bytes_; }
     // Represented context allocation records and fixed layer/workspace/staging
     // objects. Excludes separately reserved reconstruction/prefix owners, graph
@@ -1254,6 +1408,9 @@ private:
     static std::shared_ptr<const Exl3TurboAngleWarmPages> make_turboangle_pages(
         std::shared_ptr<const Exl3ExactHostState> source, int rows);
     struct Impl;
+    struct BatchBinding;
+    struct PromptTierScope;
+    struct BatchTierScope;
     explicit Exl3TextContext(std::unique_ptr<Impl> impl);
     void reset_impl(cudaStream_t stream,bool preserve_exact_payload);
     Exl3RequestResetStats reset_for_request_impl(std::string_view contract,
@@ -1263,12 +1420,28 @@ private:
     void append_prefill_impl(std::span<const std::int64_t> token_ids,
                              cudaStream_t stream, bool wide, bool exact = false);
     void canonicalize_exact_rows(cudaStream_t stream);
+    // VeriCache root: GDN recurrent/convolution checkpoint and frontier
+    // metadata (verified roots, exact-line slots).
+    struct VerifiedRoot;
+    void save_root_slot(bool pending, cudaStream_t stream);
+    void save_root(std::unique_ptr<VerifiedRoot>& slot, cudaStream_t stream) const;
+    void restore_root(const VerifiedRoot& root, cudaStream_t stream);
+    friend class Exl3ExactLineSlot;
     void prepare_transaction_impl(Exl3VeriCacheServingCoordinator*,
                                   unsigned startup_fault_for_test);
     void retain_transaction_prefix_impl(int retained_rows,
                                         int fail_after_model_layer,
                                         cudaStream_t stream);
     std::unique_ptr<Impl> impl_;
+    Exl3BatchedVerifyCoordinator* batched_verify_ = nullptr;
+    Exl3TextContext* fold_peer_ = nullptr;
+    std::vector<std::int64_t> fold_tokens_;
+    cudaStream_t fold_stream_ = nullptr;
+public:
+    std::uint64_t batched_graph_replays() const noexcept { return batched_graph_replays_; }
+    std::uint64_t batched_eager_forwards() const noexcept { return batched_eager_forwards_; }
+private:
+    std::uint64_t batched_graph_replays_ = 0, batched_eager_forwards_ = 0;
     int position_ = 0;
     std::uint16_t* logits_ = nullptr;
     std::size_t persistent_bytes_ = 0;
@@ -1278,4 +1451,4 @@ private:
     friend class Exl3TextModel;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

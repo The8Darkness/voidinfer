@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Fixed owner slots are part of the enclosing object's metadata credit. New
 // allocation families must explicitly fit the menu before physical allocation.
 template<class Owner,std::size_t Capacity>

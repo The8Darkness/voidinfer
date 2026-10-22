@@ -8,7 +8,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Fixed request-local logical ownership for precreated completion events. The
 // native handles remain owned by the enclosing physical lane. A slot becomes
 // reusable only after its exact generation is ready and explicitly retired.

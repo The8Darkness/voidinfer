@@ -4,7 +4,7 @@ static void require(bool b,const char* s){if(!b)throw std::runtime_error(s);}
 #include "exl3_host_residency.h"
 #include <iostream>
 #include <cstring>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void need(bool b,const char* s){if(!b)throw std::runtime_error(s);}
 static void checked(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 int main(){try{
@@ -15,7 +15,8 @@ int main(){try{
     {
         Exl3RecurrentExportPool pool;
         auto a=pool.acquire(sizes),b=pool.acquire(sizes),c=pool.acquire(sizes);
-        need(a && b && c && !pool.acquire(sizes),"three-slot exhaustion failed");
+        auto d=pool.acquire(sizes),e=pool.acquire(sizes),f=pool.acquire(sizes);
+        need(a && b && c && d && e && f && !pool.acquire(sizes),"six-slot exhaustion failed");
         checked(cudaMemcpyAsync(a->data,source,bytes,cudaMemcpyDeviceToHost));
         checked(cudaEventRecord(a->completed));a->recorded=true;checked(cudaEventSynchronize(a->completed));
         need(reinterpret_cast<std::uint32_t*>(a->data)[bytes/4-1]==0x3f3f3f3f,"direct population failed");
@@ -29,6 +30,7 @@ int main(){try{
         need(recycled && recycled->data==address,"retired completed slot not reused");
         recycled->poisoned=true;recycled.reset();
         need(!pool.acquire(sizes),"poisoned slot reused");
+        d.reset();e.reset();f.reset();
         survivor=a;
         std::cout<<"pool allocated="<<pool.stats.allocations<<" hits="<<pool.stats.pool_hits<<" fallback="<<pool.stats.fallbacks
             <<" registration_ms="<<pool.stats.register_ms<<" allocation_ms="<<pool.stats.allocate_ms<<" lock_bytes="<<measured.locked_tensor_bytes<<"\n";
@@ -38,7 +40,9 @@ int main(){try{
     std::vector<std::shared_ptr<Exl3RecurrentSlab>> owners;
     for(int i=0;i<3;++i){auto pool=std::make_unique<Exl3RecurrentExportPool>();for(int n=0;n<3;++n){auto slab=pool->acquire(sizes);if(slab)owners.push_back(std::move(slab));}pools.push_back(std::move(pool));}
     const auto peak=Exl3RecurrentPinBudget::snapshot();
-    need(owners.size()==6 && peak[0]==7*bytes && peak[0]<=Exl3RecurrentPinBudget::cap,"process cap excludes survivors");
+    // Survivor plus nine acquires, bounded by the process cap.
+    const std::size_t capped=std::min<std::size_t>(9,Exl3RecurrentPinBudget::cap()/bytes-1);
+    need(owners.size()==capped && peak[0]==(capped+1)*bytes && peak[0]<=Exl3RecurrentPinBudget::cap(),"process cap excludes survivors");
     owners.clear();pools.clear();survivor.reset();checked(cudaFree(source));
     need(Exl3RecurrentPinBudget::snapshot()[0]==0,"registration remains after all owners retire");
     std::cout<<"PASS_RECURRENT_POOL cap_peak="<<peak[1]<<" final_live=0\n";return 0;

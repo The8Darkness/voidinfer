@@ -9,6 +9,7 @@
 #include <psapi.h>
 #include "exl3/resource_inventory.h"
 #include "exl3/merge_resident_ranges.h"
+#include "exl3/host_memory_available.h"
 #include "exl3/retained_descriptor_ledger.h"
 #include "exl3/bounded_shared_owner.h"
 #include "exl3/reserved_host_payload_union.h"
@@ -29,13 +30,19 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Configured page-budget refusal occurs before ownership publication or locks.
 // Keep it distinct from OS failures and failed rollback/retirement.
 class Exl3HostResidentBudgetExhausted : public std::runtime_error {
 public:
     Exl3HostResidentBudgetExhausted()
         :std::runtime_error("resident page budget exhausted including in-flight roots") {}
+};
+// Available physical memory fell below the configured reserve.
+class Exl3HostResidentReserveExhausted : public std::runtime_error {
+public:
+    Exl3HostResidentReserveExhausted()
+        :std::runtime_error("host residency physical reserve exhausted") {}
 };
 class Exl3HostResidentSet {
 public:
@@ -171,6 +178,9 @@ private:
     inline static FailedCloseStorage failed_close_storage_{};
     inline static std::atomic_bool failed_close_retained_=false;
     static constexpr std::uint64_t chunk_bytes=16ULL<<20,quota_slack=64ULL<<20;
+    // A quota change costs 4-17 ms (SetProcessWorkingSetSizeEx): the minimum
+    // grows by this much more than needed, so most admissions keep it.
+    static constexpr std::uint64_t quota_growth=256ULL<<20;
     std::uint64_t budget_,reserve_,page_=0;
     SIZE_T original_min_=0,original_max_=0,current_min_=0,current_max_=0;
     DWORD original_flags_=0,current_flags_=0;
@@ -273,10 +283,10 @@ private:
         }
     }
     void check_reserve(std::uint64_t missing=0) const {
-        MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
-        if(!GlobalMemoryStatusEx(&memory)) throw error("available memory");
-        if(memory.ullAvailPhys<reserve_ || missing>memory.ullAvailPhys-reserve_)
-            throw std::runtime_error("host residency physical reserve exhausted");
+        const auto available=exl3_available_host_bytes();
+        if(!available) throw error("available memory");
+        if(*available<reserve_ || missing>*available-reserve_)
+            throw Exl3HostResidentReserveExhausted();
     }
     void set_quota(SIZE_T minimum,SIZE_T maximum,DWORD flags) {
         if(!SetProcessWorkingSetSizeEx(GetCurrentProcess(),minimum,maximum,flags)) throw error("working set quota");
@@ -594,16 +604,24 @@ public:
             if(locked) throw std::invalid_argument("resident page has a foreign lock");
             if(!valid) missing+=page_;
         });
-        if(added_bytes) check_reserve(missing);
+        // Only pages that are not resident yet take memory: locking pages
+        // already backed (a root exported from the planes its prefill just
+        // filled) commits nothing, so it never trips the reserve. Refusing it
+        // there freed nothing either and turned every admission under host
+        // pressure into a 429 after a full prefill.
+        if(missing) check_reserve(missing);
         const auto previous_min=current_min_,previous_max=current_max_;const auto previous_flags=current_flags_;
         Range attempted{};
         try {
             if(added_bytes) {
                 const auto required=old_bytes+added_bytes;
-                if(required>std::numeric_limits<SIZE_T>::max()-2*quota_slack) throw std::overflow_error("resident quota overflow");
-                const SIZE_T minimum=std::max<SIZE_T>(current_min_,required+quota_slack);
+                if(required>std::numeric_limits<SIZE_T>::max()-2*quota_slack-quota_growth) throw std::overflow_error("resident quota overflow");
+                constexpr DWORD flags=QUOTA_LIMITS_HARDWS_MIN_DISABLE|QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+                const SIZE_T minimum=required+quota_slack<=current_min_?current_min_:
+                    static_cast<SIZE_T>(required+quota_slack+quota_growth);
                 const SIZE_T maximum=std::max<SIZE_T>(current_max_,minimum+quota_slack);
-                set_quota(minimum,maximum,QUOTA_LIMITS_HARDWS_MIN_DISABLE|QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                if(minimum!=current_min_ || maximum!=current_max_ || flags!=current_flags_)
+                    set_quota(minimum,maximum,flags);
             }
             for(const auto& r:added) for(auto first=r.first;first<r.second;) {
                 const auto end=first+std::min<std::uint64_t>(chunk_bytes,r.second-first);
@@ -615,7 +633,8 @@ public:
                 query(completed.back(),[&](auto,bool valid,bool locked) {
                     if(!valid || !locked) throw std::runtime_error("new resident lock not witnessed");
                 });
-                check_reserve();++stats.lock_calls;
+                if(missing) check_reserve();
+                ++stats.lock_calls;
                 if(after_lock) after_lock(completed.size());
                 first=end;
             }
@@ -921,5 +940,5 @@ public:
         closed_=true;process_owned_=false;
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3
 #endif

@@ -3,8 +3,8 @@
 struct T69ProjectionCaptureItem {
     int layer = -1;
     std::string operation;
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::unique_ptr<DeviceBuffer> input;
 };
 
@@ -12,12 +12,12 @@ struct T69ProjectionCapture {
     std::array<T69ProjectionCaptureItem, 2> items;
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+        const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
         void* user) {
         static_cast<T69ProjectionCapture*>(user)->observe(observation);
     }
 
-    void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if (x.rows != 1024 || x.metadata.mcg || !x.metadata.mul1 ||
             x.metadata.has_bias) return;
         int slot = -1;
@@ -195,9 +195,9 @@ T69OracleMetrics t69_check_fp64_oracle(
 
 void run_projection_reconstruct_gemm_t69(
     Exl3TextModel& target, const std::vector<std::int64_t>& source) {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
-    using Candidate = ninfer::exl3::Exl3CudaReconstructGemmWorkspace;
-    using Phase = ninfer::exl3::Exl3ReconstructGemmPhaseTiming;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
+    using Candidate = voidinfer::exl3::Exl3CudaReconstructGemmWorkspace;
+    using Phase = voidinfer::exl3::Exl3ReconstructGemmPhaseTiming;
     for(int rows:{1,16,128,1024}) {
         const auto weights=5120ull*17408*2;
         const auto scratch=16ull*1024*1024;
@@ -221,20 +221,20 @@ void run_projection_reconstruct_gemm_t69(
     require(overflow_refused,"T69 complete allocation overflow accepted");
     require(target.max_context() >= 1040 && source.size() >= 1040,
             "T69 source/context extent");
-    for (const char* key : {"NINFER_EXL3_WIDE_PREFILL",
-                            "NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-                            "NINFER_EXL3_PREFILL_WIDE1024",
-                            "NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-                            "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
+    for (const char* key : {"VOIDINFER_EXL3_WIDE_PREFILL",
+                            "VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+                            "VOIDINFER_EXL3_PREFILL_WIDE1024",
+                            "VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+                            "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A"})
         require(env(key) == "1", std::string("T69 current direct flag ") + key);
 
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     auto context = target.create_context(true);
     context->prefill(std::span<const std::int64_t>(source.data(), 16));
     T69ProjectionCapture capture;
     context->set_target_projection_observer_for_test(
         T69ProjectionCapture::callback, &capture, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_exact_prefill_wide(
         std::span<const std::int64_t>(source.data() + 16, 1024));
     cuda_check(cudaDeviceSynchronize(), "T69 capture complete");
@@ -242,7 +242,7 @@ void run_projection_reconstruct_gemm_t69(
     require(capture.items[0].input && capture.items[1].input,
             "T69 missing K6/K7 real input");
 
-    const std::filesystem::path directory = env("NINFER_T69_OUT");
+    const std::filesystem::path directory = env("VOIDINFER_T69_OUT");
     require(!directory.empty() && !std::filesystem::exists(directory),
             "T69 output directory must be new");
     std::filesystem::create_directories(directory);
@@ -396,11 +396,11 @@ void run_projection_reconstruct_gemm_t69(
 // projection and a bitwise packed-state FP64 oracle.
 struct K5PrefillCapture {
     std::array<T69ProjectionCaptureItem,3> items;
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,
                          void* user) {
         static_cast<K5PrefillCapture*>(user)->observe(x);
     }
-    void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if(x.rows!=1024 || x.layer!=0 || x.metadata.K!=5 ||
            x.metadata.mcg || !x.metadata.mul1 || x.metadata.has_bias) return;
         const int slot=x.operation=="gate"?0:x.operation=="up"?1:
@@ -454,18 +454,18 @@ std::uint16_t t69_float_to_half_rn(float value) {
 
 void run_k5_prefill_operator(Exl3TextModel& target,
                              const std::vector<std::int64_t>& source) {
-    using Candidate=ninfer::exl3::Exl3CudaReconstructGemmWorkspace;
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Candidate=voidinfer::exl3::Exl3CudaReconstructGemmWorkspace;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     require(source.size()>=1040 && target.max_context()>=1040,
             "K5 prefill source capacity");
-    require(env("NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT")=="1",
+    require(env("VOIDINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT")=="1",
             "K5 prefill test candidate flag");
     auto context=target.create_context(true);
     context->prefill(std::span<const std::int64_t>(source.data(),16));
     K5PrefillCapture capture;
     context->set_target_projection_observer_for_test(
         K5PrefillCapture::callback,&capture,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_prefill_wide(
         std::span<const std::int64_t>(source.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"K5 capture complete");
@@ -548,7 +548,7 @@ void run_k5_prefill_operator(Exl3TextModel& target,
             reused.reused_weight_calls==2 &&
             reused.cached_weight_capacity_bytes>=2ull*5120*17408*2,
             "K5 gate/up distinct weight reuse");
-    const char* lt=std::getenv("NINFER_EXL3_FAST_PREFILL_K5_CUBLAS_LT");
+    const char* lt=std::getenv("VOIDINFER_EXL3_FAST_PREFILL_K5_CUBLAS_LT");
     if (lt && std::strcmp(lt,"1")==0)
         require(reused.k5_lt_calls==4 && down.stats().k5_lt_calls==2,
                 "K5 cuBLASLt candidate did not dispatch");
@@ -761,18 +761,18 @@ void run_k5_prefill_operator(Exl3TextModel& target,
 
 void run_k5_direct_bulk_operator(Exl3TextModel& target,
                                  const std::vector<std::int64_t>& source) {
-    using Candidate=ninfer::exl3::Exl3CudaReconstructGemmWorkspace;
+    using Candidate=voidinfer::exl3::Exl3CudaReconstructGemmWorkspace;
     require(source.size()>=1040 && target.max_context()>=1040,
             "K5 direct bulk source capacity");
-    require(env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL")=="1",
+    require(env("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL")=="1",
             "K5 direct bulk requires FP16 GEMM destination policy");
-    _putenv_s("NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","0");
+    _putenv_s("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","0");
     auto context=target.create_context(true);
     context->prefill(std::span<const std::int64_t>(source.data(),16));
     K5PrefillCapture capture;
     context->set_target_projection_observer_for_test(
         K5PrefillCapture::callback,&capture,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->append_prefill_wide(
         std::span<const std::int64_t>(source.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"K5 direct bulk capture complete");
@@ -793,9 +793,9 @@ void run_k5_direct_bulk_operator(Exl3TextModel& target,
         require((site_index<2 && ni==5120 && no==17408) ||
                 (site_index==2 && ni==17408 && no==5120),
                 "K5 direct bulk reached shape changed");
-        _putenv_s("NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","0");
+        _putenv_s("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","0");
         Candidate control(ni,no,rows,false,true);
-        _putenv_s("NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","1");
+        _putenv_s("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","1");
         Candidate candidate(ni,no,rows,false,true);
         control.begin_layer_reuse(512ull*1024*1024,true);
         candidate.begin_layer_reuse(512ull*1024*1024,true);
@@ -859,7 +859,7 @@ void run_k5_direct_bulk_operator(Exl3TextModel& target,
         control.end_layer_reuse();
         candidate.end_layer_reuse();
     }
-    _putenv_s("NINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","0");
+    _putenv_s("VOIDINFER_EXL3_FAST_GDN_BULK_MLP_PACKED_K5","0");
     std::cout<<"K5_DIRECT_BULK_OPERATOR PASS sites=3 rows=1024"
              <<std::endl;
 }

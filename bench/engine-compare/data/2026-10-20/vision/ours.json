@@ -1,0 +1,92 @@
+[
+ {
+  "case": "scene",
+  "ok": true,
+  "s": 1.955,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 404,
+   "total_tokens": 660
+  },
+  "text": "This is a cheerful, stylized digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, displayed in bold, dark blue capital letters at the top left of the image.\n\nThe scene depicts a peaceful rural landscape under a bright sky:\n\n---\n\n### **Sky and Sun**\n- The background features a clear, light blue sky that gradients slightly lighter near the horizon.\n- In the upper right corner, there’s a large, bright yellow sun with a thin orange outline — simple but radiant, reinforcing the “sunny” theme.\n\n---\n\n### **Mountains**\n- Behind the house are three stylized mountains:\n  - The central mountain is the tallest, with a white snow-capped peak and gray-blue slopes.\n  - To its left is a smaller, darker gray mountain.\n  - To its right is another medium-sized mountain, also grayish-blue.\n- All mountains have clean, angular shapes typical of flat design or children’s illustrations.\n\n---\n\n### **House**\n- Centered in the foreground is a cozy, single-story house:\n  - **Walls**: Light beige or tan color.\n  - **Roof**: A steep, triangular red roof with a black outline.\n"
+ },
+ {
+  "case": "chart",
+  "ok": true,
+  "s": 1.844,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 411,
+   "total_tokens": 667
+  },
+  "text": "This chart, titled **\"NIFER VISION 731\"**, appears to be a simple visual test or demonstration of basic shape recognition and spatial relationships — possibly for vision screening, cognitive assessment, or educational purposes. It is divided into two sections: **COUNT** and **POSITION**.\n\n---\n\n### ✅ What the Chart Shows:\n\n#### 1. **COUNT Section**\n- Displays **three red circles** arranged horizontally.\n- Below them, the text reads:  \n  > **THREE RED CIRCLES**\n\n→ This tests the ability to count objects and identify their color and shape.\n\n---\n\n#### 2. **POSITION Section**\n- Shows a **blue square** on the left.\n- An arrow points from the blue square to the right.\n- On the right side, there is a **green triangle**.\n- Labels below each shape:\n  - Left: **BLUE SQUARE**\n  - Right: **GREEN TRIANGLE**\n\n→ This tests understanding of directional/spatial relationships (e.g., “the square is to the left of the triangle” or “the arrow indicates movement from square to triangle”).\n\n---\n\n### 📊 Values You Can Read:\n\n| Category   | Value /"
+ },
+ {
+  "case": "compare",
+  "ok": true,
+  "s": 0.956,
+  "usage": {
+   "completion_tokens": 136,
+   "prompt_tokens": 505,
+   "total_tokens": 641
+  },
+  "text": "Based on a comparison of the two images provided, here are the differences:\n\n- **Number of Red Circles:**\n  - The \"LEFT PANEL\" image contains two red circles.\n  - The \"RIGHT PANEL\" image contains three red circles.\n\n- **Presence of a Star:**\n  - The \"LEFT PANEL\" image does not have a star.\n  - The \"RIGHT PANEL\" image has one yellow star located in the bottom-right area.\n\n- **Elements that are the same:**\n  - Both panels have an identical blue square in the bottom-left position.\n  - Both panels have the same title bar style and background color."
+ },
+ {
+  "case": "long_prompt",
+  "ok": true,
+  "s": 1.586,
+  "usage": {
+   "completion_tokens": 124,
+   "prompt_tokens": 3506,
+   "total_tokens": 3630
+  },
+  "text": "Based on the image and source code provided:\n\n1.  **Chart Title:** The title of the chart in the image is **NIFER VISION 731**.\n2.  **First Defined Function:** Looking at the C++ source code, the first function defined (within the `Exl3ActivationLifetime` class) is the `current()` method inside the `Witness` struct.\n\n```cpp\nbool current() const noexcept {\n    return lifetime && (generation&1) &&\n        lifetime->generation_.load(std::memory_order_acquire)==generation;\n}\n```"
+ },
+ {
+  "case": "video",
+  "ok": true,
+  "s": 1.781,
+  "usage": {
+   "completion_tokens": 202,
+   "prompt_tokens": 1164,
+   "total_tokens": 1366
+  },
+  "text": "The video begins with a title card that reads \"NIFER TEMPORAL TEST\" in white text on a dark blue background. Below this, the text \"PHASE 2: RED MOVES\" is displayed. A red circle is positioned at the start of a horizontal number line ranging from 0 to 5. The red circle then moves along the number line towards the right.\n\nAs the red circle reaches the position marked '3', the text changes to \"PHASE 3: 3 + BLUE SQUARE\". At this point, a large green number '3' appears next to the red circle. The red circle continues its movement to the right, passing the blue square which is located near the end of the number line.\n\nFinally, the scene transitions to show the text \"PHASE 5: END 9\". The red circle and the green number '3' are now positioned above a yellow box labeled \"END 9\", indicating the conclusion of the test phase."
+ },
+ {
+  "case": "text_after",
+  "ok": true,
+  "s": 0.148,
+  "usage": {
+   "completion_tokens": 2,
+   "prompt_tokens": 24,
+   "total_tokens": 26
+  },
+  "text": "Paris"
+ },
+ {
+  "case": "scene",
+  "ok": true,
+  "s": 2.584,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 404,
+   "total_tokens": 660
+  },
+  "text": "This is a cheerful, stylized digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, displayed in bold, dark blue capital letters at the top left of the image.\n\nThe scene depicts a peaceful rural landscape under a bright sky:\n\n---\n\n### **Sky and Sun**\n- The background features a clear, light blue sky that gradients slightly lighter near the horizon.\n- In the upper right corner, there’s a large, bright yellow sun with a thin orange outline — simple but radiant, reinforcing the “sunny” theme.\n\n---\n\n### **Mountains**\n- Behind the house are three stylized mountains:\n  - The central mountain is the tallest, with a white snow-capped peak and gray-blue slopes.\n  - To its left is a smaller, darker gray mountain.\n  - To its right is another medium-sized mountain, also grayish-blue.\n- All mountains have clean, angular shapes typical of flat design or children’s illustrations.\n\n---\n\n### **House**\n- Centered in the foreground is a cozy, single-story house:\n  - **Walls**: Light beige or tan color.\n  - **Roof**: A steep, triangular red roof with a black outline.\n",
+  "concurrent": 2
+ },
+ {
+  "case": "chart",
+  "ok": true,
+  "s": 2.41,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 411,
+   "total_tokens": 667
+  },
+  "text": "This chart, titled **\"NIFER VISION 731\"**, appears to be a simple visual test or demonstration of basic shape recognition and spatial relationships — possibly for vision screening, cognitive assessment, or educational purposes. It is divided into two sections: **COUNT** and **POSITION**.\n\n---\n\n### ✅ What the Chart Shows:\n\n#### 1. **COUNT Section**\n- Displays **three red circles** arranged horizontally.\n- Below them, the text reads:  \n  > **THREE RED CIRCLES**\n\n→ This tests the ability to count objects and identify their color and shape.\n\n---\n\n#### 2. **POSITION Section**\n- Shows a **blue square** on the left.\n- An arrow points from the blue square to the right.\n- On the right side, there is a **green triangle**.\n- Labels below each shape:\n  - Left: **BLUE SQUARE**\n  - Right: **GREEN TRIANGLE**\n\n→ This tests understanding of directional/spatial relationships (e.g., “the square is to the left of the triangle” or “the arrow indicates movement from square to triangle”).\n\n---\n\n### 📊 Values You Can Read:\n\n| Category   | Value /",
+  "concurrent": 2
+ }
+]

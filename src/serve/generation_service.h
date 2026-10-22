@@ -1,10 +1,10 @@
 #pragma once
 
-// Product-side adapter between HTTP protocol requests and the public NInfer
+// Product-side adapter between HTTP protocol requests and the public VoidInfer
 // engine. It owns one Engine and keeps protocol concerns (aliases, usage,
 // streaming callbacks, and tool-call parsing) outside the target package.
 
-#include "ninfer/engine.h"
+#include "voidinfer/engine.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
@@ -29,9 +29,8 @@ struct GenerationMetrics {
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
-    ninfer::GenerationEngineTiming engine_timing;
 
-    SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
+    bool speculative_enabled                  = false;
     std::uint32_t speculative_draft_window    = 0;
     std::uint64_t speculative_rounds          = 0;
     std::uint64_t speculative_draft_tokens    = 0;
@@ -50,8 +49,7 @@ struct GenerationMetrics {
     std::uint64_t speculative_diagnostic_rows=0;
     std::optional<std::uint64_t> speculative_shared_projection_rows;
     std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
-    ninfer::MaterializationDiagnostics materialization;
+    voidinfer::PrefixReusePath prefix_reuse_path = voidinfer::PrefixReusePath::Root;
 };
 
 struct GenerationOutcome {
@@ -61,9 +59,9 @@ struct GenerationOutcome {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
-    ninfer::ThinkingBudgetStats thinking;
+    voidinfer::ThinkingBudgetStats thinking;
     std::size_t streamed_content_bytes = 0;
-    ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
+    voidinfer::FinishReason finish_reason = voidinfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
 };
 
@@ -74,14 +72,14 @@ struct StreamSink {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+ApiError request_error_to_api_error(const voidinfer::RequestError& exception);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
-    ninfer::GenerationHandle generation;
-    ninfer::ResolvedSamplingParameters sampling;
+    voidinfer::GenerationHandle generation;
+    voidinfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
@@ -104,19 +102,19 @@ public:
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from ServeOptions.
-    [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
+    [[nodiscard]] const voidinfer::EngineOptions& engine_options() const { return engine_->options(); }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] voidinfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] voidinfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] voidinfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
-    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
+    [[nodiscard]] voidinfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }
 
-    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
+    [[nodiscard]] voidinfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }
 
@@ -152,9 +150,9 @@ private:
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
     ServeOptions options_;
-    std::unique_ptr<ninfer::Engine> engine_;
-    ninfer::PromptCapabilities prompt_capabilities_;
+    std::unique_ptr<voidinfer::Engine> engine_;
+    voidinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

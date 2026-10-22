@@ -1,11 +1,12 @@
 #include "exl3/exl3_frontend_resources.h"
-#include <ninfer/targets/qwen3_6/frontend.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
-using namespace ninfer;
+using namespace voidinfer;
 int main(int argc,char** argv){try{
+    if(argc==1)return 77; // fixture-driven validator: skipped by bare CTest
     if(argc!=3)throw std::invalid_argument("target-directory fixtures.json");
     auto resources=exl3::load_pinned_frontend_resources(argv[1]);
     auto frontend=targets::qwen3_6::make_frontend(resources,{.vision_enabled=false,.max_context=4096});
@@ -46,7 +47,7 @@ int main(int argc,char** argv){try{
             if(payload->storage!=storage || expected.size()!=payload->span().size_bytes() || std::memcmp(expected.data(),payload->span().data(),expected.size()))throw std::runtime_error("V6 patch dtype/order mismatch");
             auto reused=visual.prepare(prompt);const auto& again=targets::qwen3_6::PreparedPromptAccess::view(reused);
             if(again.media_payloads[0]!=payload || again.token_ids!=data.token_ids || again.positions!=data.positions)throw std::runtime_error("V6 media cache identity mismatch");
-            if(storage==VisionPatchStorage::Float16){if(const auto* destination=std::getenv("NINFER_TEST_MEDIA_PLAN_OUT")){
+            if(storage==VisionPatchStorage::Float16){if(const auto* destination=std::getenv("VOIDINFER_TEST_MEDIA_PLAN_OUT")){
                 if(std::filesystem::exists(destination))throw std::runtime_error("preserve prepared media plan");
                 nlohmann::ordered_json items=nlohmann::ordered_json::array();
                 for(const auto& item:data.vision_items){nlohmann::ordered_json spans=nlohmann::ordered_json::array();for(auto span:item.token_spans)spans.push_back({{"begin",span.begin},{"count",span.count}});

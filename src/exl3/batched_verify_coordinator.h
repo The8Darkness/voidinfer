@@ -1,0 +1,502 @@
+#pragma once
+// Batched multi-agent rounds: lanes of the coherent-device Engine meet at the
+// target verification of their DFlash2 rounds. The first lane to arrive opens
+// a group and waits briefly; later arrivals join it. The group closes when
+// every active lane of this coordinator has arrived (at most four, the widest
+// batched forward) or when the opener's wait ends. The closing thread runs
+// one batched target forward (Exl3TextContext::continue_rows_batched) led by
+// the member registered first, on that member's stream after every member's
+// queued work; each member resumes on its own stream after the forward. A
+// lane verifies alone when it is the only active lane or nobody joins in time.
+#include "exl3/dflash2_draft.h"
+#include "exl3/linear_cuda.h"
+#include "exl3/text_model.h"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <exception>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace voidinfer::exl3 {
+
+class Exl3BatchedVerifyCoordinator {
+public:
+    static constexpr std::size_t kMaxGroup = Exl3TextContext::kMaxBatchedPeers + 1;
+
+    explicit Exl3BatchedVerifyCoordinator(std::chrono::microseconds wait) : wait_(wait) {}
+    ~Exl3BatchedVerifyCoordinator() {
+        for (auto& [context, lane] : lanes_) {
+            (void)context;
+            cudaEventDestroy(lane.ready);
+            cudaEventDestroy(lane.done);
+        }
+        for (auto& [draft, lane] : draft_lanes_) {
+            (void)draft;
+            cudaEventDestroy(lane.ready);
+        }
+    }
+    Exl3BatchedVerifyCoordinator(const Exl3BatchedVerifyCoordinator&) = delete;
+    Exl3BatchedVerifyCoordinator& operator=(const Exl3BatchedVerifyCoordinator&) = delete;
+
+    // Lanes register in a fixed order; the earliest registered member of a
+    // group leads its forward (captured graphs are prepared per leader and
+    // ordered peer list).
+    void register_context(Exl3TextContext& context) {
+        std::lock_guard lock(mutex_);
+        lane_for(context);
+    }
+
+    // Every group of two or more registered lanes (up to kMaxGroup), as the
+    // ordered member lists a batched forward uses (leader first). More than
+    // four lanes: only the full group and those missing one lane (graphs are
+    // captured per group; the other subsets run eager forwards).
+    std::vector<std::vector<Exl3TextContext*>> groups() const {
+        std::lock_guard lock(mutex_);
+        std::vector<Exl3TextContext*> ordered(lanes_.size());
+        for (const auto& [context, lane] : lanes_) ordered[lane.order] = const_cast<Exl3TextContext*>(context);
+        std::vector<std::vector<Exl3TextContext*>> result;
+        const std::size_t n = ordered.size();
+        for (std::uint32_t mask = 1; mask < (1u << n); ++mask) {
+            std::vector<Exl3TextContext*> members;
+            for (std::size_t i = 0; i < n; ++i)
+                if (mask & (1u << i)) members.push_back(ordered[i]);
+            if (members.size() >= 2 && members.size() <= kMaxGroup &&
+                (n <= 4 || members.size() >= min_graph_width(n) || within_half(mask)))
+                result.push_back(std::move(members));
+        }
+        return result;
+    }
+
+    // A lane holds an active request (decode rounds may arrive).
+    void set_active(bool active) {
+        std::lock_guard lock(mutex_);
+        active_ += active ? 1 : -1;
+        changed_.notify_all();
+    }
+
+    void continue_rows(Exl3TextContext& context, std::span<const std::int64_t> tokens,
+                       cudaStream_t stream) {
+        std::unique_lock lock(mutex_);
+        auto& lane = lane_for(context);
+        if (active_ < 2 && !open_) {
+            ++solo_;
+            lock.unlock();
+            context.continue_rows(tokens, stream);
+            return;
+        }
+        Member mine;
+        mine.context = &context;
+        mine.order = lane.order;
+        mine.stream = stream;
+        mine.tokens.assign(tokens.begin(), tokens.end());
+        mine.ready = lane.ready;
+        mine.done = lane.done;
+        check(cudaEventRecord(mine.ready, stream), "batched verify arrival");
+        const auto arrived = std::chrono::steady_clock::now();
+        std::shared_ptr<Group> group;
+        bool opener = false;
+        if (open_) {
+            group = open_;
+        } else {
+            group = std::make_shared<Group>();
+            open_ = group;
+            opener = true;
+        }
+        group->members.push_back(&mine);
+        changed_.notify_all();
+        const auto target = std::min<std::size_t>(max_group(), static_cast<std::size_t>(std::max(active_, 1)));
+        if (group->members.size() >= target) {
+            open_ = nullptr;
+            lead(lock, *group);
+        } else if (opener) {
+            const auto deadline = arrived + wait_;
+            while (!group->closed && changed_.wait_until(lock, deadline) != std::cv_status::timeout) {
+                // Fewer active lanes now: close once everyone left has arrived,
+                // or once the lanes still missing all wait at the draft gate
+                // (they cannot reach this one before its deadline).
+                const auto now_target = std::min<std::size_t>(max_group(),
+                    static_cast<std::size_t>(std::max(active_, 1)));
+                if (!group->closed && (group->members.size() >= now_target ||
+                    group->members.size() + waiting_draft() >= static_cast<std::size_t>(active_))) break;
+            }
+            if (!group->closed) {
+                if (open_ == group) open_ = nullptr;
+                if (group->members.size() < 2) ++timeouts_;
+                lead(lock, *group);
+            }
+        }
+        changed_.wait(lock, [&] { return group->done; });
+        wait_us_ += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - arrived).count());
+        const auto error = group->error;
+        lock.unlock();
+        if (error) std::rethrow_exception(error);
+    }
+
+    // The same lanes meet again at their cached-ring draft proposals: one
+    // batched draft forward (Exl3Dflash2DraftModel::propose_batched) on the
+    // first-registered member's stream after every member's queued work.
+    std::vector<std::int64_t> propose(Exl3Dflash2DraftModel& draft, std::span<const std::int64_t> block,
+        int block_pos0, const std::uint16_t* target_embedding_bf16, const Exl3CudaLinearWeights& target_head,
+        const Exl3CudaLinearMetadata& target_head_metadata, std::int64_t mask_token_id, cudaStream_t stream) {
+        std::unique_lock lock(mutex_);
+        if (active_ < 2 && !open_draft_) {
+            ++draft_solo_;
+            lock.unlock();
+            return draft.propose_cached_private(block, block_pos0, target_embedding_bf16, target_head,
+                target_head_metadata, mask_token_id, stream);
+        }
+        auto& lane = draft_lane_for(draft);
+        DraftMember mine;
+        mine.request.draft = &draft;
+        mine.request.block = block;
+        mine.request.block_pos0 = block_pos0;
+        mine.order = lane.order;
+        mine.stream = stream;
+        mine.ready = lane.ready;
+        mine.mask_token_id = mask_token_id;
+        check(cudaEventRecord(mine.ready, stream), "batched draft arrival");
+        const auto arrived = std::chrono::steady_clock::now();
+        std::shared_ptr<DraftGroup> group;
+        bool opener = false;
+        if (open_draft_) group = open_draft_;
+        else {
+            group = std::make_shared<DraftGroup>();
+            group->embedding = target_embedding_bf16;
+            group->head = target_head;
+            group->head_metadata = target_head_metadata;
+            open_draft_ = group;
+            opener = true;
+        }
+        group->members.push_back(&mine);
+        changed_.notify_all();
+        const auto target = std::min<std::size_t>(max_group(), static_cast<std::size_t>(std::max(active_, 1)));
+        if (group->members.size() >= target) {
+            open_draft_ = nullptr;
+            lead_draft(lock, *group);
+        } else if (opener) {
+            const auto deadline = arrived + wait_;
+            while (!group->closed && changed_.wait_until(lock, deadline) != std::cv_status::timeout) {
+                // As the verify gate: the missing lanes may all wait there.
+                const auto now_target = std::min<std::size_t>(max_group(),
+                    static_cast<std::size_t>(std::max(active_, 1)));
+                if (!group->closed && (group->members.size() >= now_target ||
+                    group->members.size() + waiting_verify() >= static_cast<std::size_t>(active_))) break;
+            }
+            if (!group->closed) {
+                if (open_draft_ == group) open_draft_ = nullptr;
+                lead_draft(lock, *group);
+            }
+        }
+        changed_.wait(lock, [&] { return group->done; });
+        const auto error = group->error;
+        lock.unlock();
+        if (error) std::rethrow_exception(error);
+        return std::move(mine.request.proposals);
+    }
+    // Lanes waiting in the other gate's open group (mutex held).
+    std::size_t waiting_verify() const { return open_ ? open_->members.size() : 0; }
+    std::size_t waiting_draft() const { return open_draft_ ? open_draft_->members.size() : 0; }
+    std::uint64_t batched_drafts() const {
+        std::lock_guard lock(mutex_);
+        return draft_batched_;
+    }
+
+    std::uint64_t batched_rounds() const {
+        std::lock_guard lock(mutex_);
+        return batched_;
+    }
+    std::uint64_t solo_rounds() const {
+        std::lock_guard lock(mutex_);
+        return solo_;
+    }
+    std::uint64_t eager_rounds() const {
+        std::lock_guard lock(mutex_);
+        return eager_;
+    }
+    std::uint64_t split_rounds() const {
+        std::lock_guard lock(mutex_);
+        return splits_;
+    }
+    std::uint64_t timeouts() const {
+        std::lock_guard lock(mutex_);
+        return timeouts_;
+    }
+    std::uint64_t wait_us() const {
+        std::lock_guard lock(mutex_);
+        return wait_us_;
+    }
+    // Batched rounds by group width (index = members).
+    std::array<std::uint64_t, kMaxGroup + 1> width_histogram() const {
+        std::lock_guard lock(mutex_);
+        return widths_;
+    }
+    // VOIDINFER_EXL3_BATCHED_FORWARD_TIMING=1 (synchronizes each leader
+    // forward): mean forward ms by width, graph and eager rounds apart.
+    std::string forward_timing() const {
+        std::lock_guard lock(mutex_);
+        std::string text;
+        for (std::size_t w = 2; w <= kMaxGroup; ++w)
+            for (int eager = 0; eager < 2; ++eager)
+                if (timed_[w][eager])
+                    text += " w" + std::to_string(w) + (eager ? "e=" : "g=") +
+                        std::to_string(forward_ms_[w][eager] / static_cast<double>(timed_[w][eager])).substr(0, 5) +
+                        "x" + std::to_string(timed_[w][eager]);
+        text += " closes(members/active)";
+        for (std::size_t m = 1; m <= kMaxGroup; ++m)
+            for (std::size_t a = 0; a <= kMaxGroup; ++a)
+                if (closes_[m][a]) text += " " + std::to_string(m) + "/" + std::to_string(a) + "=" +
+                    std::to_string(closes_[m][a]);
+        return text;
+    }
+
+private:
+    struct Lane {
+        std::size_t order = 0;
+        cudaEvent_t ready = nullptr;
+        cudaEvent_t done = nullptr;
+    };
+    struct Member {
+        Exl3TextContext* context = nullptr;
+        std::size_t order = 0;
+        std::vector<std::int64_t> tokens;
+        cudaStream_t stream = nullptr;
+        cudaEvent_t ready = nullptr;
+        cudaEvent_t done = nullptr;
+    };
+    struct Group {
+        std::vector<Member*> members;
+        bool closed = false;
+        bool done = false;
+        std::exception_ptr error;
+    };
+    // Wide coordinators also capture every subset inside lanes 0-3 or 4-7: a
+    // group with no graph of its own runs as (at most) two such half forwards.
+    static bool within_half(std::uint32_t mask) { return (mask & 0xF0u) == 0 || (mask & 0x0Fu) == 0; }
+    // Groups of more than four lanes capture graphs for subsets of at least
+    // VOIDINFER_EXL3_BATCHED_GRAPH_MIN_WIDTH lanes (default n-1); narrower
+    // subsets run eager forwards (launch-bound: 3-4x a captured replay).
+    static std::size_t min_graph_width(std::size_t n) {
+        static const int value = [] {
+            const char* text = std::getenv("VOIDINFER_EXL3_BATCHED_GRAPH_MIN_WIDTH");
+            return text ? std::atoi(text) : 0;
+        }();
+        return value > 0 ? static_cast<std::size_t>(value) : n - 1;
+    }
+    // VOIDINFER_EXL3_BATCHED_MAX_GROUP (2..8): widest group (research).
+    static std::size_t max_group() {
+        static const std::size_t value = [] {
+            const char* text = std::getenv("VOIDINFER_EXL3_BATCHED_MAX_GROUP");
+            const int parsed = text ? std::atoi(text) : static_cast<int>(kMaxGroup);
+            return static_cast<std::size_t>(std::max(2, std::min(static_cast<int>(kMaxGroup), parsed)));
+        }();
+        return value;
+    }
+    static void check(cudaError_t error, const char* what) {
+        if (error != cudaSuccess)
+            throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(error));
+    }
+    Lane& lane_for(Exl3TextContext& context) {
+        auto [it, inserted] = lanes_.try_emplace(&context);
+        if (inserted) {
+            it->second.order = lanes_.size() - 1;
+            check(cudaEventCreateWithFlags(&it->second.ready, cudaEventDisableTiming), "batched verify event");
+            check(cudaEventCreateWithFlags(&it->second.done, cudaEventDisableTiming), "batched verify event");
+        }
+        return it->second;
+    }
+    struct DraftMember {
+        Exl3DraftBatchedRequest request;
+        std::size_t order = 0;
+        cudaStream_t stream = nullptr;
+        cudaEvent_t ready = nullptr;
+        std::int64_t mask_token_id = 0;
+    };
+    struct DraftGroup {
+        std::vector<DraftMember*> members;
+        const std::uint16_t* embedding = nullptr;
+        Exl3CudaLinearWeights head{};
+        Exl3CudaLinearMetadata head_metadata{};
+        bool closed = false;
+        bool done = false;
+        std::exception_ptr error;
+    };
+    Lane& draft_lane_for(const Exl3Dflash2DraftModel& draft) {
+        auto [it, inserted] = draft_lanes_.try_emplace(&draft);
+        if (inserted) {
+            it->second.order = draft_lanes_.size() - 1;
+            check(cudaEventCreateWithFlags(&it->second.ready, cudaEventDisableTiming), "batched draft event");
+        }
+        return it->second;
+    }
+    // The leader stream waits for every member's queued work; the batched
+    // draft synchronizes it before returning host proposals, so members need
+    // no device-side resume.
+    void lead_draft(std::unique_lock<std::mutex>& lock, DraftGroup& group) {
+        group.closed = true;
+        std::sort(group.members.begin(), group.members.end(),
+                  [](const DraftMember* a, const DraftMember* b) { return a->order < b->order; });
+        auto members = group.members;
+        lock.unlock();
+        std::exception_ptr error;
+        try {
+            if (members.size() == 1) {
+                auto& only = *members[0];
+                only.request.proposals = only.request.draft->propose_cached_private(only.request.block,
+                    only.request.block_pos0, group.embedding, group.head, group.head_metadata,
+                    only.mask_token_id, only.stream);
+            } else {
+                const cudaStream_t stream = members[0]->stream;
+                std::vector<Exl3DraftBatchedRequest*> requests;
+                for (auto* member : members) {
+                    if (member != members[0])
+                        check(cudaStreamWaitEvent(stream, member->ready, 0), "batched draft member order");
+                    requests.push_back(&member->request);
+                }
+                // Draft rows never decide output: FP16-accumulate M64 projections.
+                struct RoundNumerics {
+                    RoundNumerics(){exl3_set_batched_round_numerics(true);}
+                    ~RoundNumerics(){exl3_set_batched_round_numerics(false);}
+                } round_numerics;
+                // Batched drafts take up to four lanes (eight with 64-row
+                // batched rounds): wider groups draft in chunks.
+                const std::size_t kDraftChunk = Exl3Dflash2DraftModel::max_batched_members();
+                for (std::size_t first = 0; first < requests.size(); first += kDraftChunk) {
+                    const auto count = std::min(kDraftChunk, requests.size() - first);
+                    if (count == 1) {
+                        auto& only = *members[first];
+                        only.request.proposals = only.request.draft->propose_cached_private(only.request.block,
+                            only.request.block_pos0, group.embedding, group.head, group.head_metadata,
+                            only.mask_token_id, stream);
+                    } else
+                        Exl3Dflash2DraftModel::propose_batched(
+                            std::span<Exl3DraftBatchedRequest* const>(requests.data() + first, count),
+                            group.embedding, group.head, group.head_metadata, stream);
+                }
+            }
+        } catch (...) {
+            error = std::current_exception();
+        }
+        lock.lock();
+        if (members.size() == 1) ++draft_solo_;
+        else ++draft_batched_;
+        group.error = error;
+        group.done = true;
+        changed_.notify_all();
+    }
+
+    // Runs the group's forward with the lock released; every member then
+    // resumes after group.done_event (the leader's completion event).
+    void lead(std::unique_lock<std::mutex>& lock, Group& group) {
+        group.closed = true;
+        ++closes_[std::min(group.members.size(), kMaxGroup)][static_cast<std::size_t>(std::clamp(active_, 0,
+            static_cast<int>(kMaxGroup)))];
+        std::sort(group.members.begin(), group.members.end(),
+                  [](const Member* a, const Member* b) { return a->order < b->order; });
+        auto members = group.members;
+        lock.unlock();
+        std::exception_ptr error;
+        bool eager = false;
+        double timed_ms = -1;
+        try {
+            const std::size_t n = lanes_.size();
+            const bool split = n > 4 && members.size() > 1 && members.size() < min_graph_width(n);
+            if (split) {
+                // No graph for this subset: one forward per half (lanes 0-3,
+                // 4-7), each a captured half-group replay (or a solo round),
+                // on the halves' own leader streams.
+                std::array<std::vector<Member*>, 2> halves;
+                for (auto* member : members) halves[member->order < 4 ? 0 : 1].push_back(member);
+                for (auto& half : halves) {
+                    if (half.empty()) continue;
+                    if (half.size() == 1) {
+                        half[0]->context->continue_rows(half[0]->tokens, half[0]->stream);
+                        continue;
+                    }
+                    Member& leader = *half[0];
+                    std::vector<Exl3TextContext::BatchedPeer> peers;
+                    for (std::size_t i = 1; i < half.size(); ++i) {
+                        check(cudaStreamWaitEvent(leader.stream, half[i]->ready, 0), "split batched peer order");
+                        peers.push_back({half[i]->context, half[i]->tokens, half[i]->stream});
+                    }
+                    const auto graphs_before = leader.context->batched_graph_replays();
+                    leader.context->continue_rows_batched(peers, leader.tokens, leader.stream);
+                    check(cudaEventRecord(leader.done, leader.stream), "split batched completion");
+                    for (std::size_t i = 1; i < half.size(); ++i)
+                        check(cudaStreamWaitEvent(half[i]->stream, leader.done, 0), "split batched resume");
+                    eager = eager || leader.context->batched_graph_replays() == graphs_before;
+                }
+                ++splits_;
+            } else if (members.size() == 1) {
+                members[0]->context->continue_rows(members[0]->tokens, members[0]->stream);
+            } else {
+                Member& leader = *members[0];
+                std::vector<Exl3TextContext::BatchedPeer> peers;
+                for (std::size_t i = 1; i < members.size(); ++i) {
+                    check(cudaStreamWaitEvent(leader.stream, members[i]->ready, 0), "batched verify peer order");
+                    peers.push_back({members[i]->context, members[i]->tokens, members[i]->stream});
+                }
+                const auto graphs_before = leader.context->batched_graph_replays();
+                static const bool timing = std::getenv("VOIDINFER_EXL3_BATCHED_FORWARD_TIMING") != nullptr;
+                if (timing) check(cudaStreamSynchronize(leader.stream), "batched forward timing start");
+                const auto started = std::chrono::steady_clock::now();
+                leader.context->continue_rows_batched(peers, leader.tokens, leader.stream);
+                if (timing) {
+                    check(cudaStreamSynchronize(leader.stream), "batched forward timing end");
+                    timed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                }
+                check(cudaEventRecord(leader.done, leader.stream), "batched verify completion");
+                // Members resume after the forward; ordered here, before the
+                // leader can record its event again for a later round.
+                for (std::size_t i = 1; i < members.size(); ++i)
+                    check(cudaStreamWaitEvent(members[i]->stream, leader.done, 0), "batched verify resume");
+                eager = leader.context->batched_graph_replays() == graphs_before;
+            }
+        } catch (...) {
+            error = std::current_exception();
+        }
+        lock.lock();
+        if (members.size() == 1) ++solo_;
+        else {
+            ++batched_;
+            ++widths_[members.size()];
+            eager_ += eager ? 1 : 0;
+            if (timed_ms >= 0) {
+                forward_ms_[members.size()][eager ? 1 : 0] += timed_ms;
+                ++timed_[members.size()][eager ? 1 : 0];
+            }
+        }
+        group.error = error;
+        group.done = true;
+        changed_.notify_all();
+    }
+
+    const std::chrono::microseconds wait_;
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    std::map<const Exl3TextContext*, Lane> lanes_;
+    std::shared_ptr<Group> open_;
+    std::map<const Exl3Dflash2DraftModel*, Lane> draft_lanes_;
+    std::shared_ptr<DraftGroup> open_draft_;
+    std::uint64_t draft_batched_ = 0, draft_solo_ = 0;
+    int active_ = 0;
+    std::uint64_t batched_ = 0, solo_ = 0, timeouts_ = 0, wait_us_ = 0, eager_ = 0, splits_ = 0;
+    std::array<std::uint64_t, kMaxGroup + 1> widths_{};
+    std::array<std::array<double, 2>, kMaxGroup + 1> forward_ms_{};
+    std::array<std::array<std::uint64_t, 2>, kMaxGroup + 1> timed_{};
+    // Group closes by members x active lanes at the close (timing mode).
+    std::array<std::array<std::uint64_t, kMaxGroup + 1>, kMaxGroup + 1> closes_{};
+};
+
+}  // namespace voidinfer::exl3

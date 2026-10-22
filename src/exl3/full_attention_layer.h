@@ -3,6 +3,7 @@
 #include "exl3/linear_cuda.h"
 #include "exl3/sibling_rows.h"
 #include "exl3/l0_oscar_storage.h"
+#include "exl3/growable_device_region.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/attention_page_ranges.h"
 #include "exl3/attention_position_contract.h"
@@ -22,8 +23,8 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
-// NINFER_EXL3_FA2_PREFILL (default 1): FA2-style prefill attention route.
+namespace voidinfer::exl3 {
+// VOIDINFER_EXL3_FA2_PREFILL (default 1): FA2-style prefill attention route.
 bool exl3_fa2_prefill_enabled();
 
 struct Exl3PrefillQkvConcurrencyView {
@@ -316,8 +317,13 @@ public:
     void arm_captured_retained_prefix(int attempted_rows,int base_position,
                                       cudaStream_t stream);
     void note_captured_replay(int rows) noexcept { oscar_count_ += rows; }
+    bool retained_prefix_armed(int rows) const noexcept {
+        return retained_prefix_available_ && retained_prefix_rows_==rows;
+    }
+    const char* retained_prefix_cleared_by() const noexcept {return retained_prefix_cleared_by_;}
     void invalidate_retained_prefix() noexcept {
         retained_prefix_available_ = false;
+        retained_prefix_cleared_by_ = "invalidate";
     }
 
     // Optional persistent ordinary-attention cache used by the E4A model
@@ -658,10 +664,16 @@ public:
     // Decode-only graph path: kernels read the current position through this
     // stable device pointer instead of a captured host scalar.
     void set_position_device(const int* position_device) noexcept;
+    // Rotary position map of the owning context (rope_map.cuh); read by every
+    // Q/K RoPE launch, so captured graphs follow per-request vision positions.
+    void set_rope_map(const int* map) noexcept { rope_map_ = map; }
     // L0 OSCAR: after the host K/V planes were restored to `position`, reload
     // the device window (sink and recent rows) and re-encode the history.
     void l0_refresh_window(int position, cudaStream_t stream);
-    // Parks / reinstalls the encoded INT2 history (rows [0, watermark)).
+    // Concurrent lanes: switch between the private decode window ring and the
+    // shared prompt-scale ring, carrying the window rows of `position`.
+    void l0_select_ring(bool prompt, int position, cudaStream_t stream);
+    // Parks / reinstalls the encoded INT4 history (rows [0, watermark)).
     // Export returns the watermark; import follows l0_refresh_window.
     int l0_history_watermark(cudaStream_t stream) const;
     // Rows [first, first + rows): codes K then V ([rows][4][64] each), FP16
@@ -672,13 +684,86 @@ public:
                            const std::uint16_t* meta, cudaStream_t stream);
     void l0_set_history_watermark(int rows, int position, cudaStream_t stream);
     // L0 OSCAR exact history (l0_exact.cuh): while set, history attention reads
-    // the FP16 L2 planes instead of the INT2 codes and hot rows (VeriCache
+    // the FP16 L2 planes instead of the INT4 codes and hot rows (VeriCache
     // verifier passes and lossless ingestion). No effect without L0 storage.
     void set_l0_exact_history(bool exact) noexcept { l0_exact_ = l0_exact_prefill_ = exact; }
+    // Exact line of folded VeriCache (Exl3TextContext::make_exact_line): the
+    // layer attends with exact history only and keeps no INT4 codes or hot
+    // rows (no encode, no hot fills); its window ring stays its own. Set
+    // before set_kv_cache, the L0 storage gets no meta planes or hot rows.
+    // FP8 history mirror (l0_exact.cuh L0LineFp8) of the context's FP16
+    // planes: `use` (the asynchronous VeriCache line) attends it in staged
+    // exact passes; otherwise staged exact passes only extend it.
+    void set_l0_fp8_mirror(std::uint8_t* k, std::uint8_t* v, std::atomic<int>* valid, bool use) noexcept {
+        l0_fp8_k_ = k; l0_fp8_v_ = v; l0_fp8_valid_ = valid; l0_fp8_use_ = use;
+    }
+    void set_l0_exact_only(bool exact_only) noexcept {
+        l0_exact_only_ = exact_only;
+        if (exact_only) l0_exact_ = l0_exact_prefill_ = true;
+    }
+    // Copies `source`'s L0 window ring and sink rows (same ring size) and,
+    // with `aging_state`, its encode watermark state.
+    void copy_l0_window_from(const Exl3FullAttentionLayer& source, cudaStream_t stream,
+                             bool aging_state);
+    // Batched multi-agent rounds: while set, forward() runs its row-independent
+    // work over own_rows + every peer's rows, and each peer layer (another
+    // agent's context, same model layer) runs its own stateful core on its rows
+    // at its own position.
+    // stream: the peer's own (transaction) stream; launches use the owner's.
+    struct BatchPeer { Exl3FullAttentionLayer* layer = nullptr; int rows = 0; int position = 0;
+                       cudaStream_t stream = nullptr; };
+    static constexpr std::size_t kMaxBatchPeers = 7;
+    struct Batch {
+        int own_rows = 0;
+        int peer_count = 0;
+        std::array<BatchPeer, kMaxBatchPeers> peers{};
+        // Optional: each peer's stateful core runs on its own forked stream
+        // (fork_event recorded on the owner stream, join_events back) so the
+        // agents' recurrence/attention kernels overlap.
+        std::array<cudaStream_t, kMaxBatchPeers> fork_streams{};
+        cudaEvent_t fork_event = nullptr;
+        std::array<cudaEvent_t, kMaxBatchPeers> join_events{};
+    };
+    void set_batch(const Batch* batch) noexcept { batch_ = batch; }
+    // Context owning this layer: L0 decode scratch is shared by the layers of
+    // one context only (set before set_kv_cache).
+    void set_l0_scratch_owner(const void* owner) noexcept { l0_scratch_owner_ = owner; }
+    // Growable L0 planes: back rows [0, rows) (plus margin) before a forward
+    // may touch them; release backing beyond `rows` once nothing in flight
+    // references it (request reset).
+    void ensure_l0_rows(int rows);
+    void release_l0_rows_beyond(int rows);
+    // Suspended lanes (device-memory pressure): bytes of code/meta rows
+    // [0,rows), their copy to or from `host` (packed plane after plane), and
+    // the release of all their device backing (no work may reference it).
+    std::size_t l0_code_bytes(int rows) const noexcept;
+    void copy_l0_codes(std::byte* host,int rows,bool to_host,cudaStream_t stream);
+    void release_l0_codes();
+    // Device bytes currently backing the growable L0 code/meta planes.
+    std::size_t l0_code_device_bytes() const noexcept {
+        std::size_t bytes = 0;
+        for (const auto& region : l0_regions_) if (region) bytes += region->mapped_bytes();
+        return bytes;
+    }
+    // Concurrent Engine lanes: binds the context's small (<= views.rows) tier
+    // and selects it. The prompt tier (the shared prompt-scale views given at
+    // construction) is selected only around exclusive prompt/verifier passes.
+    void enable_small_tier(const Exl3SmallTierViews& views);
+    void set_prompt_tier(bool prompt) noexcept;
+    // Selects the shared batch views (views.batch) of the small tier.
+    void set_batch_tier(bool batch) noexcept;
 
     // Rewind L0 aging and hot rows to a verified root at `position` (VeriCache):
     // rows from history_end(position) on will be rewritten and re-encoded.
     void l0_rewind(int position, cudaStream_t stream);
+    // A new history (context reset): no coded rows and no hot rows. Hot rows
+    // are keyed by row index only, so rows kept from the previous history
+    // would serve its FP16 values for the new one's rows.
+    void l0_reset_history(cudaStream_t stream);
+    // Exact line moved to another lane's planes: its sink rows (and a full-size
+    // window ring, which l0_rewind leaves alone) from those planes, aging state
+    // cleared; the l0_rewind of the restored root follows.
+    void l0_rebind(int position, cudaStream_t stream);
     // K/V cache rows an accepted sibling carries into its chain slot.
     void append_sibling_row_copies(Exl3SiblingRowCopies& out,int source,
                                    int destination) const;
@@ -896,6 +981,17 @@ private:
     int max_rows_ = 0;
     std::size_t workspace_bytes_ = 0;
     std::array<std::uint16_t*, 18> buffers_{};
+    // Private small tier (concurrent lanes): verifier/decode rows use these
+    // buffers and the workspaces' small views; prompt-scale rows use the
+    // (possibly shared) buffers above. TierScope selects per call.
+    std::array<std::uint16_t*, 18> small_buffers_{};
+    std::array<std::uint16_t*, 18> batch_buffers_{};
+    void* small_storage_ = nullptr;
+    int small_rows_ = 0;
+    int batch_rows_ = 0;
+    bool small_tier_active_ = false;
+    bool batch_tier_active_ = false;
+    void require_tier_rows(int rows) const;
     std::array<bool, 18> buffer_owned_{};
     std::array<std::optional<Exl3LayerBufferRetirement>,18> buffer_retirements_{};
     std::array<Exl3CudaLinearWorkspace*, 7> linear_workspaces_{};
@@ -903,10 +999,44 @@ private:
     std::uint16_t* k_cache_ = nullptr;
     // KV-tier fidelity research (kv_fakequant.cuh): aged-row watermark and rotation bank.
     int* fakequant_watermark_ = nullptr;
-    // L0 OSCAR INT2 history (l0_oscar.cuh); empty unless NINFER_EXL3_L0_OSCAR=1.
+    // L0 OSCAR INT4 history (l0_oscar.cuh); empty unless VOIDINFER_EXL3_L0_OSCAR=1.
     l0_oscar::LayerStorage l0_{};
+    std::array<std::unique_ptr<Exl3GrowableDeviceRegion>,4> l0_regions_{};
+    // Window ring rows (keys wrap modulo) and the shared prompt-scale ring of
+    // concurrent lanes (l0_select_ring).
+    int l0_ring_rows_ = 2048;
+    int l0_other_ring_rows_ = 2048;
+    std::uint16_t* l0_prompt_k_ring_ = nullptr;
+    std::uint16_t* l0_prompt_v_ring_ = nullptr;
+    bool l0_prompt_ring_active_ = false;
+    // Arguments of attention_middle(): the stateful core between the Q/K/V
+    // projections and the output projection (see full_attention_layer.cu).
+    struct AttentionMiddle {
+        const std::uint16_t* input_norm;
+        std::uint16_t *qg,*kp,*vp,*qn,*kn,*qr,*kr,*attn,*gp;
+        int rows,position;
+        cudaStream_t stream;
+        bool profile,preserve_m1_topology,wide_prefill,eligible_retained_prefix;
+        cudaEvent_t* starts;
+        cudaEvent_t* ends;
+    };
+    void attention_middle(const AttentionMiddle& m);
+    void run_peer_segment(const std::uint16_t* qg_source,const std::uint16_t* kp_source,
+        const std::uint16_t* vp_source,std::uint16_t* attn_destination,int rows,int position,
+        cudaStream_t stream,cudaStream_t state_stream,bool preserve_m1_topology,int lanes=1);
+    const Batch* batch_ = nullptr;
+    // Agents sharing the current batched forward: the L0 verifier history
+    // splits into kHistorySegments / lanes segments per agent, so every
+    // agent's history CTAs fill one wave together.
+    int history_lanes_ = 1;
+    const void* l0_scratch_owner_ = nullptr;
     bool l0_exact_ = false;          // verifier/decode rows (<= 8)
+    bool l0_exact_only_ = false;     // exact line: no codes/hot rows of its own
     bool l0_exact_prefill_ = false;  // prefill chunks (> 8 rows)
+    std::uint8_t* l0_fp8_k_ = nullptr;
+    std::uint8_t* l0_fp8_v_ = nullptr;
+    std::atomic<int>* l0_fp8_valid_ = nullptr;
+    bool l0_fp8_use_ = false;
 
     int fakequant_bank_ = 0;
     std::uint16_t* v_cache_ = nullptr;
@@ -1030,6 +1160,7 @@ private:
     int fast_wmma32_split_count_ = 0;
     int fast_wmma32_split2_capacity_splits_ = 0;
     const int* position_device_ = nullptr;
+    const int* rope_map_ = nullptr;
     const int* mrope_positions_ = nullptr;
     int rope_offset_ = 0;
     Exl3OscarContext* oscar_ = nullptr;
@@ -1070,6 +1201,9 @@ private:
     std::uint64_t oscar_count_ = 0;
     std::uint64_t ordinary_count_ = 0;
     bool retained_prefix_available_ = false;
+    // Diagnostic: the last transition that cleared the retained prefix.
+    const char* retained_prefix_cleared_by_ = "none";
+    int retained_prefix_cleared_rows_ = 0;
     int retained_prefix_rows_ = 0;
     int retained_prefix_position_ = 0;
     cudaStream_t retained_prefix_stream_ = nullptr;
@@ -1077,4 +1211,4 @@ private:
     Exl3FullAttentionLayerTimings timings_{};
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

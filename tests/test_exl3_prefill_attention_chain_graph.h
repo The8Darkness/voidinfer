@@ -4,20 +4,20 @@
 // the retained-kernel attention-only graph. Prepared for the focused CUDA gate;
 // this helper intentionally does no timing or promotion work.
 void run_prefill_attention_chain_graph(
-    ninfer::exl3::Exl3TextModel& target,
-    ninfer::exl3::Exl3Dflash2DraftModel& draft,
+    voidinfer::exl3::Exl3TextModel& target,
+    voidinfer::exl3::Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& fixture) {
-    using ninfer::exl3::exl3_prefill_attention_chain_global_snapshot;
+    using voidinfer::exl3::exl3_prefill_attention_chain_global_snapshot;
     require(fixture.size()>=4096,"prefill attention-chain fixture extent");
-    const auto saved=env("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
+    const auto saved=env("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
     struct Result {
-        std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> request;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> prefill_state;
+        std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> request;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> prefill_state;
         std::vector<float> prefill_logits;
         std::int64_t next_token=-1;
         std::array<std::uint64_t,5> draft_ring_digest{};
         std::vector<std::int64_t> first_draft_proposal;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> decoded_state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> decoded_state;
     };
     std::array<std::unique_ptr<DeviceBuffer>,5> tap_stage;
     std::array<std::uint16_t*,5> tap_stage_pointers{};
@@ -25,8 +25,8 @@ void run_prefill_attention_chain_graph(
         tap_stage[tap]=std::make_unique<DeviceBuffer>(16ULL*kHidden*2);
         tap_stage_pointers[tap]=static_cast<std::uint16_t*>(tap_stage[tap]->get());
     }
-    const auto run_4k=[&](ninfer::exl3::Exl3TextContext& context) {
-        const auto request=ninfer::exl3::Exl3VeriCacheRequest::initialize(
+    const auto run_4k=[&](voidinfer::exl3::Exl3TextContext& context) {
+        const auto request=voidinfer::exl3::Exl3VeriCacheRequest::initialize(
             context,std::span<const std::int64_t>(fixture.data(),4096),1024);
         require(request && context.position()==4096,
             "prefill attention-chain Engine 4K request extent");
@@ -58,12 +58,12 @@ void run_prefill_attention_chain_graph(
             context.export_exact_host_state()};
     };
 
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH","0");
     auto control=target.create_context(true);
     control->prepare_continuation(8);
     const auto control_result=run_4k(*control);
 
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH","1");
     auto candidate=target.create_context(true);
     candidate->prepare_continuation(8);
     const auto before=exl3_prefill_attention_chain_global_snapshot();
@@ -108,7 +108,7 @@ void run_prefill_attention_chain_graph(
     // B8 and repair options), and publish each authoritative window. The known
     // fixtures reach the requested output limit without a frontend stop/control
     // boundary, so min(8,remaining) is the Engine's exact useful-token policy.
-    using Root=std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest>;
+    using Root=std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest>;
     struct CompleteSchedule {
         std::vector<std::int64_t> output;
         std::vector<int> partitions;
@@ -117,24 +117,24 @@ void run_prefill_attention_chain_graph(
         std::uint64_t proposal_calls=0,neural_rows=0,proposed_suffix_rows=0;
         std::uint64_t verification_rows=0,replay_rows=0,accepted_draft_rows=0;
     };
-    ninfer::exl3::Exl3VeriCacheServingIdentity identity{
+    voidinfer::exl3::Exl3VeriCacheServingIdentity identity{
         "prefill-attention-chain-128","SC_6.00bpw_H6_V6",
         "pinned-tokens","exact-B8-L2","text"};
-    ninfer::exl3::Exl3VeriCacheServingPrefixCache cache(
+    voidinfer::exl3::Exl3VeriCacheServingPrefixCache cache(
         {2,64,2ULL<<30,8ULL<<30},identity);
     MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
     require(GlobalMemoryStatusEx(&memory),
         "prefill attention-chain 128-token memory policy");
-    ninfer::exl3::Exl3VeriCacheServingCoordinator coordinator(cache,
+    voidinfer::exl3::Exl3VeriCacheServingCoordinator coordinator(cache,
         {1,1,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
     // Engine seals physical residency authority and its coordinator metadata
     // backing before any request admission. Merely installing the lane callback
     // is insufficient: reserve_snapshot_metadata intentionally refuses an
     // unbound coordinator even for a current lease.
     coordinator.bind_physical_resources({},
-        ninfer::exl3::Exl3ResourceInventory::unlimited());
+        voidinfer::exl3::Exl3ResourceInventory::unlimited());
     coordinator.reserve_metadata_startup();
-    const auto conditional_value=env("NINFER_EXL3_ENGINE_CONDITIONAL_B8");
+    const auto conditional_value=env("VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8");
     require(conditional_value.empty() || conditional_value=="0" ||
             conditional_value=="1",
         "prefill attention-chain conditional-B8 option");
@@ -142,7 +142,7 @@ void run_prefill_attention_chain_graph(
     const auto run_complete_schedule=[&](const Result& source) {
         auto compact=source.request->compact_draft(
             draft,tap_stage_pointers);
-        auto lane=std::make_unique<ninfer::exl3::Exl3Dflash2Execution>(
+        auto lane=std::make_unique<voidinfer::exl3::Exl3Dflash2Execution>(
             target.create_context(true),draft,identity.contract());
         // Engine installs this lane-scoped reservation at startup. The focused
         // lane must reproduce that authority before using verify_owned; an
@@ -241,7 +241,7 @@ void run_prefill_attention_chain_graph(
             schedule_graph_after.quarantines==schedule_graph_before.quarantines,
         "prefill attention-chain decode schedule changed prefill graph counters");
     coordinator.close();
-    _putenv_s("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH",saved.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH",saved.c_str());
     std::cout<<"PREFILL_ATTENTION_CHAIN_GRAPH PASS captures="
              <<first.captures-before.captures<<" reset_replays="
              <<second.replays-first.replays

@@ -1,0 +1,22 @@
+{
+ "nv_start_c1_default": 177152,
+ "nv_start_c2_default": 139264,
+ "nv_start_c4_default": 65536,
+ "nv_start_c8_default": 8192,
+ "nv_start_c1_slots0": 182272,
+ "nv_start_c2_slots0": 151552,
+ "nv_start_c4_slots0": 89088,
+ "nv_start_c8_slots0": 13312,
+ "nv_fill_c1": 182272,
+ "nv_fill_c2": 86016,
+ "nv_fill_c4": 26624,
+ "nv_fill_c8": 3072,
+ "ours_fill_c1": 257024,
+ "ours_fill_c2": 192512,
+ "ours_fill_c4": 65536,
+ "ours_fill_c8": 8192,
+ "ours_asym_second": 135168,
+ "nv_asym_pool": 184320,
+ "nv_asym_first": 151552,
+ "nv_asym_second": 38912
+}

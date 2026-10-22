@@ -1,7 +1,7 @@
-#include <ninfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
 
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/frontend_resources.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6 {
+namespace voidinfer::targets::qwen3_6 {
 namespace {
 
 using Json   = nlohmann::json;
@@ -380,7 +380,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     result.strings.reserve(caller.strings.size());
     for (const StopString& stop : caller.strings) {
         if (stop.text.empty()) { throw std::invalid_argument("stop string must not be empty"); }
-        (void)ninfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
+        (void)voidinfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
         const auto duplicate = std::find_if(
             result.strings.begin(), result.strings.end(), [&](const StopString& existing) {
                 return existing.text == stop.text && existing.channel == stop.channel &&
@@ -399,7 +399,15 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string_vi
     output.append(channel,text);
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
+constexpr std::string_view kReplacementCharacter = "\xef\xbf\xbd";
+
+// Appends the decodable prefix of `bytes` to `out` and returns the bytes it
+// consumed; an incomplete trailing sequence stays unconsumed. Sampled
+// byte-level tokens can form ill-formed UTF-8 (a stray continuation byte, a
+// lead byte followed by a non-continuation, an overlong or surrogate code
+// point): each ill-formed sequence becomes U+FFFD, as tokenizers decode with
+// errors="replace", and the token stream itself stays exact.
+std::size_t decode_utf8_prefix(std::string_view bytes, std::string& out) {
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const auto lead         = static_cast<unsigned char>(bytes[offset]);
@@ -407,8 +415,9 @@ std::size_t valid_utf8_prefix_size(std::string_view bytes) {
         std::uint32_t codepoint = 0;
         std::uint32_t minimum   = 0;
         if (lead <= 0x7fU) {
-            length    = 1;
-            codepoint = lead;
+            out.push_back(static_cast<char>(lead));
+            ++offset;
+            continue;
         } else if (lead >= 0xc2U && lead <= 0xdfU) {
             length    = 2;
             codepoint = lead & 0x1fU;
@@ -422,21 +431,26 @@ std::size_t valid_utf8_prefix_size(std::string_view bytes) {
             codepoint = lead & 0x07U;
             minimum   = 0x10000U;
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            out.append(kReplacementCharacter);
+            ++offset;
+            continue;
         }
-        if (offset + length > bytes.size()) { return offset; }
-        for (std::size_t index = 1; index < length; ++index) {
+        std::size_t index = 1;
+        for (; index < length && offset + index < bytes.size(); ++index) {
             const auto byte = static_cast<unsigned char>(bytes[offset + index]);
-            if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
-            }
+            if ((byte & 0xc0U) != 0x80U) { break; }
             codepoint = (codepoint << 6U) | (byte & 0x3fU);
         }
-        if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
-            codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
+        if (index < length && offset + index == bytes.size()) { return offset; }
+        if (index < length || codepoint < minimum ||
+            (codepoint >= 0xd800U && codepoint <= 0xdfffU) || codepoint > 0x10ffffU) {
+            // The lead byte and its continuations so far are one ill-formed
+            // sequence; a breaking byte starts the next one.
+            out.append(kReplacementCharacter);
+            offset += index;
+            continue;
         }
+        out.append(bytes.substr(offset, length));
         offset += length;
     }
     return offset;
@@ -662,14 +676,15 @@ void feed_token_bytes(DecoderState& state, std::string_view bytes, const StopPol
                       StopMatch* best_match) {
     require_pending_append(state.fixed_pending_storage,state.utf8_pending,bytes.size());
     state.utf8_pending.append(bytes);
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
     auto& text=state.decoded_scratch;
-    if(state.fixed_pending_storage && valid>text.capacity())
+    // Each pending byte decodes to at most one 3-byte replacement character.
+    if(state.fixed_pending_storage && state.utf8_pending.size()>text.capacity()/3)
         throw std::logic_error("decoded output scratch exceeds preallocated capacity");
-    text.assign(state.utf8_pending.data(),valid);
+    text.clear();
     struct ClearDecoded {std::string& value;~ClearDecoded(){value.clear();}} clear_decoded{text};
-    state.utf8_pending.erase(0, valid);
+    const std::size_t consumed = decode_utf8_prefix(state.utf8_pending, text);
+    if (consumed == 0) { return; }
+    state.utf8_pending.erase(0, consumed);
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
@@ -680,7 +695,7 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         // Publish the standard replacement character rather than an invalid
         // UTF-8 suffix; the logical token prefix remains exact.
         state.utf8_pending.clear();
-        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
+        feed_decoded_text(state, kReplacementCharacter, policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
         feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,
@@ -1042,8 +1057,8 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
-          capture_only(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY") != nullptr &&
-                       std::string_view(std::getenv("NINFER_OSCAR_QKV_CAPTURE_ONLY")) == "1") {
+          capture_only(std::getenv("VOIDINFER_OSCAR_QKV_CAPTURE_ONLY") != nullptr &&
+                       std::string_view(std::getenv("VOIDINFER_OSCAR_QKV_CAPTURE_ONLY")) == "1") {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -1287,7 +1302,7 @@ void OutputSession::preallocate_pending_storage() {
     for(const auto& stop:impl_->policy.strings)
         stop_bytes[channel_index(stop.channel)]=std::max(stop_bytes[channel_index(stop.channel)],stop.text.size());
     const auto reserve_decoder=[&](DecoderState& state) {
-        state.decoded_scratch.reserve(utf8);
+        state.decoded_scratch.reserve(checked_sum(checked_sum(utf8,utf8),utf8));
         state.channel_scratch.reserve(checked_sum(std::max(stop_bytes[0],stop_bytes[1]),marker));
         state.utf8_pending.reserve(utf8);
         state.think_marker_pending.reserve(marker);
@@ -1840,4 +1855,4 @@ std::size_t Frontend::output_text_byte_bound(std::uint32_t token_allowance) cons
     return width*token_allowance+repair_bytes;
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace voidinfer::targets::qwen3_6

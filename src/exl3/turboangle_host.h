@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Bounded CPU TurboAngle donor implementation (paper arXiv:2603.27467,
 // Algorithm 1 + quantized pair norms). Fixed d256 seeded sign rotation.
 // K: 7 angle + 8 linear norm bits/pair; V: 6 angle + 4 log norm bits/pair.
@@ -90,4 +90,4 @@ struct TurboAngle256 {
         return result;
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

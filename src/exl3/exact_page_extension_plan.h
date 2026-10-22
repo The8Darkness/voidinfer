@@ -2,7 +2,7 @@
 #include "exl3/exact_kv_extent.h"
 #include <cstddef>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3ExactPageExtensionPlan {
     std::size_t all=0,fresh=0;
     static Exl3ExactPageExtensionPlan derive(int old_position,int new_position) {

@@ -2,9 +2,9 @@
 
 void run_wide_request_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4096 && source.size()>2100,"wide request fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     std::array<std::unique_ptr<DeviceBuffer>,5> stage;
     std::array<std::uint16_t*,5> staging{};

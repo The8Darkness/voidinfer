@@ -40,10 +40,10 @@ struct FDTrace {
     std::ofstream* report=nullptr;
     int first_layer=-1,first_position=-1;
     std::size_t retained_bytes=0;
-    static void callback(const ninfer::exl3::Exl3LayerObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3LayerObservation& x,void* user) {
         static_cast<FDTrace*>(user)->observe(x);
     }
-    void observe(const ninfer::exl3::Exl3LayerObservation& x) {
+    void observe(const voidinfer::exl3::Exl3LayerObservation& x) {
         require(x.position==0||x.position==16,"FD fixed block identity");
         const auto copy=[&](const std::uint16_t* ptr,int columns) {
             require(ptr!=nullptr,"FD missing trace plane");
@@ -112,8 +112,8 @@ struct FDTrace {
     }
 };
 
-FDMetric fd_typed_kv(const ninfer::exl3::Exl3ExactHostState& a,
-                     const ninfer::exl3::Exl3ExactHostState& b,std::ofstream& out) {
+FDMetric fd_typed_kv(const voidinfer::exl3::Exl3ExactHostState& a,
+                     const voidinfer::exl3::Exl3ExactHostState& b,std::ofstream& out) {
     struct Plane {int layer,first,rows;std::span<const std::uint16_t> k,v;};
     std::vector<Plane> reference;
     b.visit_kv_for_test([&](int l,int f,int r,auto k,auto v){reference.push_back({l,f,r,k,v});});
@@ -132,12 +132,12 @@ FDMetric fd_typed_kv(const ninfer::exl3::Exl3ExactHostState& a,
 void fd_projection_replay(T69ProjectionCaptureItem& site,std::ofstream& report) {
     require(site.input&&site.metadata.K==7,"FD real K7 capture");
     const int ni=site.metadata.in_features,no=site.metadata.out_features;
-    ninfer::exl3::Exl3CudaLinearWorkspace direct(ni,no,1024,false,false,false,false,false,true);
-    ninfer::exl3::Exl3CudaReconstructGemmWorkspace candidate(ni,no,1024);
+    voidinfer::exl3::Exl3CudaLinearWorkspace direct(ni,no,1024,false,false,false,false,false,true);
+    voidinfer::exl3::Exl3CudaReconstructGemmWorkspace candidate(ni,no,1024);
     DeviceBuffer a(1024ull*no*2),b(1024ull*no*2);
     direct.forward(site.weights,site.metadata,static_cast<const std::uint16_t*>(site.input->get()),
         static_cast<std::uint16_t*>(a.get()),1024,nullptr,
-        ninfer::exl3::Exl3CudaLinearAdmission::target_wide_prefill);
+        voidinfer::exl3::Exl3CudaLinearAdmission::target_wide_prefill);
     candidate.forward_numeric_candidate(site.weights,site.metadata,
         static_cast<const std::uint16_t*>(site.input->get()),static_cast<std::uint16_t*>(b.get()),1024);
     const auto ah=target_continue_device_bits(static_cast<const std::uint16_t*>(a.get()),1024ull*no,"FD direct");
@@ -155,7 +155,7 @@ void fd_attention_replay(const FDTrace& trace,std::ofstream& report) {
     std::copy(trace.k.begin(),trace.k.end(),kp.begin());std::copy(trace.v.begin(),trace.v.end(),vp.begin());
     DeviceBuffer q(trace.q.size()*2),k(kp.size()*2),v(vp.size()*2),a(rows*6144*2),b(rows*6144*2);
     DeviceBuffer scores(rows*24*capacity*4);
-    const auto workspace_bytes=ninfer::exl3::exl3_numeric_attention_splitk_workspace_bytes(rows,capacity);
+    const auto workspace_bytes=voidinfer::exl3::exl3_numeric_attention_splitk_workspace_bytes(rows,capacity);
     DeviceBuffer workspace(workspace_bytes);
     cuda_check(cudaMemcpy(q.get(),trace.q.data(),trace.q.size()*2,cudaMemcpyHostToDevice),"FD Q upload");
     cuda_check(cudaMemcpy(k.get(),kp.data(),kp.size()*2,cudaMemcpyHostToDevice),"FD K upload");
@@ -163,11 +163,11 @@ void fd_attention_replay(const FDTrace& trace,std::ofstream& report) {
     for(int first:{0,496,1008}) {
         const int position=16+first;
         const auto* query=static_cast<const std::uint16_t*>(q.get())+static_cast<std::size_t>(first)*6144;
-        ninfer::exl3::exl3_exact_attention_for_test(query,static_cast<const std::uint16_t*>(k.get()),
+        voidinfer::exl3::exl3_exact_attention_for_test(query,static_cast<const std::uint16_t*>(k.get()),
             static_cast<const std::uint16_t*>(v.get()),static_cast<std::uint16_t*>(a.get()),
             static_cast<float*>(scores.get()),rows,position,capacity,true,nullptr,
             true,true,true,true,true,false,true,false,true,false,false,false,false,true);
-        ninfer::exl3::exl3_numeric_attention_splitk_for_test(query,static_cast<const std::uint16_t*>(k.get()),
+        voidinfer::exl3::exl3_numeric_attention_splitk_for_test(query,static_cast<const std::uint16_t*>(k.get()),
             static_cast<const std::uint16_t*>(v.get()),static_cast<std::uint16_t*>(b.get()),
             static_cast<float*>(workspace.get()),workspace_bytes,rows,position,capacity);
         const auto ah=target_continue_device_bits(static_cast<const std::uint16_t*>(a.get()),rows*6144,"FD exact attention");
@@ -197,10 +197,10 @@ void fd_attention_replay(const FDTrace& trace,std::ofstream& report) {
 }
 
 void run_first_divergence(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    const std::string lane=env("NINFER_FD_LANE");
+    const std::string lane=env("VOIDINFER_FD_LANE");
     require(lane=="projection"||lane=="attention","FD lane must be separate projection or attention");
     require(source.size()>=1040&&target.max_context()==4352,"FD real fixture extent");
-    const std::filesystem::path dir=env("NINFER_FD_OUT");
+    const std::filesystem::path dir=env("VOIDINFER_FD_OUT");
     require(!dir.empty()&&!std::filesystem::exists(dir),"FD output must be new");
     std::filesystem::create_directories(dir);
     std::ofstream out(dir/"divergence.csv"),kvout(dir/"kv.csv");
@@ -214,23 +214,23 @@ void run_first_divergence(Exl3TextModel& target,const std::vector<std::int64_t>&
             ((bits&32768)?-1:1);
         require(static_cast<double>(half_to_float(static_cast<std::uint16_t>(bits)))==value,"FD half decoder");
     }
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
-    _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","0");
+    _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED","0");
     FDTrace trace;trace.boundary=lane=="projection"?22:3;trace.report=&out;
     T69ProjectionCapture capture;
     auto parent=target.create_context(true);parent->prepare_continuation(8);
     parent->set_layer_observer_for_test(FDTrace::callback,&trace);
     if(lane=="projection") parent->set_target_projection_observer_for_test(T69ProjectionCapture::callback,
-        &capture,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        &capture,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     t69b_ingest(*parent,std::span<const std::int64_t>(source.data(),1040));
     parent->set_layer_observer_for_test(nullptr);parent->set_target_projection_observer_for_test(nullptr);
     const auto parent_state=parent->export_exact_host_state();
     if(lane=="projection") fd_projection_replay(capture.items[1],out);
     else fd_attention_replay(trace,out);
-    _putenv_s("NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC",lane=="projection"?"1":"0");
-    _putenv_s("NINFER_EXL3_NUMERIC_ATTENTION_TILED",lane=="attention"?"1":"0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC",lane=="projection"?"1":"0");
+    _putenv_s("VOIDINFER_EXL3_NUMERIC_ATTENTION_TILED",lane=="attention"?"1":"0");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     trace.candidate=true;candidate->set_layer_observer_for_test(FDTrace::callback,&trace);
     t69b_ingest(*candidate,std::span<const std::int64_t>(source.data(),1040));

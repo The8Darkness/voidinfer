@@ -1,5 +1,6 @@
 #pragma once
 
+#include "exl3/host_memory_ledger.h"
 #include "exl3/host_resident_set.h"
 #include "exl3/vericache_request.h"
 #include "exl3/device_page_key.h"
@@ -8,6 +9,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -18,7 +21,7 @@
 #include <vector>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3Dflash2Execution;
 
 // Explicit in-process admission/publication owner for already-authoritative
@@ -215,6 +218,21 @@ public:
         const Exl3VeriCacheServingCoordinator&) = delete;
     Exl3VeriCacheServingCoordinator& operator=(
         const Exl3VeriCacheServingCoordinator&) = delete;
+
+    // Host memory pressure on a lane's path (lane_kv_source.h): evicts
+    // retained roots until `extra` more bytes fit above the relief floor.
+    // Returns the evicted count; none while the coordinator is closing or a
+    // runtime allocation runs on this thread.
+    std::size_t evict_retained_for_memory(std::uint64_t extra) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (runtime_allocating_ && allocation_thread_ == std::this_thread::get_id()) return 0;
+        allocation_changed_.wait(lock, [&] { return !runtime_allocating_; });
+        if (closed_ || closing_started_ || allocating_) return 0;
+        if (exl3_host_memory_short(extra)) (void)release_stale_resident_locked();
+        std::size_t evicted = 0;
+        while (exl3_host_memory_short(extra) && evict_retained_locked()) ++evicted;
+        return evicted;
+    }
 
     Ticket admit(std::shared_ptr<const Exl3VeriCacheRequest> root) {
         validate_root(root);
@@ -1348,7 +1366,60 @@ private:
             throw std::invalid_argument(
                 "serving coordinator stale/missing physical retirement");
     }
+    // Host memory below the residency reserve: retained prefix roots are
+    // evicted (oldest first) until the update fits, since a live request's
+    // history takes precedence over cached ones.
     Exl3HostResidentSet::Stats replace_resident_locked(
+        std::span<const std::pair<std::uint64_t,
+            std::shared_ptr<const Exl3VeriCacheRequest>>> replacements,
+        std::uint64_t removed_id, bool request_admission = false) {
+        bool refreshed = false;
+        for (;;) {
+            try {
+                return replace_resident_once_locked(replacements, removed_id, request_admission);
+            } catch (const Exl3HostResidentReserveExhausted&) {
+                if (!refreshed) {
+                    refreshed = true;
+                    if (release_stale_resident_locked()) continue;
+                }
+                if (!evict_retained_locked()) throw;
+            }
+        }
+    }
+    // The committed resident union keeps every root it locked until the next
+    // commit, also roots the prefix cache has evicted since (its own budget
+    // evictions do not commit here). Under host memory pressure such stale
+    // roots kept whole idle plane sets backed (8 agents x 110K on 4 lanes:
+    // ~29 GB pinned with an empty cache) and every admission was refused, so
+    // no commit ever dropped them. A commit without the refused update only
+    // removes pages and cannot fail the reserve check; the caller retries
+    // once. False when that commit is refused too.
+    bool release_stale_resident_locked() {
+        try {
+            (void)replace_resident_once_locked({}, 0);
+        } catch (const Exl3HostResidentReserveExhausted&) {
+            return false;
+        }
+        if (const auto release = exl3_release_idle_plane_rows.load()) release();
+        static const bool trace = std::getenv("VOIDINFER_EXL3_VERICACHE_STATS") != nullptr;
+        if (trace) Exl3HostMemoryLedger::print("released_stale_resident");
+        return true;
+    }
+    // Drops the oldest retained root from the prefix cache and from the
+    // resident union at once: the union owns every root it locked, so only
+    // then are its pages unlocked and freed. Idle plane sets then give back
+    // the rows only that root named. False when the cache is empty.
+    bool evict_retained_locked() {
+        auto root = cache_.evict_oldest_root();
+        if (!root) return false;
+        (void)replace_resident_once_locked({}, 0);
+        root.reset();
+        if (const auto release = exl3_release_idle_plane_rows.load()) release();
+        static const bool trace = std::getenv("VOIDINFER_EXL3_VERICACHE_STATS") != nullptr;
+        if (trace) Exl3HostMemoryLedger::print("evicted_root");
+        return true;
+    }
+    Exl3HostResidentSet::Stats replace_resident_once_locked(
         std::span<const std::pair<std::uint64_t,
             std::shared_ptr<const Exl3VeriCacheRequest>>> replacements,
         std::uint64_t removed_id, bool request_admission = false) {
@@ -1391,10 +1462,22 @@ private:
                 resident_.admit_host_metadata_lifetime(allocation.owner,
                     allocation.bytes,allocation.matches,allocation.attach);
             });
+        // Allocations the CUDA driver already page-locks (registered recurrent
+        // slabs, cudaHostAlloc pools) cannot be paged out: they stay out of the
+        // VirtualLock set (re-locking a fresh root's 144 MiB slab cost ~40 ms of
+        // first-token time) and their bytes stay bounded by their own pools.
+        const auto driver_pinned=[](const void* data,std::size_t bytes) {
+            const auto pinned=[](const void* p) {
+                cudaPointerAttributes attributes{};
+                if(cudaPointerGetAttributes(&attributes,p)!=cudaSuccess) {(void)cudaGetLastError();return false;}
+                return attributes.type==cudaMemoryTypeHost;
+            };
+            return bytes && pinned(data) && pinned(static_cast<const unsigned char*>(data)+bytes-1);
+        };
         std::size_t range_count=0;
         if(!roots.empty())Exl3VeriCacheRequest::visit_host_allocations(roots,
-            [&](const void*,std::size_t bytes) {
-                if(!bytes)return;
+            [&](const void* data,std::size_t bytes) {
+                if(!bytes || driver_pinned(data,bytes))return;
                 if(range_count==std::numeric_limits<std::size_t>::max())
                     throw std::overflow_error("coordinator snapshot range count overflow");
                 ++range_count;
@@ -1410,6 +1493,7 @@ private:
         }
         const auto required=Exl3HostResidentSet::Snapshot::descriptor_requirement(roots.size()+source_slots,range_count);
         auto fault=ResidencyFault::none;
+        double inventory_ms_trace=0;
         const auto stats=resident_.replace_reserved_snapshot(required,[&](std::uint64_t configuration) {
         if(configuration!=required.configuration)throw std::logic_error("coordinator snapshot configuration changed");
         Exl3HostResidentSet::Snapshot snapshot;
@@ -1428,10 +1512,11 @@ private:
         for (const auto& root : roots) snapshot.owners.push_back(root);
         if (!roots.empty()) Exl3VeriCacheRequest::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) {
-                snapshot.add(data, bytes);
+                if (!driver_pinned(data, bytes)) snapshot.add(data, bytes);
             }, false);
-        resident_inventory_ms_ += std::chrono::duration<double, std::milli>(
+        inventory_ms_trace = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - inventory_started).count();
+        resident_inventory_ms_ += inventory_ms_trace;
         return snapshot;
         },[&] {
         // The Engine admission seam must not be consumed by preparation-time
@@ -1447,6 +1532,11 @@ private:
                 throw std::runtime_error("injected coordinator after resident lock");
         });
         ++resident_updates_;
+        static const bool trace=std::getenv("VOIDINFER_EXL3_RESIDENT_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"RESIDENT_SNAPSHOT roots=%zu ranges=%zu inventory_ms=%.1f registry_ms=%.1f total_ms=%.1f new_locked=%llu unlocked=%llu\n",
+            roots.size(),range_count,inventory_ms_trace,stats.elapsed_ms,
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-inventory_started).count(),
+            static_cast<unsigned long long>(stats.new_locked_bytes),static_cast<unsigned long long>(stats.unlocked_bytes));
         resident_new_locked_bytes_ += stats.new_locked_bytes;
         resident_unlocked_bytes_ += stats.unlocked_bytes;
         resident_registry_ms_ += stats.elapsed_ms;
@@ -1514,4 +1604,4 @@ private:
     bool closing_started_ = false;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

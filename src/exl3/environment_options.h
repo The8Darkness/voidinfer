@@ -4,7 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Strict opt-in controls: absent means false; only literal 0 and 1 are valid.
 // The caller supplies its existing diagnostic and chooses when to read the
@@ -20,4 +20,4 @@ inline bool read_binary_option(const char* name, const char* diagnostic) {
     return parse_binary_option(std::getenv(name), diagnostic);
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 namespace {
 
 int resolve_clip_index(float clip_ratio) {
@@ -101,4 +101,4 @@ void oscar_int2_g128_decode(const OscarInt2G128EncodedRow& encoded, float* outpu
     }
 }
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

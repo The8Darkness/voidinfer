@@ -2,7 +2,7 @@
 
 #include "exl3/sibling_rows.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Verifier row layout {c, packed offsets} (exl3_sibling_layout). c == 0: row
 // r is at logical offset r. With c > 0 chain rows, rows >= c are sibling
@@ -20,4 +20,4 @@ __device__ __forceinline__ int sibling_row_offset(int row, const int* layout) {
     return chain > 0 && row >= chain ? sibling_offset(row - chain, layout[1]) : row;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

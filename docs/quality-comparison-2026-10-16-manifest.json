@@ -1,0 +1,311 @@
+{
+ "date": "2026-10-16/17",
+ "gpu": "NVIDIA GeForce RTX 5090, 617.14",
+ "voidinfer": {
+  "commit": "07bf1c9e5381de43f31b26a40167d8b5ed2bb5e4",
+  "branch": "refactor/voidinfer",
+  "dirty": false,
+  "research_tool_sha256": "2922baf7888c334c68f258dae7d6a3ad14e9504a6f64fd3f8a9d8dc081ac3079",
+  "serve_sha256": "de076838031cbc0ebbbdcee8f02eaf3dc87cabd767c1140735d3f6e4283ca3cb"
+ },
+ "ninfer": {
+  "commit": "a0cf1c179470dac19a0d0e3036e39153fd904081",
+  "dirty": false,
+  "perplexity_sha256": "36b37951e5f516aa0b8ea6af91b421de67839425d13bf02e2022a4c575fcb633",
+  "serve_sha256": "3df3005e83b649cfc6cd9d091991e7bbba8a6b30a94024e7df1846efdd1e40d0"
+ },
+ "models": {
+  "exl3_6bpw": {
+   "path": "C:\\AI\\models\\Qwen3.8-27B-exl3-6bpw-H6-V6",
+   "files": {
+    "cal_trace.json": "7a3436f016f3f1822bc5de1cdbb23797965c145411b3c5c600fb27812d87dd2d",
+    "config.json": "08f73b0d24188776fa278306031a93b863bc6d2b0ac837e24c6ed792b30b3081",
+    "crc32.txt": "b42dd291f5f98b05807e458f5b47849969a9b3326acbf0c97d28b05826740b83",
+    "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+    "model.safetensors.index.json": "d5bc6446c36d53525403d22002bd67aa735bfc2d0eae7cab1f498a78d406b110",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "qbench_prompts_gen.json": "6070481d810633355e264a618f8a3727af0fc135b3c3671c917928dc6dc215ed",
+    "quantization_config.json": "6792a170c07f19550c8c6b3b0fc052a07ceea4aad91a3819ba5f7c02e6a1a647",
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    "_weights": {
+     "cal_trace.safetensors": 4096088,
+     "model-00001-of-00003.safetensors": 8546827604,
+     "model-00002-of-00003.safetensors": 8450997360,
+     "model-00003-of-00003.safetensors": 5592807688
+    }
+   }
+  },
+  "dflash2_draft": {
+   "path": "C:\\AI\\models\\Qwen3.8-27B-DFlash2-EXL3-5bpw",
+   "files": {
+    "config.json": "b7f916198b36fb8a1b2104c265ce055c2d128b72c5b0bad74b55e754aff60d3f",
+    "quantization_config.json": "38fcf955384fb09efbb2f21f2fdc9c602350257059d208185b40f49609f424d4",
+    "_weights": {
+     "model.safetensors": 1470916078
+    }
+   }
+  },
+  "bf16": {
+   "path": "D:\\AI\\models\\Qwen3.8-27B-bf16",
+   "files": {
+    "config.json": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    "crc32.txt": "b42dd291f5f98b05807e458f5b47849969a9b3326acbf0c97d28b05826740b83",
+    "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "merges.txt": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+    "model.safetensors.index.json": "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    "_weights": {
+     "model-00001-of-00018.safetensors": 3966730552,
+     "model-00002-of-00018.safetensors": 3043080328,
+     "model-00003-of-00018.safetensors": 2542796952,
+     "model-00004-of-00018.safetensors": 3988973152,
+     "model-00005-of-00018.safetensors": 2099339864,
+     "model-00006-of-00018.safetensors": 3979553696,
+     "model-00007-of-00018.safetensors": 2108759344,
+     "model-00008-of-00018.safetensors": 3979553696,
+     "model-00009-of-00018.safetensors": 2108759344,
+     "model-00010-of-00018.safetensors": 3979553696,
+     "model-00011-of-00018.safetensors": 2108759344,
+     "model-00012-of-00018.safetensors": 3979553696,
+     "model-00013-of-00018.safetensors": 2108759344,
+     "model-00014-of-00018.safetensors": 3979553696,
+     "model-00015-of-00018.safetensors": 2108759344,
+     "model-00016-of-00018.safetensors": 3979564040,
+     "model-00017-of-00018.safetensors": 2108759344,
+     "model-00018-of-00018.safetensors": 3392197344
+    }
+   }
+  },
+  "ninfer_nvfp4": {
+   "path": "D:\\AI\\models\\ninfer\\Qwen3.8-27B-nvfp4-NInfer",
+   "SHA256SUMS": "74d2c57145e6ff11d1d2faa79594477f9bc903a611af1fb20218189fbbb77d82  qwen3_8_27b_nvfp4.ninfer",
+   "artifact_manifest_sha256": "5738311e6ac4296b50097c3b9c27d263932889dc5cd14cf7aa6beb0bdaad3f64"
+  }
+ },
+ "datasets": {
+  "RULER": {
+   "repo": "https://github.com/NVIDIA/RULER",
+   "commit": "c3f5e3b4f87f97e048793bb510a3a6b19a46bf3a",
+   "note": "RULERv2 code (anonymous.4open.science/r/RULERv2) returned repository_expired -> RULER v1 tasks",
+   "essays_sha256": "341e0b5aaa38ab13d8f7c8b57d3b067ba120e90e690fde63dd016ac638993c77",
+   "hotpotqa_sha256": "e3da074df24e8369009918aa5cdbdd254dadcde4c63f7569d36afd6f2268caa8",
+   "tasks": [
+    "niah_multikey_1",
+    "niah_multikey_2",
+    "niah_multikey_3",
+    "vt",
+    "qa_2"
+   ],
+   "seed": 42,
+   "samples": {
+    "16384": 50,
+    "32768": 50,
+    "65536": 30,
+    "131072": 20
+   }
+  },
+  "NoLiMa": {
+   "repo": "https://github.com/adobe-research/NoLiMa",
+   "commit": "cb14780b249fecf2851127b2101a062c1b2c6430",
+   "hf_dataset": "amodaresi/NoLiMa",
+   "hf_revision_at_fetch": "378115b1f136b6ba78f90f78682bc55f70ec3ddd",
+   "needle_set_sha256": "b197f5633668be11aa5855144716b3009d6246c5fb05a508c37db0d08303aa99",
+   "haystack": "rand_shuffle/rand_book_1.txt",
+   "haystack_sha256": "1f7bdc697141b888565c851e6c34dbd649aaf580280eae92199561c4f0e93dab",
+   "depth_grid_idx": [
+    0,
+    5,
+    10,
+    15,
+    20,
+    25
+   ],
+   "lengths": [
+    4000,
+    16000,
+    32000
+   ],
+   "base_seed": 42
+  },
+  "IFBench": {
+   "items": "D:\\AI\\bench3-20261014\\items\\ifbench.jsonl",
+   "repo_pin": "allenai/IFBench 1c40f0c1",
+   "hf_pin": "IFBench_test 2e8a48de"
+  },
+  "panel_sources": {
+   "de_gutenberg_22367.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/22367/pg22367.txt",
+    "title": "Kafka - Die Verwandlung",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "359d3f5983c812393f4bd7ee49a350ffffc7d476015e58d6b84b6c848dd2b0e9",
+    "bytes": 145983
+   },
+   "de_gutenberg_2229.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/2229/pg2229.txt",
+    "title": "Goethe - Faust I",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "fed2a58edd6910ee96d27ada614d34bcc41f03750d86541c41246bb74c564ff7",
+    "bytes": 218440
+   },
+   "de_gutenberg_5323.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/5323/pg5323.txt",
+    "title": "Fontane - Effi Briest",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "15a93db448403b07093042b6aa251ab22474ad9c05918e69f7ead5c62c0b2e8e",
+    "bytes": 633751
+   },
+   "de_gutenberg_2591.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/2591/pg2591.txt",
+    "title": "Grimm - Kinder- und Hausmärchen",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "377ebb8ca06cd8bc0b1015ddb54766c44f50dece731c53bb030f1cc00f54092a",
+    "bytes": 560164
+   },
+   "de_gutenberg_34811.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/34811/pg34811.txt",
+    "title": "Mann - Buddenbrooks",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "59b2688c4de9b74ccc7feca9051c22fd5202fa31b58fe0e5f54b79d3f895d375",
+    "bytes": 1602317
+   },
+   "de_wiki_Energiewende.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Energiewende&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 271378780,
+    "sha256": "15e31c40414b732de9f1b755d02f1b0820a5505557c3e56a60a2d38883d60560",
+    "bytes": 174323
+   },
+   "de_wiki_Photosynthese.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Photosynthese&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 271344923,
+    "sha256": "942cc75aa762468377b92fa7aff9a9e3553a9c0f9876cd8a9334976e5577a3a6",
+    "bytes": 106737
+   },
+   "de_wiki_Dreißigjähriger_Krieg.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Drei%C3%9Figj%C3%A4hriger+Krieg&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 270660817,
+    "sha256": "64007bdc12b6f0b3b37b16a0e77bcb00ecb9b30c35092e08095c41562cf1d1af",
+    "bytes": 92558
+   },
+   "de_wiki_Bundesverfassungsgericht.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Bundesverfassungsgericht&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 271332005,
+    "sha256": "e9f1353a2e7dbfb7c6ff949b174792db001d36ff10fd9c175522154383e87ba1",
+    "bytes": 118796
+   },
+   "de_wiki_Quantenmechanik.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Quantenmechanik&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 268012468,
+    "sha256": "a662b9481915ede802443750cc53decede5287b0426bd1731ced0b9c8f7c6308",
+    "bytes": 86676
+   },
+   "de_wiki_Industrialisierung_in_Deutschland.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Industrialisierung+in+Deutschland&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 269757717,
+    "sha256": "c80e25745341a28e6f70499deffe0f8db924bcff57000ebc2a4773fd152c7e89",
+    "bytes": 61177
+   },
+   "de_wiki_Rhein.txt": {
+    "url": "https://de.wikipedia.org/w/api.php?action=query&format=json&prop=extracts%7Crevisions&rvprop=ids&explaintext=1&titles=Rhein&redirects=1",
+    "license": "CC BY-SA 4.0 (Wikipedia)",
+    "revid": 271383095,
+    "sha256": "9c41018dcf7aa6260c3def560419d4c39ef96b0574e79976ed9133774471fe29",
+    "bytes": 100866
+   },
+   "s1k11_train-00000-of-00001.parquet": {
+    "url": "https://huggingface.co/datasets/simplescaling/s1K-1.1/resolve/96c411f1fe4c49d20f0e2a1565f61e1a28b0b84d/data/train-00000-of-00001.parquet",
+    "dataset": "simplescaling/s1K-1.1",
+    "revision": "96c411f1fe4c49d20f0e2a1565f61e1a28b0b84d",
+    "license": "MIT (dataset card)",
+    "sha256": "10352d1f67d21b95385a364e8cc5a111a82603071acd4e36b0cbfbd6fc628c81",
+    "bytes": 22323185
+   },
+   "lc_gutenberg_145.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/145/pg145.txt",
+    "title": "Eliot - Middlemarch",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "dc2e0107e6ae07e8e33da934b2ec4e8e600826a2e0cd48df265119cd02e5fb50",
+    "bytes": 1865684
+   },
+   "lc_gutenberg_28054.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/28054/pg28054.txt",
+    "title": "Dostoevsky - The Brothers Karamazov (Garnett)",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "2e75c187cb750df3f7c910fa90970b264b9a4fee212be2a73c6bb507d9ad22fe",
+    "bytes": 2039141
+   },
+   "lc_gutenberg_24264.txt": {
+    "url": "https://www.gutenberg.org/cache/epub/24264/pg24264.txt",
+    "title": "Cao Xueqin - Hong Lou Meng",
+    "license": "Project Gutenberg (public domain in the US)",
+    "sha256": "ff1526996bf4b81807651921a85e5c1c0f1d1d123c9fa4553057ba6a3ec72011",
+    "bytes": 2663455
+   }
+  }
+ },
+ "items_sha256": {
+  "ifbench.jsonl": "ebc06faa5a15b9eb76338a2f48cbfdd30e700624e5a6bac743128e8d3af4ec41",
+  "nolima_L16000.jsonl": "5205109274020d87c524e09bd42c2dab2c4f45edd20d908ea7c8360516cafcc0",
+  "nolima_L32000.jsonl": "b569e5c8ecd9cd938ff5e739269fcac374e066f352f481d8392f0eeeffd1f569",
+  "nolima_L4000.jsonl": "4a15eaa666311ee04ed35286b4a54e08bbcd65f28ed6c743209ffa1eaebeaff3",
+  "ruler_L131072.jsonl": "fdaf1dd6d1dc123c61e846562ce6f1602d911a5542d3ac51ffd8e565df36ec27",
+  "ruler_L16384.jsonl": "99501db40d1cfd09277f40b50f48a695191bae96783424282b2fcea1f437362e",
+  "ruler_L32768.jsonl": "0db53b22393068a8ec4e70792662f4b4b59200f90f333e76e1ef11d459789950",
+  "ruler_L65536.jsonl": "da286426004cabab508867b54847c79e4dd90fc72e2715234ef8fae7c6d377cb"
+ },
+ "panel": {
+  "manifest_sha256": "fa516dee9b8f13d8e44d10a750fde87b5fb67c182b6969d5db78c1177887005a",
+  "streams": 70,
+  "tokens_per_stream": 2048,
+  "scored_targets": "[64, 2048)",
+  "seed": 20261016
+ },
+ "long_panel": {
+  "streams_json_sha256": "db2dfbf84f3dfc3ff314c75431bcf974bb2fbf7094f9b7c300721b0e7e7ca990",
+  "manifests": {
+   "w131072": "ed955e0bc015f4de7b345d59674dd7c996e4c01a73eae3c05600ce0f07f29809",
+   "w16384": "6941374aef008d0bbfc2c3c13e50db338b0bc748886631f1fe5a588989af8c6b",
+   "w32768": "e6590c7375fc5b4452f907971c4a1c4136aecb22364e133b322836d586b72558",
+   "w4096": "ac96d79a9bb55c2b0857ebf84dd509d7bb2c7aad3f37d2ee54615119b50e9383",
+   "w65536": "fc9e86f034d4fd797d379e533179a7da4f9effc4d4e2feb0190488d2fef14bbf"
+  }
+ },
+ "settings": {
+  "teacher_forced_ours": "research_exl3_long_nll: prefill context (16-row + 1024-row wide chunks, full precision), then one decode row per token; top-100 + nll per position",
+  "teacher_forced_ninfer": "ninfer-perplexity --context N --stride N-1 (single window), --topk-record --topk-k 100, --per-token-logprobs",
+  "ours_kv_arms": {
+   "fp16": "VOIDINFER_EXL3_L0_OSCAR=0",
+   "int4raw": "VOIDINFER_EXL3_L0_EXACT=prefill (default L0 INT4, hot 512)",
+   "int2raw": "VOIDINFER_EXL3_L0_CODE_BITS=2;VOIDINFER_EXL3_L0_EXACT=prefill",
+   "int4vc": "VOIDINFER_EXL3_L0_EXACT=1"
+  },
+  "references": {
+   "refs_fp32": "transformers Qwen3.5 modules, BF16 weights upcast to FP32, FP32 compute, TF32 off",
+   "refs": "transformers BF16 compute (SDPA), FP32 lm_head",
+   "long": "bf16_ref_long.py chunked exact attention (FP32 scores), segmented GDN"
+  },
+  "tasks_request": {
+   "temperature": 0.0,
+   "top_p": 1.0,
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "concurrency": 1
+  },
+  "ours_serve": "default profile: L0 OSCAR INT4 KV + exact VeriCache, DFlash2 K7",
+  "ninfer_serve": "NVFP4, --kv-dtype fp8 --kv-capacity auto, --spec dflash2 --draft-tokens 7 --lm-head-draft"
+ }
+}

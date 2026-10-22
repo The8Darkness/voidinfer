@@ -2,7 +2,7 @@
 #include "exl3/packed_projection.h"
 #include "exl3/vericache_serving_coordinator.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Bridge from existing admission authority into a compute descriptor. Keep the
 // lease array and coordinator alive until the dispatch completes. Physical
 // execution generation/buffers remain the exclusive execution owner's facts.
@@ -33,4 +33,4 @@ inline Exl3PackedProjectionPlan assemble_exl3_leased_projection(
         return coordinator.compute_leases_current(leases);
     });
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

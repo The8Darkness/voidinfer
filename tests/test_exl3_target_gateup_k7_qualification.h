@@ -8,22 +8,22 @@ void run_target_gateup_k7_qualification(
     require(prompt.size() == 512,
             "target gate/up K7 qualification requires ctx512");
     require(oscar, "target gate/up K7 qualification requires canonical OSCAR");
-    require(env("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M") == "0",
+    require(env("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M") == "0",
             "target gate/up K7 qualification must start at explicit flag0");
-    ninfer::test::ScopedEnvironmentRestore restore{
-        "NINFER_EXL3_TARGET_GATEUP_SMALL_M",
-        "NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M",
-        "NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A",
-        "NINFER_EXL3_GENERIC_SPLITS"};
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
-    _putenv_s("NINFER_EXL3_GENERIC_SPLITS", "5");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
+    voidinfer::test::ScopedEnvironmentRestore restore{
+        "VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M",
+        "VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A",
+        "VOIDINFER_EXL3_GENERIC_SPLITS"};
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M", "0");
+    _putenv_s("VOIDINFER_EXL3_GENERIC_SPLITS", "5");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
 
     const auto captured = run_target_gateup_k7_capture(
         target, draft, prompt, oscar);
     require(captured.size() == 4,
             "target gate/up K7 qualification capture count mismatch");
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     constexpr Admission admit = Admission::target_continuation_gate_up;
     constexpr int output_features = 17408;
     constexpr std::size_t guard = 128;
@@ -31,7 +31,7 @@ void run_target_gateup_k7_qualification(
 
     const auto& representative = captured.front();
     for (const char* malformed : {"2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", malformed);
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", malformed);
         bool rejected = false;
         try {
             Exl3CudaLinearWorkspace invalid(
@@ -41,10 +41,10 @@ void run_target_gateup_k7_qualification(
         }
         require(rejected, "target M1 K7 async-A accepted malformed opt-in");
     }
-    _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
     Exl3CudaLinearWorkspace m1_latched_off(
         kHidden, output_features, 1, false, true);
-    _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "1");
     require(std::string(m1_latched_off.dispatch_name(
                 representative.metadata, 1, admit)) == "generic_mma_split",
             "target M1 K7 workspace did not latch flag0");
@@ -59,8 +59,8 @@ void run_target_gateup_k7_qualification(
                     representative.metadata, 1, admit)) ==
                 "generic_mma_split",
             "target M1 K7 async-A ownership/dispatch mismatch");
-    _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", "1");
     Exl3CudaLinearWorkspace enabled(kHidden, output_features, 8, false, true);
     Exl3CudaLinearWorkspace generic_owner(kHidden, output_features, 8);
     require(std::string(enabled.dispatch_name(
@@ -87,14 +87,14 @@ void run_target_gateup_k7_qualification(
     require(!enabled.target_gateup_small_m_candidate(wrong, 8, admit),
             "target gate/up K7 admitted mismatched metadata");
     for (const char* disabled : {"", "0", "2", "true", "01"}) {
-        _putenv_s("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", disabled);
+        _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", disabled);
         Exl3CudaLinearWorkspace off(
             kHidden, output_features, 8, false, true);
         require(std::string(off.dispatch_name(
                     representative.metadata, 8, admit)) == "generic_tile",
                 "target gate/up K7 accepted a non-exact opt-in");
     }
-    _putenv_s("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", "1");
+    _putenv_s("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M", "1");
 
     out << "layer,operator,M,dispatch,repeat_equal,guards_ok,finite,"
            "bit_mismatches,values\n";
@@ -122,10 +122,10 @@ void run_target_gateup_k7_qualification(
                               item.input.size() * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice),
                    "target gate/up K7 input upload");
-        _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
         Exl3CudaLinearWorkspace m1_control(
             kHidden, output_features, 1, false, true);
-        _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "1");
         Exl3CudaLinearWorkspace m1_candidate(
             kHidden, output_features, 1, false, true);
         require(std::string(m1_control.dispatch_name(
@@ -155,7 +155,7 @@ void run_target_gateup_k7_qualification(
                         }),
                 "target M1 K7 exact differential failed");
         m1_async_values += m1_actual.size();
-        _putenv_s("NINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_M1_K7_N32_ASYNC_A", "0");
         Exl3CudaLinearWorkspace candidate(
             kHidden, output_features, 8, false, true);
         Exl3CudaLinearWorkspace m1_reference(

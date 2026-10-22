@@ -85,7 +85,7 @@ void check_ring_attention_case(const RingAttentionInput& x, const std::string& n
     std::vector<std::uint16_t> initial(count + 2 * guard, canary), serial;
     double max_error = 0, max_ratio = 0;
     auto launch = [&](bool parallel) {
-        ninfer::exl3::dflash2_ring_attention_for_test(ptr(0), ptr(1), ptr(2), x.start, x.count,
+        voidinfer::exl3::dflash2_ring_attention_for_test(ptr(0), ptr(1), ptr(2), x.start, x.count,
             ptr(3), ptr(4), base + guard, x.queries, x.block, x.scale, parallel);
     };
     for (bool parallel : {false, true}) {
@@ -101,7 +101,7 @@ void check_ring_attention_case(const RingAttentionInput& x, const std::string& n
         std::vector<std::uint16_t> values(got.begin() + guard, got.end() - guard);
         require(std::all_of(values.begin(), values.end(), [](auto h) { return std::isfinite(half_to_float(h)); }),
                 "ring nonfinite output");
-        const bool split = parallel && ninfer::exl3::dflash2_ring_attention_split_for_test(x.count);
+        const bool split = parallel && voidinfer::exl3::dflash2_ring_attention_split_for_test(x.count);
         if (!parallel) serial = values;
         else if (!split) require(values == serial, "ring original-GPU bitwise mismatch: " + name);
         if (production && parallel)
@@ -117,12 +117,12 @@ void check_ring_attention_case(const RingAttentionInput& x, const std::string& n
     // Admission/no-op checks must not touch output.
     for (bool parallel : {false, true}) {
         cuda_check(cudaMemcpy(base, initial.data(), out.bytes(), cudaMemcpyHostToDevice), "ring invalid guards");
-        ninfer::exl3::dflash2_ring_attention_for_test(nullptr, nullptr, nullptr, 0, 0,
+        voidinfer::exl3::dflash2_ring_attention_for_test(nullptr, nullptr, nullptr, 0, 0,
             nullptr, nullptr, base + guard, 0, 1, x.scale, parallel);
         for (int bad = 0; bad < 6; ++bad) {
             bool rejected = false;
             try {
-                ninfer::exl3::dflash2_ring_attention_for_test(ptr(0), ptr(1), ptr(2),
+                voidinfer::exl3::dflash2_ring_attention_for_test(ptr(0), ptr(1), ptr(2),
                     bad == 0 ? 2048 : x.start, bad == 1 ? 2048 : x.count, ptr(3), ptr(4), base + guard,
                     bad == 2 ? 9 : x.queries, bad == 3 ? 0 : x.block,
                     bad == 4 ? 0.0f : (bad == 5 ? std::numeric_limits<float>::quiet_NaN() : x.scale), parallel);

@@ -3,7 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 namespace {
 void need(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 bool refuses(auto&& call){try{call();}catch(...){return true;}return false;}

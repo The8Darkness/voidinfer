@@ -1,16 +1,22 @@
+#include "exl3/sampled_select.cuh"
+#include "core/capture_guard.h"
+#include "core/poll_wait.h"
 #include "exl3/gaming_operator_fixture.h"
 #include "exl3/dflash2_draft.h"
 #include "exl3/vericache_serving_coordinator.h"
 #include "exl3/linear_workspace_requirements.h"
 #include "exl3/text_model.h"
+#include "exl3/batched_verify_coordinator.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
+#include <mma.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <execution>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -26,7 +32,7 @@
 #include <span>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 using Json = nlohmann::json;
@@ -400,7 +406,7 @@ std::vector<std::uint16_t> host_linear_forward(const HostLinearModule& w,
 // trajectory is genuine model behavior (finite in FP32) or a shared
 // decode-scale error (runaway even in FP32). Read-only w.r.t. the device path:
 // inputs are downloaded, results only printed. No effect unless
-// NINFER_DFLASH2_REF_FP32 is set (one-shot).
+// VOIDINFER_DFLASH2_REF_FP32 is set (one-shot).
 std::vector<float> ref32_from_f16(const std::vector<std::uint16_t>& h) {
     std::vector<float> f(h.size());
     for (std::size_t i = 0; i < h.size(); ++i) f[i] = half_to_float(h[i]);
@@ -748,9 +754,13 @@ __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
                                        int rows,
                                        int stream,
                                        const std::uint16_t* residual=nullptr,
-                                       std::uint16_t* residual_out=nullptr) {
+                                       std::uint16_t* residual_out=nullptr,
+                                       int segment=0) {
     const int row = static_cast<int>(blockIdx.x);
     if (row >= rows) return;
+    // segment > 0: rows form independent blocks of `segment` rows (one per
+    // agent of a batched draft forward); each block's first row has no history.
+    const bool has_previous = segment > 0 ? row % segment != 0 : row > 0;
     const std::uint16_t* base_row = base + stream * (kConvKernel * kHidden);
     // Grid (rows, kHidden / blockDim): one channel per thread.
     {
@@ -758,7 +768,7 @@ __global__ void dflash_dyn_conv_kernel(const std::uint16_t* x,
         if (i >= kHidden) return;
         const int g = i / kConvGroup;
         const float x0 = half_to_float(x[row * kHidden + i]);
-        const float x1 = row > 0 ? half_to_float(x[(row - 1) * kHidden + i]) : 0.0f;
+        const float x1 = has_previous ? half_to_float(x[(row - 1) * kHidden + i]) : 0.0f;
         const float d0 = half_to_float(dyn[row * kConvDynamic +
                                           stream * (kConvKernel * kConvGroups) + g]);
         const float d1 = half_to_float(dyn[row * kConvDynamic +
@@ -832,6 +842,8 @@ constexpr int kDenseRowsCols=8;
 constexpr int kDenseRowsTileK=128;
 constexpr int kDenseRowsStages=4;
 constexpr int kDenseRowsMax=8;
+// Batched multi-agent drafting: one launch covers up to four agents' blocks.
+constexpr int kDenseRowsBatchedMax=4*kDenseRowsMax;
 constexpr int kDenseRowsThreads=kDenseRowsCols*kDenseRowsMax;
 constexpr int kDenseRowsParts=kDenseRowsCols/8;
 
@@ -842,10 +854,12 @@ __device__ __forceinline__ void dflash_cp_async_16(void* shared_ptr,const void* 
                  :: "r"(shared_address), "l"(global_ptr));
 }
 
-__global__ void __launch_bounds__(kDenseRowsThreads) dflash_dense_rows_kmajor_kernel(
+template<int MaxRows=kDenseRowsMax>
+__global__ void __launch_bounds__(kDenseRowsCols*MaxRows) dflash_dense_rows_kmajor_kernel(
     const std::uint16_t* a,const std::uint16_t* b,std::uint16_t* c,int m,int k,int n) {
+    constexpr int kDenseRowsThreads=kDenseRowsCols*MaxRows;
     __shared__ __align__(16) std::uint16_t weights[kDenseRowsStages][kDenseRowsTileK][kDenseRowsCols];
-    __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][kDenseRowsMax][kDenseRowsTileK];
+    __shared__ __align__(16) std::uint16_t inputs[kDenseRowsStages][MaxRows][kDenseRowsTileK];
     const int tid=static_cast<int>(threadIdx.x);
     const int col0=static_cast<int>(blockIdx.x)*kDenseRowsCols;
     const int col=tid%kDenseRowsCols;
@@ -894,19 +908,83 @@ __global__ void __launch_bounds__(kDenseRowsThreads) dflash_dense_rows_kmajor_ke
 
 bool dflash_dense_rows_enabled() {
     static const bool enabled=[] {
-        const char* value=std::getenv("NINFER_DFLASH2_DENSE_ROWS_PIPELINE");
+        const char* value=std::getenv("VOIDINFER_DFLASH2_DENSE_ROWS_PIPELINE");
         return !value || std::strcmp(value,"0")!=0;
     }();
     return enabled;
 }
 
+// Tensor-core dense rows for the batched draft (up to 32 rows): c[m][n] =
+// a[m][k] b[k][n] with k-major FP16 weights. One CTA per 16 output columns
+// (32-byte weight rows), eight warps splitting K, FP32 accumulation and a
+// shared-memory reduction. A tiles read 16-row blocks, so the caller
+// guarantees round_up(m, 16) readable rows.
+constexpr int kDenseTcWarps = 8;
+__global__ void __launch_bounds__(kDenseTcWarps * 32) dflash_dense_rows_tc_kernel(
+    const std::uint16_t* __restrict__ a, const std::uint16_t* __restrict__ b,
+    std::uint16_t* __restrict__ c, int m, int k, int n) {
+    using namespace nvcuda;
+    __shared__ float partial[kDenseTcWarps][32][16];
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int col0 = static_cast<int>(blockIdx.x) * 16;
+    const int span = k / kDenseTcWarps;
+    const int k0 = warp * span;
+    const auto* ah = reinterpret_cast<const half*>(a);
+    const auto* bh = reinterpret_cast<const half*>(b);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
+    wmma::fill_fragment(acc0, 0.0f);
+    wmma::fill_fragment(acc1, 0.0f);
+    const bool second = m > 16;
+#pragma unroll 8
+    for (int kk = k0; kk < k0 + span; kk += 16) {
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> fb;
+        wmma::load_matrix_sync(fb, bh + static_cast<std::size_t>(kk) * n + col0, n);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
+        wmma::load_matrix_sync(fa, ah + kk, k);
+        wmma::mma_sync(acc0, fa, fb, acc0);
+        if (second) {
+            wmma::load_matrix_sync(fa, ah + static_cast<std::size_t>(16) * k + kk, k);
+            wmma::mma_sync(acc1, fa, fb, acc1);
+        }
+    }
+    wmma::store_matrix_sync(&partial[warp][0][0], acc0, 16, wmma::mem_row_major);
+    if (second) wmma::store_matrix_sync(&partial[warp][16][0], acc1, 16, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = static_cast<int>(threadIdx.x); i < m * 16; i += kDenseTcWarps * 32) {
+        const int r = i / 16, col = i % 16;
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < kDenseTcWarps; ++w) sum += partial[w][r][col];
+        c[static_cast<std::size_t>(r) * n + col0 + col] = float_to_half(sum);
+    }
+}
+
+// The tensor-core route when `capacity` rows are readable from `in`.
+bool launch_dflash_dense_rows_tc(const std::uint16_t* in, const std::uint16_t* weights,
+    std::uint16_t* out, int rows, int k, int n, int capacity, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VOIDINFER_DFLASH2_DENSE_TC");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled || rows < 1 || rows > 32 || (rows + 15) / 16 * 16 > capacity ||
+        k % (16 * kDenseTcWarps) != 0 || n % 16 != 0 ||
+        ((reinterpret_cast<std::uintptr_t>(in) | reinterpret_cast<std::uintptr_t>(weights)) % 32) != 0)
+        return false;
+    dflash_dense_rows_tc_kernel<<<n / 16, kDenseTcWarps * 32, 0, stream>>>(in, weights, out, rows, k, n);
+    return true;
+}
+
 bool launch_dflash_dense_rows_kmajor(const std::uint16_t* in,const std::uint16_t* weights,
     std::uint16_t* out,int rows,int k,int n,cudaStream_t stream) {
-    if(!dflash_dense_rows_enabled() || rows<1 || rows>kDenseRowsMax ||
+    if(!dflash_dense_rows_enabled() || rows<1 || rows>kDenseRowsBatchedMax ||
        k%kDenseRowsTileK!=0 || n%kDenseRowsCols!=0 ||
        (reinterpret_cast<std::uintptr_t>(in)|reinterpret_cast<std::uintptr_t>(weights))%16!=0)
         return false;
-    dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,kDenseRowsThreads,0,stream>>>(in,weights,out,rows,k,n);
+    if(rows>kDenseRowsMax)
+        dflash_dense_rows_kmajor_kernel<kDenseRowsBatchedMax><<<n/kDenseRowsCols,
+            kDenseRowsCols*kDenseRowsBatchedMax,0,stream>>>(in,weights,out,rows,k,n);
+    else
+        dflash_dense_rows_kmajor_kernel<<<n/kDenseRowsCols,kDenseRowsThreads,0,stream>>>(in,weights,out,rows,k,n);
     return true;
 }
 
@@ -1044,6 +1122,34 @@ __global__ void dflash_prefill_positions_kernel(std::int32_t* positions, int row
     if (row < rows) positions[row] = first + row;
 }
 
+// Device-positioned variants for the captured decode ring commit: the base
+// position is a device scalar set before each replay.
+__global__ void dflash_set_position_kernel(std::int32_t* base, int value) { *base = value; }
+__global__ void dflash_prefill_positions_device_kernel(std::int32_t* positions, int rows,
+    const std::int32_t* base) {
+    const int row = static_cast<int>(threadIdx.x);
+    if (row < rows) positions[row] = *base + row;
+}
+// Captured fresh-prefill bulk commit: moves the five tap row pointers and the
+// base position to the next chunk at the end of each replay.
+__global__ void dflash_bulk_advance_kernel(const std::uint16_t** taps, std::int32_t* base,
+    int rows) {
+    const int t = static_cast<int>(threadIdx.x);
+    if (t < kLayers) taps[t] += static_cast<std::size_t>(rows) * kHidden;
+    if (t == 0) *base += rows;
+}
+__global__ void dflash_prefill_ring_scatter_positions_kernel(const std::uint16_t* k,
+    const std::uint16_t* v, std::uint16_t* ring_k, std::uint16_t* ring_v,
+    int rows, const std::int32_t* positions) {
+    const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int n = kKVHeads * kHeadDim;
+    if (i >= rows * n) return;
+    const int slot = (positions[0] + i / n) & kRingMask;
+    const std::size_t dst = static_cast<std::size_t>(slot) * n + i % n;
+    ring_k[dst] = k[i];
+    ring_v[dst] = v[i];
+}
+
 __global__ void dflash_prefill_ring_scatter_kernel(const std::uint16_t* k,
     const std::uint16_t* v, std::uint16_t* ring_k, std::uint16_t* ring_v,
     int rows, int first) {
@@ -1071,7 +1177,7 @@ __global__ void dflash_attention_ring_kernel(const std::uint16_t* q,
                                              const std::uint16_t* v_blk,
                                              std::uint16_t* out,
                                              int queries, int block_keys,
-                                             float scale) {
+                                             float scale, const int* block_pos = nullptr) {
     const int q_idx = static_cast<int>(blockIdx.x);
     const int query = q_idx / kQHeads;
     const int head = q_idx % kQHeads;
@@ -1085,6 +1191,9 @@ __global__ void dflash_attention_ring_kernel(const std::uint16_t* q,
     // oldest keys for late block rows at a full ring. kRingCap == sliding_window.
     int ctx_start = ctx_keys + query - (kRingCap - 1);
     if (ctx_start < 0) ctx_start = 0;
+    // Short contexts: ring keys before cache position 0 (virtual saturation
+    // padding) are not part of the context.
+    if (block_pos) ctx_start = max(ctx_start, ctx_keys - *block_pos);
     float maximum = -3.402823466e+38F;
     for (int key = ctx_start; key < ctx_keys; ++key) {
         const int slot = (ring_start_slot + key) & kRingMask;
@@ -1130,7 +1239,8 @@ __global__ void dflash_attention_ring_kernel(const std::uint16_t* q,
 __global__ void dflash_attention_ring_parallel_kernel(const std::uint16_t* q,
     const std::uint16_t* ring_k, const std::uint16_t* ring_v, int ring_start_slot,
     int ctx_keys, const std::uint16_t* k_blk, const std::uint16_t* v_blk,
-    std::uint16_t* out, int queries, int block_keys, float scale) {
+    std::uint16_t* out, int queries, int block_keys, float scale,
+    const int* block_pos = nullptr) {
     const int q_idx = static_cast<int>(blockIdx.x);
     const int query = q_idx / kQHeads;
     const int head = q_idx % kQHeads;
@@ -1148,6 +1258,9 @@ __global__ void dflash_attention_ring_parallel_kernel(const std::uint16_t* q,
     __syncthreads();
     int ctx_start = ctx_keys + query - (kRingCap - 1);
     if (ctx_start < 0) ctx_start = 0;
+    // Short contexts: ring keys before cache position 0 (virtual saturation
+    // padding) are not part of the context.
+    if (block_pos) ctx_start = max(ctx_start, ctx_keys - *block_pos);
     const int context = ctx_keys - ctx_start;
     const int keys = context + block_keys;
     __shared__ float scores[kRingKeep + kBlockCap];
@@ -1225,7 +1338,7 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
     const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
     int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
     const std::uint16_t* v_blk, std::uint16_t* out, int queries, int block_keys,
-    float scale) {
+    float scale, const int* block_pos = nullptr) {
     const int q_idx = static_cast<int>(blockIdx.x);
     const int query = q_idx / kQHeads;
     const int head = q_idx % kQHeads;
@@ -1242,6 +1355,9 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
     query_values[t] = half_to_float(q_row[t]);
     int ctx_start = ctx_keys + query - (kRingCap - 1);
     if (ctx_start < 0) ctx_start = 0;
+    // Short contexts: ring keys before cache position 0 (virtual saturation
+    // padding) are not part of the context.
+    if (block_pos) ctx_start = max(ctx_start, ctx_keys - *block_pos);
     const int context = ctx_keys - ctx_start;
     const int keys = context + block_keys;
     __syncthreads();
@@ -1325,7 +1441,7 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_staged_kernel(
 
 bool dflash_ring_staged_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_RING_STAGED");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_RING_STAGED");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -1353,7 +1469,12 @@ __global__ void __launch_bounds__(kMmaThreads) dflash_attention_ring_mma_kernel(
     const std::uint16_t* q, const std::uint16_t* ring_k, const std::uint16_t* ring_v,
     int ring_start_slot, int ctx_keys, const std::uint16_t* k_blk,
     const std::uint16_t* v_blk, int queries, int block_keys, float scale,
-    float* partial_o, float* partial_ml) {
+    float* partial_o, float* partial_ml, const int* ring_start_device = nullptr,
+    const int* block_pos = nullptr) {
+    // Captured batched drafts read the per-round ring start from the device.
+    if (ring_start_device) ring_start_slot = *ring_start_device;
+    // Ring key index below which keys lie before cache position 0 (padding).
+    const int floor_key = block_pos ? ctx_keys - *block_pos : -2147483647;
     constexpr int group = kQHeads / kKVHeads;
     const int chunk = static_cast<int>(blockIdx.x);
     const int kv_head = static_cast<int>(blockIdx.y);
@@ -1429,7 +1550,8 @@ __global__ void __launch_bounds__(kMmaThreads) dflash_attention_ring_mma_kernel(
                 const int key = first + local;
                 // Query r / group sees context keys from ctx_keys + query - 2047 on.
                 const bool valid = r < rows && key < keys &&
-                    (key >= context || lo + key >= ctx_keys + r / group - (kRingCap - 1));
+                    (key >= context || (lo + key >= ctx_keys + r / group - (kRingCap - 1) &&
+                                        lo + key >= floor_key));
                 ss[r][local] = valid ? c[n][e] * scale : -INFINITY;
             }
         }
@@ -1522,7 +1644,7 @@ __global__ void __launch_bounds__(kHeadDim) dflash_attention_ring_combine_kernel
     out[static_cast<std::size_t>(q_idx) * kHeadDim + d] = float_to_half(acc / l);
 }
 
-// Split-K tensor-core route for long ring contexts (default; NINFER_DFLASH2_
+// Split-K tensor-core route for long ring contexts (default; VOIDINFER_DFLASH2_
 // RING_SPLIT=0 keeps the per-(query, head) staged kernel). Short contexts stay
 // on the staged kernel, which wins below kRingSplitMinKeys.
 constexpr int kRingSplitMinKeys = 256;
@@ -1534,7 +1656,7 @@ constexpr std::size_t kRingSplitMlFloats =
 
 bool dflash_ring_split_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_RING_SPLIT");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_RING_SPLIT");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -1548,12 +1670,12 @@ void launch_ring_attention_split(const std::uint16_t* q, const std::uint16_t* ri
     const std::uint16_t* ring_v, int ring_start_slot, int ctx_keys,
     const std::uint16_t* k_blk, const std::uint16_t* v_blk, std::uint16_t* out,
     int queries, int block_keys, float scale, float* partial_o, float* partial_ml,
-    cudaStream_t stream) {
+    cudaStream_t stream, const int* ring_start_device = nullptr, const int* block_pos = nullptr) {
     const int context = ctx_keys - std::max(0, ctx_keys - (kRingCap - 1));
     const int chunks = (context + block_keys + kMmaChunk - 1) / kMmaChunk;
     dflash_attention_ring_mma_kernel<<<dim3(chunks, kKVHeads), kMmaThreads, 0, stream>>>(
         q, ring_k, ring_v, ring_start_slot, ctx_keys, k_blk, v_blk, queries, block_keys,
-        scale, partial_o, partial_ml);
+        scale, partial_o, partial_ml, ring_start_device, block_pos);
     dflash_attention_ring_combine_kernel<<<dim3(queries * (kQHeads / kKVHeads), kKVHeads),
         kHeadDim, 0, stream>>>(partial_o, partial_ml, out, queries, chunks);
 }
@@ -2062,7 +2184,7 @@ __global__ void __launch_bounds__(32) dflash_topk16_segment_merge_kernel(
 }
 
 
-// Chunked exact top-16 (default; NINFER_DFLASH2_TOPK_CHUNKED=0 keeps the
+// Chunked exact top-16 (default; VOIDINFER_DFLASH2_TOPK_CHUNKED=0 keeps the
 // segmented insertion route). With T the 16th largest of the per-128-logit
 // chunk maxima, every top-16 logit lies in a chunk whose maximum is >= T, so
 // sorting the (value desc, id asc) pairs of those chunks yields exactly the
@@ -2221,7 +2343,7 @@ __global__ void __launch_bounds__(kTopKSelectThreads) dflash_topk16_chunk_select
 
 bool dflash_topk_chunked_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_TOPK_CHUNKED");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_TOPK_CHUNKED");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -2229,7 +2351,7 @@ bool dflash_topk_chunked_enabled() {
 
 bool dflash_topk_segmented_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_DFLASH2_TOPK_SEGMENTED");
+        const char* value = std::getenv("VOIDINFER_DFLASH2_TOPK_SEGMENTED");
         return !value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -2430,6 +2552,66 @@ __global__ void dflash_selector_edges_kernel(int position, std::int64_t anchor,
 // reproduces the 256-wide shared-memory tree (strides 128, 64, 32 in registers,
 // then 16..1 by shuffles), so every score and the selected chain are those of
 // the former one-product-per-thread reduction.
+// Coupled sampled proposals (sampled_select.cuh): with temperature > 0 the
+// chain picks argmax logit/T + Gumbel(seed, key, token) over its candidates
+// (their target-head logits, the draft's estimate of the target distribution;
+// the selector's edge terms are not calibrated as logits)
+// truncated like the target sampler (top_k, then min_p / top_p of the
+// candidate weights), so it proposes the token the target's coupled draw
+// most likely picks. key = absolute index of the proposed token.
+struct DraftSelectSampling {
+    float inv_temperature=0.0f,top_p=1.0f,min_p=0.0f;
+    int top_k=0;
+    unsigned long long seed=0;
+    int key_base=0,pad=0;
+    // Presence penalty (sampled_select.h): candidates generated before the
+    // proposed index (committed output, the block's seed or an earlier proposal).
+    float presence_penalty=0.0f;
+    const std::int32_t* first_occurrence=nullptr;
+};
+__device__ inline int dflash_sampled_choice(const DraftSelectSampling& s,int key,
+    const float* raw_scores,const std::int64_t* candidates,std::int64_t seed_token,
+    const std::int64_t* chain,int chain_rows) {
+    float scores[kTopK];
+    for(int c=0;c<kTopK;++c) {
+        scores[c]=raw_scores[c];
+        if(s.presence_penalty==0.0f) continue;
+        const auto token=candidates[c];
+        bool seen=token==seed_token ||
+            (s.first_occurrence && s.first_occurrence[token]<key);
+        for(int i=0;i<chain_rows && !seen;++i) seen=chain[i]==token;
+        if(seen) scores[c]-=s.presence_penalty;
+    }
+    int order[kTopK];
+    for(int c=0;c<kTopK;++c) order[c]=c;
+    for(int i=1;i<kTopK;++i) {
+        const int o=order[i];int j=i;
+        while(j>0 && scores[o]>scores[order[j-1]]) {order[j]=order[j-1];--j;}
+        order[j]=o;
+    }
+    int cap=kTopK;
+    if(s.top_k>0 && s.top_k<cap) cap=s.top_k;
+    float prob[kTopK],sum=0.0f;
+    const float m=scores[order[0]]*s.inv_temperature;
+    for(int j=0;j<cap;++j) {prob[j]=__expf(scores[order[j]]*s.inv_temperature-m);sum+=prob[j];}
+    const float min_p_thresh=s.min_p>0.0f?s.min_p*prob[0]:-1.0f;
+    float cum=0.0f;int support=0;
+    for(int j=0;j<cap;++j) {
+        if(min_p_thresh>=0.0f && prob[j]<min_p_thresh) break;
+        cum+=prob[j];support=j+1;
+        if(s.top_p<1.0f && cum>=s.top_p*sum) break;
+    }
+    if(support<1) support=1;
+    int best=order[0];float best_value=-CUDART_INF_F;
+    for(int j=0;j<support;++j) {
+        const int c=order[j];
+        const float v=scores[c]*s.inv_temperature+
+            exl3_sampled_gumbel(s.seed,key,static_cast<int>(candidates[c]));
+        if(v>best_value) {best_value=v;best=c;}
+    }
+    return best;
+}
+
 constexpr int kSelectorFusedThreads = kTopK * 32;
 static_assert(kRank == 256, "selector tree is laid out for rank 256");
 
@@ -2438,7 +2620,7 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
     const std::int64_t* device_anchor, const std::int64_t* cand_ids,
     const std::uint16_t* hidden, const std::uint16_t* pred_cb,
     const std::uint16_t* succ_cb, const float* cand_unary,
-    std::int64_t* proposal_out) {
+    std::int64_t* proposal_out, const DraftSelectSampling* sampling = nullptr) {
     const int t = static_cast<int>(threadIdx.x);
     const int lane = t & 31;
     const int candidate_index = t >> 5;
@@ -2448,6 +2630,7 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
     if (t == 0)
         anchor = device_anchor != nullptr ? device_anchor[0] : initial_anchor;
     __syncthreads();
+    const std::int64_t seed_token = anchor;
 
     for (int position = 0; position < proposal_rows; ++position) {
         const auto* pred_row = pred_cb + static_cast<std::size_t>(anchor) * kRank;
@@ -2476,6 +2659,12 @@ __global__ void __launch_bounds__(kSelectorFusedThreads) dflash_selector_fused_c
         if (t == 0) {
             float best_score = scores[0];
             int best = 0;
+            if (sampling && sampling->inv_temperature > 0.0f)
+                best = dflash_sampled_choice(*sampling, sampling->key_base + position,
+                    cand_unary + static_cast<std::size_t>(position) * kTopK,
+                    cand_ids + static_cast<std::size_t>(position) * kTopK,
+                    seed_token, proposal_out, position);
+            else
             for (int c = 1; c < kTopK; ++c)
                 if (scores[c] > best_score) { best_score = scores[c]; best = c; }
             const auto selected = cand_ids[
@@ -2742,13 +2931,14 @@ void gopt_draft_dense_fixture(bool paired,bool kmajor,const std::uint16_t* input
 }
 
 struct Exl3Dflash2DraftModel::Impl {
+    Exl3DeviceSampling sampling;   // coupled proposals (propose_batched)
     Exl3GamingOptions gaming=Exl3GamingOptions::from_environment();
     GoptSubmissions gaming_submissions{};
     int device=0;
     bool parallel_topk = false;
     bool local_merge_topk = false;
     std::uint64_t local_merge_topk_calls = 0;
-    // NINFER_DFLASH2_HEAD_PREFIX=N (multiple of 128, default 98304 = 99.96% of
+    // VOIDINFER_DFLASH2_HEAD_PREFIX=N (multiple of 128, default 98304 = 99.96% of
     // code/prose tokens, 0 = off): the draft head
     // scores only token ids [0, N). The target verifies every proposal, so this
     // changes acceptance, never output. A host seed token >= N switches back to
@@ -2816,7 +3006,7 @@ struct Exl3Dflash2DraftModel::Impl {
         }
 
         void initialize() {
-            const char* requested = std::getenv("NINFER_DFLASH2_PROJECTION_TIMING");
+            const char* requested = std::getenv("VOIDINFER_DFLASH2_PROJECTION_TIMING");
             enabled = requested != nullptr && std::string(requested) == "1";
             if (!enabled) return;
             for (auto& event : events)
@@ -2889,6 +3079,36 @@ struct Exl3Dflash2DraftModel::Impl {
 
     bool prefill_batch = false;
     bool target_commit_batch = false;
+    // Decode ring commits of 2..8 rows replay one captured chain per row
+    // count (~76 launches -> one graph); `base` holds the ring position.
+    struct CommitGraphs {
+        std::array<cudaGraphExec_t, 9> exec{};
+        std::int32_t* base = nullptr;
+        CommitGraphs() = default;
+        CommitGraphs(const CommitGraphs&) = delete;
+        CommitGraphs& operator=(const CommitGraphs&) = delete;
+        ~CommitGraphs() {
+            for (auto graph : exec) if (graph) cudaGraphExecDestroy(graph);
+            if (base) cudaFree(base);
+        }
+    } commit_graphs;
+    // Fresh-prefill bulk commits replay one captured whole-chunk chain per
+    // chunk (~50 launches each, host-bound when eager); `base` holds the
+    // chunk's first position and the tap pointers advance inside the graph.
+    struct BulkGraph {
+        cudaGraphExec_t exec = nullptr;
+        std::int32_t* base = nullptr;
+        BulkGraph() = default;
+        BulkGraph(const BulkGraph&) = delete;
+        BulkGraph& operator=(const BulkGraph&) = delete;
+        ~BulkGraph() {
+            if (exec) cudaGraphExecDestroy(exec);
+            if (base) cudaFree(base);
+        }
+    } bulk_graph;
+    // Batched multi-agent drafting (set_batched_propose); null keeps every
+    // proposal private to this execution.
+    Exl3BatchedVerifyCoordinator* batched_propose = nullptr;
     Exl3CudaLinearWorkspace::Owner ws_fc;
     Exl3CudaLinearWorkspace::Owner ws_q;
     Exl3CudaLinearWorkspace::Owner ws_kv;
@@ -2948,6 +3168,7 @@ struct Exl3Dflash2DraftModel::Impl {
         float* edge_scores = nullptr;       // [16]
         std::int64_t* proposal_out = nullptr; // [P]
         DraftPositionConfidence* confidence_out = nullptr; // [P], T73A only
+        DraftSelectSampling* select_sampling = nullptr;   // coupled proposals (fused selector)
     } s{};
 
     std::vector<std::unique_ptr<DeviceAllocation>> scratch;
@@ -2982,12 +3203,41 @@ struct Exl3Dflash2DraftModel::Impl {
     } ring_undo;
     long long ring_base_abs = 0;
     int ring_count = 0;
+    // Short contexts (< kRingKeep committed rows): the ring is presented as
+    // saturated, its oldest slots lying before cache position 0. They are
+    // zeroed and the ring attention masks them (block position); host ring
+    // exports carry only the real rows.
+    void saturate_virtually(cudaStream_t stream) {
+        if (ring_count <= 0 || ring_count >= kRingKeep) return;
+        const long long end = ring_base_abs + ring_count;
+        for (long long cursor = end; cursor < end + (kRingCap - ring_count);) {
+            const long long slot = cursor & kRingMask;
+            const long long rows = std::min<long long>(end + (kRingCap - ring_count) - cursor,
+                                                       kRingCap - slot);
+            const std::size_t row_bytes = static_cast<std::size_t>(kKVHeads) * kHeadDim * sizeof(std::uint16_t);
+            for (int layer = 0; layer < kLayers; ++layer) {
+                cuda_check(cudaMemsetAsync(ring_k[layer] + slot * kKVHeads * kHeadDim, 0,
+                    static_cast<std::size_t>(rows) * row_bytes, stream), "zero draft ring padding");
+                cuda_check(cudaMemsetAsync(ring_v[layer] + slot * kKVHeads * kHeadDim, 0,
+                    static_cast<std::size_t>(rows) * row_bytes, stream), "zero draft ring padding");
+            }
+            cursor += rows;
+        }
+        ring_base_abs = end - kRingKeep;
+        ring_count = kRingKeep;
+    }
     FreshPrefillStatus fresh_prefill;
     cudaStream_t fresh_prefill_stream = nullptr;
     std::size_t ring_bytes = 0;
     std::shared_ptr<const int> host_ring_identity=std::make_shared<const int>(0);
     std::shared_ptr<const Exl3DraftHostRing> host_ring_parent;
     bool host_ring_failed=false;
+    // Pinned window of one host ring export: every (layer, plane) ring range
+    // lands here under one stream fence before the page scatter.
+    struct PinnedStage {
+        std::uint16_t* host=nullptr; std::size_t bytes=0;
+        ~PinnedStage(){if(host)cudaFreeHost(host);}
+    } ring_export_stage;
     bool fail_next_host_export_completion=false;
     std::uint64_t ring_revision=0,witness_revision=0;
     std::uint64_t ring_acquisition=0,ring_execution=0;
@@ -3034,10 +3284,10 @@ struct Exl3Dflash2DraftModel::Impl {
         int capacity = 0, rows = 0, count = 0;
         long long base_abs = 0, frontier = 0;
         bool active = false;
-    } ring_checkpoint;
-    void copy_ring_checkpoint_slots(bool restore, cudaStream_t stream) {
+    } ring_checkpoint, ring_checkpoint_pending;   // pending: folded VeriCache next root
+    void copy_ring_checkpoint_slots(bool restore, cudaStream_t stream, bool pending = false) {
         constexpr std::size_t row_elements = static_cast<std::size_t>(kKVHeads) * kHeadDim;
-        auto& cp = ring_checkpoint;
+        auto& cp = pending ? ring_checkpoint_pending : ring_checkpoint;
         const int first_slot = static_cast<int>(cp.frontier & kRingMask);
         for (int layer = 0; layer < kLayers; ++layer)
             for (int plane = 0; plane < 2; ++plane) {
@@ -3176,6 +3426,7 @@ struct Exl3Dflash2DraftModel::Impl {
         alloc(kTopK * sizeof(float), reinterpret_cast<void**>(&s.edge_scores), "dflash edge scores");
         // [0, kBlockCap) proposals (slot 7: device-seed status).
         alloc(rowsB(kBlockCap) * sizeof(std::int64_t), reinterpret_cast<void**>(&s.proposal_out), "dflash proposal out");
+        alloc(sizeof(DraftSelectSampling), reinterpret_cast<void**>(&s.select_sampling), "dflash selection sampling");
         if (position_confidence)
             alloc(rowsB(kBlockCap) * sizeof(DraftPositionConfidence),
                   reinterpret_cast<void**>(&s.confidence_out),
@@ -3635,8 +3886,11 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
     cuda_check(cudaStreamIsCapturing(stream,&capture),"draft host export capture status");
     require(capture==cudaStreamCaptureStatusNone,"draft host export requires eager stream");
     cuda_check(cudaStreamSynchronize(stream),"draft host export completed ring");
-    auto result=Exl3DraftHostRing::create_planned(Exl3DraftHostRing::planned_page_capacity(m.ring_base_abs,m.ring_count),reserve);
-    result->model_identity_=m.host_ring_identity;result->base_=m.ring_base_abs;result->count_=m.ring_count;
+    // A virtually saturated ring exports its real rows only (from position 0).
+    const long long export_base=std::max<long long>(m.ring_base_abs,0);
+    const int export_count=static_cast<int>(m.ring_base_abs+m.ring_count-export_base);
+    auto result=Exl3DraftHostRing::create_planned(Exl3DraftHostRing::planned_page_capacity(export_base,export_count),reserve);
+    result->model_identity_=m.host_ring_identity;result->base_=export_base;result->count_=export_count;
     const auto end=result->position();
     const auto parent=share_prefix?m.host_ring_parent:nullptr;
     long long cursor=result->base_;
@@ -3663,11 +3917,6 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
         } else page->first=cursor;
         const int rows=static_cast<int>(std::min<long long>(end-cursor,64-cursor%64));
         const int previous=page->rows;page->rows+=rows;
-        for(int layer=0;layer<kLayers;++layer) {
-            page->k[layer].reserve(64*1024);page->v[layer].reserve(64*1024);
-            page->k[layer].resize(static_cast<std::size_t>(page->rows)*1024);
-            page->v[layer].resize(static_cast<std::size_t>(page->rows)*1024);
-        }
         require(download_count<downloads.size(),"draft ring download plan capacity");
         downloads[download_count++]={page,cursor,previous,rows};
         require(result->pages_.size()<result->pages_.capacity(),"draft ring export exceeds planned descriptors");
@@ -3675,35 +3924,81 @@ std::shared_ptr<const Exl3DraftHostRing> Exl3Dflash2DraftModel::export_host_ring
     }
     // All metadata and payload storage is prepared before the first download.
     // No partial preparation can publish a new parent or submit an earlier page.
-    for(std::size_t index=0;index<download_count;++index) {
-        const auto& planned=downloads[index];const auto& page=planned.page;
-        for(int layer=0;layer<kLayers;++layer) {
-            const auto download=[&](auto& plane,const std::uint16_t* source) {
-                const auto retain_uncertain=[&] {
-                    // Keep source allocations out of cudaFree as well as keeping
-                    // destination storage alive; retirement records are preallocated.
-                    for(const auto& allocation:m.scratch)
-                        if(allocation->ptr==source)allocation->uncertain_transfer_use=true;
-                    m.host_ring_failed=true;Exl3DraftHostRing::retain_uncertain_transfer(result);
-                };
-                const auto submitted=cudaMemcpyAsync(plane.data()+static_cast<std::size_t>(planned.previous)*1024,
-                    source+static_cast<std::size_t>(planned.cursor&kRingMask)*1024,static_cast<std::size_t>(planned.rows)*2048,
-                    cudaMemcpyDeviceToHost,stream);
-                if(submitted!=cudaSuccess) {
-                    retain_uncertain();
-                    cuda_check(submitted,"draft host page suffix download");
-                }
-                const bool fail_completion=std::exchange(fail_completion_for_test,false) |
-                    std::exchange(m.fail_next_host_export_completion,false);
-                const auto completed=fail_completion?cudaErrorUnknown:cudaStreamSynchronize(stream);
-                if(completed!=cudaSuccess) {
-                    retain_uncertain();
-                    cuda_check(completed,"draft host suffix complete");
-                }
-                result->exported_bytes_+=static_cast<std::size_t>(planned.rows)*2048;
-            };
-            download(page->k[layer],m.ring_k[layer]);download(page->v[layer],m.ring_v[layer]);
+    // The page suffixes cover one ring range [first, end): per (layer, plane)
+    // at most two DMA segments (ring wrap) into the pinned stage, one stream
+    // fence, then the page scatter (previously a fenced copy per page,
+    // layer and plane: ~16 ms at a 2K ring).
+    // Fresh payload storage is first-touch (page fault) bound: size the pages
+    // in parallel (an allocation failure is rethrown here, not terminated).
+    std::atomic<bool> sizing_failed{false};
+    std::for_each(std::execution::par,downloads.begin(),downloads.begin()+download_count,[&](const DownloadPage& planned) {
+        try {
+            auto& page=*planned.page;
+            for(int layer=0;layer<kLayers;++layer) {
+                page.k[layer].reserve(64*1024);page.v[layer].reserve(64*1024);
+                page.k[layer].resize(static_cast<std::size_t>(page.rows)*1024);
+                page.v[layer].resize(static_cast<std::size_t>(page.rows)*1024);
+            }
+        } catch(...) {sizing_failed.store(true,std::memory_order_relaxed);}
+    });
+    if(sizing_failed.load(std::memory_order_relaxed))throw std::bad_alloc();
+    if(download_count) {
+        const long long first=downloads[0].cursor;
+        const auto total=static_cast<std::size_t>(end-first);
+        const std::size_t plane_elements=total*1024;
+        const std::size_t stage_bytes=static_cast<std::size_t>(2*kLayers)*plane_elements*sizeof(std::uint16_t);
+        auto& stage=m.ring_export_stage;
+        if(stage.bytes<stage_bytes) {
+            if(stage.host){cuda_check(cudaFreeHost(stage.host),"draft ring export stage release");stage.host=nullptr;stage.bytes=0;}
+            const std::size_t capacity=static_cast<std::size_t>(2*kLayers)*kRingCap*1024*sizeof(std::uint16_t);
+            void* host=nullptr;
+            cuda_check(cudaHostAlloc(&host,capacity,cudaHostAllocDefault),"draft ring export stage");
+            stage.host=static_cast<std::uint16_t*>(host);stage.bytes=capacity;
         }
+        const auto retain_uncertain=[&] {
+            // Keep source allocations out of cudaFree; the stage outlives the transfer.
+            for(int layer=0;layer<kLayers;++layer)
+                for(const auto& allocation:m.scratch)
+                    if(allocation->ptr==m.ring_k[layer] || allocation->ptr==m.ring_v[layer])
+                        allocation->uncertain_transfer_use=true;
+            m.host_ring_failed=true;Exl3DraftHostRing::retain_uncertain_transfer(result);
+        };
+        for(int layer=0;layer<kLayers;++layer)
+            for(int plane=0;plane<2;++plane) {
+                const std::uint16_t* source=plane?m.ring_v[layer]:m.ring_k[layer];
+                std::uint16_t* destination=stage.host+static_cast<std::size_t>(2*layer+plane)*plane_elements;
+                for(long long cursor=first;cursor<end;) {
+                    const long long slot=cursor&kRingMask;
+                    const long long rows=std::min<long long>(end-cursor,kRingCap-slot);
+                    const auto submitted=cudaMemcpyAsync(destination+static_cast<std::size_t>(cursor-first)*1024,
+                        source+static_cast<std::size_t>(slot)*1024,static_cast<std::size_t>(rows)*2048,
+                        cudaMemcpyDeviceToHost,stream);
+                    if(submitted!=cudaSuccess) {
+                        retain_uncertain();
+                        cuda_check(submitted,"draft host ring range download");
+                    }
+                    cursor+=rows;
+                }
+            }
+        const bool fail_completion=std::exchange(fail_completion_for_test,false) |
+            std::exchange(m.fail_next_host_export_completion,false);
+        const auto completed=fail_completion?cudaErrorUnknown:cudaStreamSynchronize(stream);
+        if(completed!=cudaSuccess) {
+            retain_uncertain();
+            cuda_check(completed,"draft host ring range complete");
+        }
+        std::for_each(std::execution::par,downloads.begin(),downloads.begin()+download_count,[&](const DownloadPage& planned) {
+            auto& page=*planned.page;
+            const std::size_t offset=static_cast<std::size_t>(planned.cursor-first)*1024;
+            const std::size_t bytes=static_cast<std::size_t>(planned.rows)*2048;
+            for(int layer=0;layer<kLayers;++layer) {
+                std::memcpy(page.k[layer].data()+static_cast<std::size_t>(planned.previous)*1024,
+                    stage.host+static_cast<std::size_t>(2*layer)*plane_elements+offset,bytes);
+                std::memcpy(page.v[layer].data()+static_cast<std::size_t>(planned.previous)*1024,
+                    stage.host+static_cast<std::size_t>(2*layer+1)*plane_elements+offset,bytes);
+            }
+        });
+        result->exported_bytes_+=static_cast<std::size_t>(2*kLayers)*static_cast<std::size_t>(total)*2048;
     }
     m.host_ring_parent=result;m.witness_revision=m.ring_revision;m.ring_witness_ready=true;
     m.witness_acquisition=m.ring_acquisition;m.witness_execution=m.ring_execution;
@@ -3770,21 +4065,66 @@ void Exl3Dflash2DraftModel::restore_host_ring(std::shared_ptr<const Exl3DraftHos
     require(capture==cudaStreamCaptureStatusNone,"draft host restore requires eager stream");
     m.host_ring_parent.reset();m.host_ring_failed=true;
     try {
+        // The pages' rows of [base, position) gather into the pinned stage
+        // (export_host_ring's layout) in parallel; each contiguous run of
+        // pages then uploads with at most two DMA segments (ring wrap) per
+        // layer and plane, under one stream fence (previously a fenced copy
+        // per page, layer and plane).
+        struct Span { const Exl3DraftHostRing::Page* page; long long first,end; };
+        std::vector<Span> spans;
         for(const auto& page:state->pages_) {
             const auto first=std::max(state->base_,page->first);
             const auto end=std::min(state->position(),page->first+page->rows);
-            if(end<=first) continue;
-            for(int layer=0;layer<kLayers;++layer) {
-                const auto upload=[&](std::uint16_t* destination,const auto& plane) {
-                    cuda_check(cudaMemcpyAsync(destination+static_cast<std::size_t>(first&kRingMask)*1024,
-                        plane.data()+static_cast<std::size_t>(first-page->first)*1024,static_cast<std::size_t>(end-first)*2048,
-                        cudaMemcpyHostToDevice,stream),"draft host page restore");
-                    cuda_check(cudaStreamSynchronize(stream),"draft host restore complete");
-                };
-                upload(m.ring_k[layer],page->k[layer]);upload(m.ring_v[layer],page->v[layer]);
+            if(end>first) spans.push_back({page.get(),first,end});
+        }
+        if(!spans.empty()) {
+            const long long lo=state->base_;
+            const std::size_t plane_elements=static_cast<std::size_t>(state->position()-lo)*1024;
+            auto& stage=m.ring_export_stage;
+            const std::size_t capacity=static_cast<std::size_t>(2*kLayers)*kRingCap*1024*sizeof(std::uint16_t);
+            if(stage.bytes<capacity) {
+                if(stage.host){cuda_check(cudaFreeHost(stage.host),"draft ring stage release");stage.host=nullptr;stage.bytes=0;}
+                void* host=nullptr;
+                cuda_check(cudaHostAlloc(&host,capacity,cudaHostAllocDefault),"draft ring stage");
+                stage.host=static_cast<std::uint16_t*>(host);stage.bytes=capacity;
             }
+            std::for_each(std::execution::par,spans.begin(),spans.end(),[&](const Span& span) {
+                const std::size_t offset=static_cast<std::size_t>(span.first-lo)*1024;
+                const std::size_t source=static_cast<std::size_t>(span.first-span.page->first)*1024;
+                const std::size_t bytes=static_cast<std::size_t>(span.end-span.first)*2048;
+                for(int layer=0;layer<kLayers;++layer) {
+                    std::memcpy(stage.host+static_cast<std::size_t>(2*layer)*plane_elements+offset,
+                        span.page->k[layer].data()+source,bytes);
+                    std::memcpy(stage.host+static_cast<std::size_t>(2*layer+1)*plane_elements+offset,
+                        span.page->v[layer].data()+source,bytes);
+                }
+            });
+            const auto upload_run=[&](long long first,long long end) {
+                for(int layer=0;layer<kLayers;++layer)
+                    for(int plane=0;plane<2;++plane) {
+                        std::uint16_t* ring=plane?m.ring_v[layer]:m.ring_k[layer];
+                        const std::uint16_t* source=stage.host+static_cast<std::size_t>(2*layer+plane)*plane_elements;
+                        for(long long cursor=first;cursor<end;) {
+                            const long long slot=cursor&kRingMask;
+                            const long long rows=std::min<long long>(end-cursor,kRingCap-slot);
+                            cuda_check(cudaMemcpyAsync(ring+static_cast<std::size_t>(slot)*1024,
+                                source+static_cast<std::size_t>(cursor-lo)*1024,static_cast<std::size_t>(rows)*2048,
+                                cudaMemcpyHostToDevice,stream),"draft host ring restore");
+                            cursor+=rows;
+                        }
+                    }
+            };
+            long long run_first=spans.front().first,run_end=spans.front().end;
+            for(std::size_t i=1;i<spans.size();++i) {
+                if(spans[i].first==run_end) {run_end=spans[i].end;continue;}
+                upload_run(run_first,run_end);
+                run_first=spans[i].first;run_end=spans[i].end;
+            }
+            upload_run(run_first,run_end);
+            cuda_check(cudaStreamSynchronize(stream),"draft host restore complete");
         }
         m.ring_base_abs=state->base_;m.ring_count=state->count_;m.host_ring_parent=std::move(state);m.host_ring_failed=false;
+        m.saturate_virtually(stream);
         m.witness_revision=m.ring_revision;m.ring_witness_ready=true;
         m.witness_acquisition=m.ring_acquisition;m.witness_execution=m.ring_execution;
     } catch(...) {m.ring_base_abs=0;m.ring_count=0;throw;}
@@ -3816,9 +4156,8 @@ std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::ring_digest(cudaStream_t str
             m.ring_digest_partial);
         cuda_check(cudaGetLastError(), "E5A3 ring digest launch");
         std::vector<std::uint64_t> partial(static_cast<std::size_t>(m.ring_count));
-        cuda_check(cudaMemcpyAsync(partial.data(), m.ring_digest_partial,
-                                   partial.size() * sizeof(std::uint64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(partial.data(), m.ring_digest_partial,
+                                   partial.size() * sizeof(std::uint64_t), stream),
                    "E5A3 ring digest download");
         cuda_check(cudaStreamSynchronize(stream), "E5A3 ring digest sync");
         std::uint64_t h = 1469598103934665603ULL;
@@ -3841,9 +4180,8 @@ std::array<std::uint64_t, 5> Exl3Dflash2DraftModel::physical_ring_digest_for_tes
             m.ring_digest_partial);
         cuda_check(cudaGetLastError(), "physical ring digest launch");
         std::vector<std::uint64_t> partial(kRingCap);
-        cuda_check(cudaMemcpyAsync(partial.data(), m.ring_digest_partial,
-                                   partial.size() * sizeof(std::uint64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(partial.data(), m.ring_digest_partial,
+                                   partial.size() * sizeof(std::uint64_t), stream),
                    "physical ring digest download");
         cuda_check(cudaStreamSynchronize(stream), "physical ring digest sync");
         std::uint64_t h = 1469598103934665603ULL;
@@ -3926,6 +4264,7 @@ void Exl3Dflash2DraftModel::finish_fresh_prefill(cudaStream_t stream) {
         require(impl_->ring_count == count && impl_->ring_base_abs == f.end - count,
                 "fresh prefill final ring span mismatch");
         f.active = false;
+        impl_->saturate_virtually(stream);
     } catch (...) { f.failed = true; throw; }
 }
 
@@ -3986,13 +4325,13 @@ void Exl3Dflash2DraftModel::begin_prefill_ring_undo(int rows, long long abs_pos0
     }
 }
 
-void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream) {
+void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream, bool pending) {
     require_no_fresh_prefill();
     auto& m = *impl_;
     require(m.ring_undo.phase == Impl::RingUndo::Phase::Idle && !m.host_ring_failed &&
             rows >= 1 && rows <= kRingKeep,
             "draft ring checkpoint requires an idle healthy ring and 1..2047 rows");
-    auto& cp = m.ring_checkpoint;
+    auto& cp = pending ? m.ring_checkpoint_pending : m.ring_checkpoint;
     if (cp.capacity < rows) {
         if (cp.arena.ptr) { cuda_check(cudaStreamSynchronize(stream), "draft ring checkpoint drain"); cudaFree(cp.arena.ptr); cp.arena.ptr = nullptr; }
         const std::size_t bytes = static_cast<std::size_t>(kLayers) * 2 * rows * kKVHeads * kHeadDim * sizeof(std::uint16_t);
@@ -4003,8 +4342,22 @@ void Exl3Dflash2DraftModel::save_ring_checkpoint(int rows, cudaStream_t stream) 
     cp.base_abs = m.ring_base_abs;
     cp.count = m.ring_count;
     cp.frontier = m.ring_base_abs + m.ring_count;
-    m.copy_ring_checkpoint_slots(false, stream);
+    m.copy_ring_checkpoint_slots(false, stream, pending);
     cp.active = true;
+}
+
+void Exl3Dflash2DraftModel::promote_ring_checkpoint() {
+    auto& m = *impl_;
+    auto& a = m.ring_checkpoint;
+    auto& b = m.ring_checkpoint_pending;
+    require(b.active, "pending draft ring checkpoint missing");
+    std::swap(a.arena.ptr, b.arena.ptr);
+    std::swap(a.capacity, b.capacity);
+    std::swap(a.rows, b.rows);
+    std::swap(a.count, b.count);
+    std::swap(a.base_abs, b.base_abs);
+    std::swap(a.frontier, b.frontier);
+    std::swap(a.active, b.active);
 }
 
 void Exl3Dflash2DraftModel::restore_ring_checkpoint(cudaStream_t stream) {
@@ -4163,8 +4516,7 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
         const long long pos = first_abs + r;
         for (int t = 0; t < kLayers; ++t)
             ptrs[t] = taps[t] + static_cast<std::size_t>(first + r) * kHidden;
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, ptrs, sizeof(ptrs),
-                                   cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, ptrs, sizeof(ptrs), stream),
                    "E5A3 commit tap pointers");
         dflash_tap_concat_kernel<<<(kLayers * kHidden + 255) / 256, 256, 0, stream>>>(m.s.tap_ptr, m.s.tcat, 1);
         cuda_check(cudaGetLastError(), "E5A3 commit tap concat");
@@ -4173,8 +4525,7 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
             m.s.fc_raw, m.hidden_norm, m.s.hctx, 1, kHidden);
         cuda_check(cudaGetLastError(), "E5A3 commit hidden norm");
         const std::int32_t p32 = static_cast<std::int32_t>(pos);
-        cuda_check(cudaMemcpyAsync(m.s.pos_ctx, &p32, sizeof(p32),
-                                   cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.pos_ctx, &p32, sizeof(p32), stream),
                    "E5A3 commit absolute position");
         for (int layer = 0; layer < kLayers; ++layer) {
             const auto& lay = m.layers[layer];
@@ -4206,6 +4557,25 @@ void Exl3Dflash2DraftModel::commit_target_block_internal(const std::uint16_t* co
     }
 }
 
+namespace {
+// Legacy-default-stream callers fork graph-captured draft work onto a private
+// non-blocking stream of their thread and join back.
+struct DraftSideStream {
+    cudaStream_t side=nullptr;
+    cudaEvent_t fork=nullptr,join=nullptr;
+};
+const DraftSideStream& draft_side_stream() {
+    thread_local const DraftSideStream value=[] {
+        DraftSideStream s;
+        cuda_check(cudaStreamCreateWithFlags(&s.side,cudaStreamNonBlocking),"draft side stream");
+        cuda_check(cudaEventCreateWithFlags(&s.fork,cudaEventDisableTiming),"draft side fork");
+        cuda_check(cudaEventCreateWithFlags(&s.join,cudaEventDisableTiming),"draft side join");
+        return s;
+    }();
+    return value;
+}
+}  // namespace
+
 void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* const* taps,
     int rows, long long abs_pos0, cudaStream_t stream) {
     impl_->invalidate_ring_witness();
@@ -4216,6 +4586,16 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     cuda_check(cudaStreamIsCapturing(stream, &capture), "draft prefill capture status");
     require(capture == cudaStreamCaptureStatusNone, "draft prefill commit requires eager stream");
+    if (!stream && m.prefill_batch && rows > 1 && rows <= 8 && !m.fresh_prefill.active) {
+        // Decode commits replay a captured graph, which needs a real stream.
+        const auto& side = draft_side_stream();
+        cuda_check(cudaEventRecord(side.fork, stream), "draft commit fork");
+        cuda_check(cudaStreamWaitEvent(side.side, side.fork, 0), "draft commit fork");
+        commit_prefill_block_internal(taps, rows, abs_pos0, side.side);
+        cuda_check(cudaEventRecord(side.join, side.side), "draft commit join");
+        cuda_check(cudaStreamWaitEvent(stream, side.join, 0), "draft commit join");
+        return;
+    }
     if (!m.prefill_batch || rows == 1) { commit_target_block_internal(taps, rows, abs_pos0, stream); return; }
     require(m.ring_count == 0 || abs_pos0 == m.ring_base_abs + m.ring_count,
             "draft prefill commit must extend committed span");
@@ -4227,20 +4607,102 @@ void Exl3Dflash2DraftModel::commit_prefill_block_internal(const std::uint16_t* c
                 m.ws_kv->draft_prefill_kv_candidate(layer.vm, std::min(rows,8)),
                 "draft prefill K/V admission unavailable");
     if (m.ring_count == 0) m.ring_base_abs = abs_pos0;
-    for (int first = 0; first < rows; first += 8) {
-        const int count = std::min(8, rows - first);
+    // Fresh prefill commits of 9..16 rows run as one chunk through the
+    // row-batched coherent projections (half the launches of two 8-row
+    // chunks); VOIDINFER_DFLASH2_PREFILL_CHUNK16=0 keeps 8-row chunks.
+    static const bool chunk16 = [] {
+        const char* value = std::getenv("VOIDINFER_DFLASH2_PREFILL_CHUNK16");
+        return !value || std::string(value) != "0";
+    }();
+    const int chunk = chunk16 && m.fresh_prefill.active && rows > 8 ? 16 : 8;
+    struct BatchedRoute {
+        Impl& m; bool on;
+        BatchedRoute(Impl& impl, bool enable) : m(impl), on(enable) {
+            if (on) { m.ws_fc->set_draft_batched(true); m.ws_kv->set_draft_batched(true); }
+        }
+        ~BatchedRoute() {
+            if (on) { m.ws_fc->set_draft_batched(false); m.ws_kv->set_draft_batched(false); }
+        }
+    };
+    static const bool commit_graph = [] {
+        const char* value = std::getenv("VOIDINFER_DFLASH2_COMMIT_GRAPH");
+        return !value || std::string(value) != "0";
+    }();
+    // The legacy default stream cannot be captured.
+    const bool graphed = commit_graph && stream && !m.fresh_prefill.active && chunk == 8 && rows <= 8 &&
+        !m.gaming[Gopt::DraftRingNormRope] && !m.projection_timing.enabled && !m.projection_observer;
+    // Graphed decode commits also use the slot-filling K split (fc: 400 ->
+    // 680 CTAs on the lone 25600 x 5120 projection).
+    const BatchedRoute batched_route(m, chunk == 16 || graphed);
+    if (graphed) {
+        const std::uint16_t* ptrs[kLayers];
+        for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t];
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, ptrs, sizeof(ptrs), stream),
+                   "draft commit tap pointers");
+        auto& graphs = m.commit_graphs;
+        if (!graphs.base)
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&graphs.base), sizeof(std::int32_t)),
+                       "draft commit position");
+        dflash_set_position_kernel<<<1,1,0,stream>>>(graphs.base, static_cast<int>(abs_pos0));
+        cuda_check(cudaGetLastError(), "draft commit position");
+        auto& exec = graphs.exec[static_cast<std::size_t>(rows)];
+        if (!exec) {
+            cudaGraph_t graph = nullptr;
+            const voidinfer::CudaCaptureScope capture_scope;
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                       "draft commit capture");
+            try {
+                dflash_tap_concat_kernel<<<(rows * kLayers * kHidden + 255) / 256,256,0,stream>>>(
+                    m.s.tap_ptr,m.s.tcat,rows);
+                m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,rows,stream,admission);
+                dflash_rms_norm_kernel<DFlashFmt::F16><<<rows,256,256*sizeof(float),stream>>>(
+                    m.s.fc_raw,m.hidden_norm,m.s.hctx,rows,kHidden);
+                dflash_prefill_positions_device_kernel<<<1,16,0,stream>>>(m.s.pos_ctx,rows,graphs.base);
+                for (int layer = 0; layer < kLayers; ++layer) {
+                    const auto& lay = m.layers[layer];
+                    m.ws_kv->forward(lay.k,lay.km,m.s.hctx,m.s.kctx,rows,stream);
+                    m.ws_kv->forward(lay.v,lay.vm,m.s.hctx,m.s.vctx,rows,stream);
+                    dflash_head_norm_kernel<<<rows*kKVHeads,128,128*sizeof(float),stream>>>(
+                        m.s.kctx,lay.k_norm,m.s.kctx_n,rows*kKVHeads,kHeadDim);
+                    dflash_rope_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+                        m.s.kctx_n,m.s.kctx_r,m.s.pos_ctx,rows,kKVHeads,kHeadDim);
+                    dflash_prefill_ring_scatter_positions_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,
+                        256,0,stream>>>(m.s.kctx_r,m.s.vctx,m.ring_k[layer],m.ring_v[layer],rows,
+                        m.s.pos_ctx);
+                }
+                cuda_check(cudaGetLastError(), "draft commit capture launches");
+            } catch (...) {
+                cudaGraph_t abandoned = nullptr;
+                (void)cudaStreamEndCapture(stream, &abandoned);
+                if (abandoned) cudaGraphDestroy(abandoned);
+                throw;
+            }
+            cuda_check(cudaStreamEndCapture(stream, &graph), "draft commit capture end");
+            const auto instantiated = cudaGraphInstantiate(&exec, graph, 0);
+            cudaGraphDestroy(graph);
+            cuda_check(instantiated, "draft commit graph instantiate");
+        }
+        cuda_check(cudaGraphLaunch(exec, stream), "draft commit graph launch");
+        const int dropped = std::max(0,m.ring_count+rows-kRingKeep);
+        m.ring_count = std::min(kRingKeep,m.ring_count+rows);
+        m.ring_base_abs += dropped;
+        return;
+    }
+    for (int first = 0; first < rows; first += chunk) {
+        const int count = std::min(chunk, rows - first);
         const int pos = static_cast<int>(abs_pos0 + first);
         const std::uint16_t* ptrs[kLayers];
         for (int t = 0; t < kLayers; ++t) ptrs[t] = taps[t] + static_cast<std::size_t>(first) * kHidden;
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, ptrs, sizeof(ptrs), stream),
                    "draft prefill tap pointers");
         dflash_tap_concat_kernel<<<(count * kLayers * kHidden + 255) / 256,256,0,stream>>>(m.s.tap_ptr,m.s.tcat,count);
         cuda_check(cudaGetLastError(), "draft prefill concat");
-        m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,count,stream,admission);
+        if (count > 8) m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,count,stream);
+        else m.ws_fc->forward(m.fc,m.fc_meta,m.s.tcat,m.s.fc_raw,count,stream,admission);
         dflash_rms_norm_kernel<DFlashFmt::F16><<<count,256,256*sizeof(float),stream>>>(
             m.s.fc_raw,m.hidden_norm,m.s.hctx,count,kHidden);
         cuda_check(cudaGetLastError(), "draft prefill hidden norm");
-        dflash_prefill_positions_kernel<<<1,8,0,stream>>>(m.s.pos_ctx,count,pos);
+        dflash_prefill_positions_kernel<<<1,16,0,stream>>>(m.s.pos_ctx,count,pos);
         cuda_check(cudaGetLastError(), "draft prefill positions");
         for (int layer = 0; layer < kLayers; ++layer) {
             const auto& lay = m.layers[layer];
@@ -4277,69 +4739,69 @@ std::unique_ptr<Exl3Dflash2DraftModel> Exl3Dflash2DraftModel::load_impl(
     const std::filesystem::path& model_directory,bool defer_private) {
     auto impl = std::make_unique<Impl>();
     cuda_check(cudaGetDevice(&impl->device),"draft weight device");
-    const char* prefill_batch = std::getenv("NINFER_DFLASH2_PREFILL_BATCH");
+    const char* prefill_batch = std::getenv("VOIDINFER_DFLASH2_PREFILL_BATCH");
     impl->prefill_batch = prefill_batch && std::string(prefill_batch) == "1";
-    const char* target_commit_batch = std::getenv("NINFER_DFLASH2_TARGET_COMMIT_BATCH");
+    const char* target_commit_batch = std::getenv("VOIDINFER_DFLASH2_TARGET_COMMIT_BATCH");
     require(target_commit_batch == nullptr || std::string(target_commit_batch) == "0" ||
                 std::string(target_commit_batch) == "1",
-            "NINFER_DFLASH2_TARGET_COMMIT_BATCH must be 0 or 1");
+            "VOIDINFER_DFLASH2_TARGET_COMMIT_BATCH must be 0 or 1");
     impl->target_commit_batch = target_commit_batch != nullptr &&
         std::string(target_commit_batch) == "1";
     require(!impl->target_commit_batch || impl->prefill_batch,
-            "NINFER_DFLASH2_TARGET_COMMIT_BATCH requires NINFER_DFLASH2_PREFILL_BATCH=1");
-    const char* parallel_topk = std::getenv("NINFER_DFLASH2_PARALLEL_TOPK");
+            "VOIDINFER_DFLASH2_TARGET_COMMIT_BATCH requires VOIDINFER_DFLASH2_PREFILL_BATCH=1");
+    const char* parallel_topk = std::getenv("VOIDINFER_DFLASH2_PARALLEL_TOPK");
     impl->parallel_topk = parallel_topk == nullptr || std::string(parallel_topk) != "0";
-    const char* local_merge_topk = std::getenv("NINFER_DFLASH2_LOCAL_TOPK");
+    const char* local_merge_topk = std::getenv("VOIDINFER_DFLASH2_LOCAL_TOPK");
     impl->local_merge_topk = local_merge_topk && std::string(local_merge_topk) == "1";
-    const char* parallel_ring = std::getenv("NINFER_DFLASH2_PARALLEL_RING_ATTENTION");
+    const char* parallel_ring = std::getenv("VOIDINFER_DFLASH2_PARALLEL_RING_ATTENTION");
     impl->parallel_ring_attention = parallel_ring == nullptr || std::string(parallel_ring) == "1";
     const char* position_confidence =
-        std::getenv("NINFER_DFLASH2_POSITION_CONFIDENCE");
+        std::getenv("VOIDINFER_DFLASH2_POSITION_CONFIDENCE");
     require(position_confidence == nullptr ||
                 std::string(position_confidence) == "0" ||
                 std::string(position_confidence) == "1",
-            "NINFER_DFLASH2_POSITION_CONFIDENCE must be 0 or 1");
+            "VOIDINFER_DFLASH2_POSITION_CONFIDENCE must be 0 or 1");
     impl->position_confidence =
         position_confidence != nullptr && std::string(position_confidence) == "1";
-    const char* dense_kmajor=std::getenv("NINFER_DFLASH2_DENSE_KMAJOR");
+    const char* dense_kmajor=std::getenv("VOIDINFER_DFLASH2_DENSE_KMAJOR");
     require(dense_kmajor==nullptr || std::string(dense_kmajor)=="0" ||
             std::string(dense_kmajor)=="1",
-        "NINFER_DFLASH2_DENSE_KMAJOR must be 0 or 1");
+        "VOIDINFER_DFLASH2_DENSE_KMAJOR must be 0 or 1");
     impl->dense_kmajor=dense_kmajor!=nullptr && std::string(dense_kmajor)=="1";
     const char* selector_batched_anchor_chain =
-        std::getenv("NINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN");
+        std::getenv("VOIDINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN");
     require(selector_batched_anchor_chain == nullptr ||
                 std::string(selector_batched_anchor_chain) == "0" ||
                 std::string(selector_batched_anchor_chain) == "1",
-            "NINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN must be 0 or 1");
+            "VOIDINFER_DFLASH2_FAST_SELECTOR_BATCHED_ANCHOR_CHAIN must be 0 or 1");
     impl->selector_batched_anchor_chain =
         selector_batched_anchor_chain != nullptr &&
         std::string(selector_batched_anchor_chain) == "1";
-    const char* fast_device_liveness=std::getenv("NINFER_DFLASH2_FAST_DEVICE_LIVENESS");
+    const char* fast_device_liveness=std::getenv("VOIDINFER_DFLASH2_FAST_DEVICE_LIVENESS");
     require(fast_device_liveness==nullptr || std::string(fast_device_liveness)=="0" ||
             std::string(fast_device_liveness)=="1",
-        "NINFER_DFLASH2_FAST_DEVICE_LIVENESS must be 0 or 1");
+        "VOIDINFER_DFLASH2_FAST_DEVICE_LIVENESS must be 0 or 1");
     impl->fast_device_liveness=fast_device_liveness!=nullptr &&
         std::string(fast_device_liveness)=="1";
-    const char* fused_topk_liveness=std::getenv("NINFER_DFLASH2_FUSED_TOPK_LIVENESS");
+    const char* fused_topk_liveness=std::getenv("VOIDINFER_DFLASH2_FUSED_TOPK_LIVENESS");
     require(fused_topk_liveness==nullptr || std::string(fused_topk_liveness)=="0" ||
             std::string(fused_topk_liveness)=="1",
-        "NINFER_DFLASH2_FUSED_TOPK_LIVENESS must be 0 or 1");
+        "VOIDINFER_DFLASH2_FUSED_TOPK_LIVENESS must be 0 or 1");
     impl->fused_topk_liveness=fused_topk_liveness!=nullptr &&
         std::string(fused_topk_liveness)=="1";
-    if(const char* prefix=std::getenv("NINFER_DFLASH2_HEAD_PREFIX")) {
+    if(const char* prefix=std::getenv("VOIDINFER_DFLASH2_HEAD_PREFIX")) {
         const int value=std::atoi(prefix);
         require(value>=0 && value%128==0 && value<=kVocab,
-            "NINFER_DFLASH2_HEAD_PREFIX must be a multiple of 128 within the vocabulary");
+            "VOIDINFER_DFLASH2_HEAD_PREFIX must be a multiple of 128 within the vocabulary");
         impl->head_prefix=value<kVocab?value:0;
     }
     require(!impl->fused_topk_liveness ||
                 (impl->fast_device_liveness && impl->local_merge_topk),
         "fused top-K liveness requires fast device liveness and local top-K");
-    const char* fused_selector=std::getenv("NINFER_DFLASH2_FUSED_SELECTOR");
+    const char* fused_selector=std::getenv("VOIDINFER_DFLASH2_FUSED_SELECTOR");
     require(fused_selector==nullptr || std::string(fused_selector)=="0" ||
             std::string(fused_selector)=="1",
-        "NINFER_DFLASH2_FUSED_SELECTOR must be 0 or 1");
+        "VOIDINFER_DFLASH2_FUSED_SELECTOR must be 0 or 1");
     impl->fused_selector=fused_selector!=nullptr &&
         std::string(fused_selector)=="1";
     // Capture the private allocation requirement before timing resources or weight
@@ -4586,8 +5048,634 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_view(
     std::span<const std::int64_t> block_ids,int block_pos0,
     const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
     const Exl3CudaLinearMetadata& target_head_metadata,std::int64_t mask_token_id,cudaStream_t stream) {
+    if(impl_->batched_propose && batched_proposal_supported(block_ids))
+        return impl_->batched_propose->propose(*this,block_ids,block_pos0,target_embedding_bf16,
+            target_head,target_head_metadata,mask_token_id,stream);
+    return propose_cached_private(block_ids,block_pos0,target_embedding_bf16,target_head,
+        target_head_metadata,mask_token_id,stream);
+}
+
+std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_private(
+    std::span<const std::int64_t> block_ids,int block_pos0,
+    const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+    const Exl3CudaLinearMetadata& target_head_metadata,std::int64_t mask_token_id,cudaStream_t stream) {
+    // A lone lane (no coordinator, or the only member of its group) uses the
+    // batched forward as a one-member group: once the ring is full it replays
+    // one captured graph instead of eager launches.
+    static const bool solo_batched=[] {
+        const char* value=std::getenv("VOIDINFER_DFLASH2_SOLO_BATCHED");
+        return !value || std::strcmp(value,"0")!=0;
+    }();
+    if(solo_batched && batched_proposal_supported(block_ids)) {
+        // The legacy default stream cannot be captured: such callers fork onto
+        // a private non-blocking stream for the proposal and join back.
+        const auto& solo=draft_side_stream();
+        cudaStream_t run=stream;
+        if(!run) {
+            cuda_check(cudaEventRecord(solo.fork,stream),"solo draft fork");
+            cuda_check(cudaStreamWaitEvent(solo.side,solo.fork,0),"solo draft fork");
+            run=solo.side;
+        }
+        Exl3DraftBatchedRequest request{this,block_ids,block_pos0,{}};
+        Exl3DraftBatchedRequest* members[1]{&request};
+        propose_batched(members,target_embedding_bf16,target_head,target_head_metadata,run);
+        if(run!=stream) {
+            cuda_check(cudaEventRecord(solo.join,run),"solo draft join");
+            cuda_check(cudaStreamWaitEvent(stream,solo.join,0),"solo draft join");
+        }
+        return std::move(request.proposals);
+    }
     return propose_internal(block_ids,block_pos0,nullptr,0,0,0,target_embedding_bf16,
         target_head,target_head_metadata,mask_token_id,stream,true);
+}
+
+bool Exl3Dflash2DraftModel::batched_rounds() const noexcept {
+    return impl_->batched_propose != nullptr;
+}
+
+void Exl3Dflash2DraftModel::set_batched_propose(Exl3BatchedVerifyCoordinator* coordinator) noexcept {
+    impl_->batched_propose=coordinator;
+}
+
+bool Exl3Dflash2DraftModel::batched_proposal_supported(std::span<const std::int64_t> block) const noexcept {
+    const Impl& m=*impl_;
+    bool gaming=false;
+    for(const auto id:{Gopt::DraftRopePair,Gopt::DraftHeadNormRope,Gopt::DraftConvResidual,
+                       Gopt::DraftResidualNorm,Gopt::DraftDenseRowPair,Gopt::DraftRingNormRope})
+        gaming=gaming || m.gaming[id];
+    return !gaming && static_cast<int>(block.size())==m.block_capacity && m.block_capacity==kBlockCap &&
+        m.fused_selector && !m.position_confidence && m.local_merge_topk &&
+        dflash_topk_segmented_enabled() && m.fast_device_liveness && !m.fused_topk_liveness &&
+        !m.projection_timing.enabled && !m.projection_observer && !m.ring_attention_observer &&
+        !m.shared_q_executor && m.parallel_ring_attention && !m.host_control_active &&
+        m.ring_count>=0 && m.ring_count<=kRingKeep &&
+        std::getenv("VOIDINFER_DFLASH2_TIMING")==nullptr &&
+        std::getenv("VOIDINFER_DFLASH2_DEBUG_LOGITS")==nullptr;
+}
+
+namespace {
+// Shared 32-row execution state of batched drafting. Batched forwards are
+// serialized (one coordinator group at a time); the weights stay per model.
+struct DraftBatchedScratch {
+    // Up to eight lanes' 8-row blocks; the planes hold rows_capacity rows
+    // (32, or 64 with eight-lane batched rounds: VOIDINFER_EXL3_BATCH_ROWS).
+    static constexpr int kRows = 8 * kBlockCap;
+    static int rows_capacity() noexcept {
+        static const int rows = [] {
+            const char* value = std::getenv("VOIDINFER_EXL3_BATCH_ROWS");
+            return value && std::atoi(value) == 64 ? 64 : 32;
+        }();
+        return rows;
+    }
+    std::mutex mutex;
+    bool ready = false;
+    std::uint16_t *x_a=nullptr,*x_b=nullptr,*ln=nullptr,*conv=nullptr,*convf=nullptr,*dyn=nullptr,
+        *ln2=nullptr,*conv2=nullptr,*convf2=nullptr,*dyn2=nullptr,*qproj=nullptr,*qn=nullptr,*qr=nullptr,
+        *kblk=nullptr,*vblk=nullptr,*kblk_n=nullptr,*kblk_r=nullptr,*attn=nullptr,*oproj=nullptr,
+        *gate=nullptr,*up=nullptr,*act=nullptr,*down=nullptr,*final_norm=nullptr,*head_out=nullptr;
+    std::int32_t* pos=nullptr;
+    std::int64_t* ids=nullptr;
+    unsigned int* liveness=nullptr;
+    std::uint16_t *tcat=nullptr,*fc_raw=nullptr,*hctx=nullptr;
+    std::int32_t* cpos=nullptr;
+    const std::uint16_t** tap_ptr=nullptr;
+    Exl3CudaLinearWorkspace::Owner ws_q,ws_kv,ws_o,ws_mlp,ws_down,ws_head,ws_head32,ws_fc;
+    // Captured proposal forwards (full rings): one per member set and head
+    // width; ring_start holds each member's ring start for the replayed round.
+    int* ring_start=nullptr;
+    DraftSelectSampling* sampling=nullptr;   // per member, uploaded every round
+    struct Graph {
+        std::array<const void*,8> members{};
+        int count=0,head_columns=0;
+        cudaGraphExec_t exec=nullptr;
+    };
+    std::vector<Graph> graphs;
+    // The planes and workspaces are shared by every lane's stream. The mutex
+    // orders host enqueues only: `done` marks the last user's GPU work, and the
+    // next user waits for it on its own stream before touching any plane.
+    cudaEvent_t done=nullptr;
+    void prepare() {
+        if(ready)return;
+        const auto alloc=[](auto*& pointer,std::size_t bytes,const char* label) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&pointer),bytes),label);
+        };
+        constexpr std::size_t two=sizeof(std::uint16_t);
+        const std::size_t rows=static_cast<std::size_t>(rows_capacity());
+        for(auto** plane:{&x_a,&x_b,&ln,&conv,&convf,&ln2,&conv2,&convf2,&oproj,&down,&final_norm})
+            alloc(*plane,rows*kHidden*two,"batched draft hidden plane");
+        alloc(dyn,rows*kConvDynamic*two,"batched draft dynamic conv");
+        alloc(dyn2,rows*kConvDynamic*two,"batched draft dynamic conv");
+        for(auto** plane:{&qproj,&qn,&qr,&attn})
+            alloc(*plane,rows*kQHeads*kHeadDim*two,"batched draft query plane");
+        for(auto** plane:{&kblk,&vblk,&kblk_n,&kblk_r})
+            alloc(*plane,rows*kKVHeads*kHeadDim*two,"batched draft key/value plane");
+        for(auto** plane:{&gate,&up,&act})
+            alloc(*plane,rows*kIntermediate*two,"batched draft MLP plane");
+        alloc(head_out,rows*kVocab*two,"batched draft head logits");
+        alloc(pos,rows*sizeof(std::int32_t),"batched draft positions");
+        alloc(ids,rows*sizeof(std::int64_t),"batched draft ids");
+        alloc(liveness,sizeof(unsigned int),"batched draft liveness");
+        alloc(ring_start,8*sizeof(int),"batched draft ring starts");
+        alloc(sampling,8*sizeof(DraftSelectSampling),"batched draft sampling");
+        alloc(tcat,rows*kLayers*kHidden*two,"batched commit tap rows");
+        alloc(fc_raw,rows*kHidden*two,"batched commit fc rows");
+        alloc(hctx,rows*kHidden*two,"batched commit hidden rows");
+        alloc(cpos,rows*sizeof(std::int32_t),"batched commit positions");
+        alloc(tap_ptr,kLayers*sizeof(const std::uint16_t*),"batched commit tap pointers");
+        cuda_check(cudaEventCreateWithFlags(&done,cudaEventDisableTiming),"batched draft scratch fence");
+        const auto linear=[](int input,int output,int max_rows,bool batched) {
+            Exl3CudaLinearWorkspace::Owner owner(std::make_unique<Exl3CudaLinearWorkspace>(
+                input,output,max_rows,true).release());
+            if(batched)owner->enable_draft_batched();
+            return owner;
+        };
+        // Narrow projections get 4x row planes: 32-row calls then split K
+        // until they fill the resident M32 slots (coherent_m32_split; the
+        // 17408-wide MLP already fills them at five partitions).
+        const int kWideRows=4*rows_capacity();
+        ws_q=linear(kHidden,kQHeads*kHeadDim,kWideRows,true);
+        ws_kv=linear(kHidden,kKVHeads*kHeadDim,kWideRows,true);
+        ws_o=linear(kQHeads*kHeadDim,kHidden,kWideRows,true);
+        ws_mlp=linear(kHidden,kIntermediate,rows_capacity(),true);
+        ws_down=linear(kIntermediate,kHidden,kWideRows,true);
+        ws_fc=linear(kLayers*kHidden,kHidden,kWideRows,true);
+        // The H6 head runs in 16-row single-split tiles; more than 16
+        // proposal rows (3-4 agents) take one 32-row pass (the head weights
+        // stream once).
+        ws_head=linear(kHidden,kVocab,16,false);
+        ws_head->set_native_continuation16(true);
+        ws_head32=linear(kHidden,kVocab,rows_capacity(),true);
+        ready=true;
+    }
+};
+DraftBatchedScratch& draft_batched_scratch() {
+    static DraftBatchedScratch scratch;
+    return scratch;
+}
+// Holds the scratch for one user: waits for the previous user's GPU work on
+// `stream` and records this user's work there when the scope ends (also on
+// failure: the enqueued work may still run).
+class DraftBatchedScratchUse {
+public:
+    DraftBatchedScratchUse(DraftBatchedScratch& scratch,cudaStream_t stream)
+        : scratch_(scratch),lock_(scratch.mutex),stream_(stream) {
+        scratch_.prepare();
+        cuda_check(cudaStreamWaitEvent(stream_,scratch_.done,0),"batched draft scratch wait");
+    }
+    ~DraftBatchedScratchUse() {(void)cudaEventRecord(scratch_.done,stream_);}
+    DraftBatchedScratchUse(const DraftBatchedScratchUse&)=delete;
+    DraftBatchedScratchUse& operator=(const DraftBatchedScratchUse&)=delete;
+private:
+    DraftBatchedScratch& scratch_;
+    std::lock_guard<std::mutex> lock_;
+    cudaStream_t stream_;
+};
+} // namespace
+
+std::size_t Exl3Dflash2DraftModel::max_batched_members() noexcept {
+    // VOIDINFER_EXL3_DRAFT_BATCH_LANES caps the lanes of one batched draft.
+    static const int cap=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_DRAFT_BATCH_LANES");
+        return value?std::max(2,std::atoi(value)):8;
+    }();
+    return static_cast<std::size_t>(std::min(cap,DraftBatchedScratch::rows_capacity()/kBlockCap));
+}
+
+void Exl3Dflash2DraftModel::set_sampling(const Exl3DeviceSampling& sampling) noexcept {
+    impl_->sampling=sampling;
+}
+
+void Exl3Dflash2DraftModel::propose_batched(std::span<Exl3DraftBatchedRequest* const> members,
+    const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+    const Exl3CudaLinearMetadata& target_head_metadata,cudaStream_t stream) {
+    const int count=static_cast<int>(members.size());
+    require(count>=1 && count*kBlockCap<=DraftBatchedScratch::rows_capacity() && target_embedding_bf16,
+        "batched draft member count");
+    const Impl& lead=*members[0]->draft->impl_;
+    for(auto* member:members) {
+        require(member && member->draft && member->draft->batched_proposal_supported(member->block) &&
+                member->draft->impl_->layers[0].q.trellis==lead.layers[0].q.trellis,
+            "batched draft member outside the shared configuration");
+        member->draft->require_no_fresh_prefill();
+        const Impl& m=*member->draft->impl_;
+        require(m.ring_base_abs>=-kRingKeep && member->block_pos0==m.ring_base_abs+m.ring_count &&
+                std::all_of(member->block.begin(),member->block.end(),
+                    [](std::int64_t token){return token>=0 && token<kVocab;}),
+            "batched draft block must extend its committed ring");
+    }
+    auto& b=draft_batched_scratch();
+    const DraftBatchedScratchUse use(b,stream);
+    constexpr int L=kBlockCap,P=kBlockCap-1;
+    const int rows=count*L;
+    std::array<std::int64_t,DraftBatchedScratch::kRows> ids{};
+    std::array<std::int32_t,DraftBatchedScratch::kRows> positions{};
+    for(int i=0;i<count;++i)
+        for(int r=0;r<L;++r) {
+            ids[i*L+r]=members[i]->block[r];
+            positions[i*L+r]=members[i]->block_pos0+r;
+        }
+    cuda_check(exl3_h2d_async(b.ids,ids.data(),rows*sizeof(std::int64_t),stream),
+        "upload batched draft ids");
+    cuda_check(exl3_h2d_async(b.pos,positions.data(),rows*sizeof(std::int32_t),stream),
+        "upload batched draft positions");
+    const auto rms=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n) {
+        dflash_rms_norm_kernel<DFlashFmt::BF16><<<n,256,256*sizeof(float),stream>>>(in,weight,out,n,kHidden);
+        cuda_check(cudaGetLastError(),"batched draft RMSNorm");
+    };
+    // capacity: rows readable from `in` (32-row planes; member offsets less).
+    const auto dense=[&](const std::uint16_t* in,const std::uint16_t* weight,std::uint16_t* out,int n,int k,int width,
+                         int capacity) {
+        // Eight-lane drafts (33..64 rows): the tensor-core kernel takes 32 rows a launch.
+        const auto tc=[&] {
+            for(int first=0;first<n;first+=32) {
+                const int count=std::min(32,n-first);
+                if(!launch_dflash_dense_rows_tc(in+static_cast<std::size_t>(first)*k,weight,
+                       out+static_cast<std::size_t>(first)*width,count,k,width,capacity-first,stream))
+                    return first==0 ? false : throw std::logic_error("batched draft dense split");
+            }
+            return true;
+        };
+        if(lead.dense_kmajor && tc()) {
+        } else if(!(lead.dense_kmajor && launch_dflash_dense_rows_kmajor(in,weight,out,n,k,width,stream))) {
+            if(lead.dense_kmajor)
+                dflash_dense_gemm_t_kernel<true><<<dim3((width+255)/256,n),256,
+                    static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(in,weight,out,n,k,width);
+            else
+                dflash_dense_gemm_t_kernel<false><<<dim3((width+255)/256,n),256,
+                    static_cast<std::size_t>(k)*sizeof(std::uint16_t),stream>>>(in,weight,out,n,k,width);
+        }
+        cuda_check(cudaGetLastError(),"batched draft dense projection");
+    };
+    const auto dyn_conv=[&](const std::uint16_t* x,const std::uint16_t* dyn,const std::uint16_t* base,
+                            std::uint16_t* y,int conv_stream,bool out_bf16) {
+        if(out_bf16)
+            dflash_dyn_conv_kernel<DFlashFmt::BF16><<<dim3(rows,kHidden/256),256,0,stream>>>(
+                x,dyn,base,y,rows,conv_stream,nullptr,nullptr,L);
+        else
+            dflash_dyn_conv_kernel<DFlashFmt::F16><<<dim3(rows,kHidden/256),256,0,stream>>>(
+                x,dyn,base,y,rows,conv_stream,nullptr,nullptr,L);
+        cuda_check(cudaGetLastError(),"batched draft dynamic conv");
+    };
+    const auto residual=[&](const std::uint16_t* a,const std::uint16_t* c,std::uint16_t* out) {
+        dflash_residual_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(a,c,out,rows*kHidden);
+        cuda_check(cudaGetLastError(),"batched draft residual");
+    };
+    const int proposal_rows=count*P;
+    // Head prefix (the same rule as a private proposal): the leading
+    // head_prefix vocabulary columns, or the full head for 64 rounds after any
+    // member's anchor fell outside the prefix. One width for the whole batch.
+    int head_columns=kVocab;
+    if(lead.head_prefix>0) {
+        constexpr int kHeadPrefixHold=64;
+        bool full=false;
+        for(auto* member:members) {
+            Impl& m=*member->draft->impl_;
+            if(member->block[0]>=m.head_prefix)m.head_full_rounds=kHeadPrefixHold;
+            if(m.head_full_rounds>0) {--m.head_full_rounds;full=true;}
+        }
+        if(!full)head_columns=lead.head_prefix;
+    }
+    // The GPU work of one proposal round. device_scalars: per-round ring
+    // starts and anchors come from device memory (captured graph replay).
+    const auto enqueue=[&](bool device_scalars) {
+        dflash_embed_kernel<<<(rows*kHidden+255)/256,256,0,stream>>>(b.ids,target_embedding_bf16,b.x_a,rows);
+        cuda_check(cudaGetLastError(),"batched draft embedding");
+        const float scale=1.0f/std::sqrt(static_cast<float>(kHeadDim));
+        std::uint16_t* current=b.x_a;
+        std::uint16_t* other=b.x_b;
+        constexpr std::size_t q_row=static_cast<std::size_t>(kQHeads)*kHeadDim;
+        constexpr std::size_t kv_row=static_cast<std::size_t>(kKVHeads)*kHeadDim;
+        for(int layer=0;layer<kLayers;++layer) {
+            const auto& lay=lead.layers[layer];
+            rms(current,lay.input_norm,b.ln,rows);
+            dense(b.ln,lay.attn_kernel_proj,b.dyn,rows,kHidden,kConvDynamic,DraftBatchedScratch::rows_capacity());
+            dyn_conv(b.ln,b.dyn,lay.attn_base,b.conv,0,false);
+            b.ws_q->forward(lay.q,lay.qm,b.conv,b.qproj,rows,stream);
+            b.ws_kv->forward(lay.k,lay.km,b.conv,b.kblk,rows,stream);
+            b.ws_kv->forward(lay.v,lay.vm,b.conv,b.vblk,rows,stream);
+            dflash_head_norm_kernel<<<rows*kQHeads,128,128*sizeof(float),stream>>>(
+                b.qproj,lay.q_norm,b.qn,rows*kQHeads,kHeadDim);
+            dflash_head_norm_kernel<<<rows*kKVHeads,128,128*sizeof(float),stream>>>(
+                b.kblk,lay.k_norm,b.kblk_n,rows*kKVHeads,kHeadDim);
+            dflash_rope_kernel<<<(rows*kQHeads*kHeadDim+255)/256,256,0,stream>>>(
+                b.qn,b.qr,b.pos,rows,kQHeads,kHeadDim);
+            dflash_rope_kernel<<<(rows*kKVHeads*kHeadDim+255)/256,256,0,stream>>>(
+                b.kblk_n,b.kblk_r,b.pos,rows,kKVHeads,kHeadDim);
+            cuda_check(cudaGetLastError(),"batched draft Q/K norm and RoPE");
+            // Each agent attends to its own committed ring plus its own block.
+            for(int i=0;i<count;++i) {
+                Impl& m=*members[i]->draft->impl_;
+                const auto* q=b.qr+static_cast<std::size_t>(i)*L*q_row;
+                const auto* k=b.kblk_r+static_cast<std::size_t>(i)*L*kv_row;
+                const auto* v=b.vblk+static_cast<std::size_t>(i)*L*kv_row;
+                auto* out=b.attn+static_cast<std::size_t>(i)*L*q_row;
+                const int ring_start=static_cast<int>(m.ring_base_abs & kRingMask);
+                if(dflash_ring_split_selected(m.ring_count))
+                    launch_ring_attention_split(q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,
+                        k,v,out,L,L,scale,m.s.ring_partial_o,m.s.ring_partial_ml,stream,
+                        device_scalars?b.ring_start+i:nullptr,b.pos+static_cast<std::size_t>(i)*L);
+                else if(dflash_ring_staged_enabled())
+                    dflash_attention_ring_staged_kernel<<<L*kQHeads,kHeadDim,0,stream>>>(
+                        q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale,
+                        b.pos+static_cast<std::size_t>(i)*L);
+                else
+                    dflash_attention_ring_parallel_kernel<<<L*kQHeads,kHeadDim,0,stream>>>(
+                        q,m.ring_k[layer],m.ring_v[layer],ring_start,m.ring_count,k,v,out,L,L,scale,
+                        b.pos+static_cast<std::size_t>(i)*L);
+                cuda_check(cudaGetLastError(),"batched draft ring attention");
+            }
+            b.ws_o->forward(lay.o,lay.om,b.attn,b.oproj,rows,stream);
+            dyn_conv(b.oproj,b.dyn,lay.attn_base,b.convf,1,true);
+            residual(current,b.convf,other);
+            rms(other,lay.post_norm,b.ln2,rows);
+            dense(b.ln2,lay.mlp_kernel_proj,b.dyn2,rows,kHidden,kConvDynamic,DraftBatchedScratch::rows_capacity());
+            dyn_conv(b.ln2,b.dyn2,lay.mlp_base,b.conv2,0,false);
+            b.ws_mlp->forward(lay.gate,lay.gm,b.conv2,b.gate,rows,stream);
+            b.ws_mlp->forward(lay.up,lay.um,b.conv2,b.up,rows,stream);
+            dflash_silu_mul_kernel<<<(rows*kIntermediate+255)/256,256,0,stream>>>(
+                b.gate,b.up,b.act,rows*kIntermediate);
+            cuda_check(cudaGetLastError(),"batched draft SiLU-mul");
+            b.ws_down->forward(lay.down,lay.dm,b.act,b.down,rows,stream);
+            dyn_conv(b.down,b.dyn2,lay.mlp_base,b.convf2,1,true);
+            residual(other,b.convf2,other);
+            std::swap(current,other);
+        }
+        // Final norm of every agent's proposal rows (the anchor row is dropped),
+        // packed [agent][P]; one H6 head over all of them in 16-row tiles.
+        for(int i=0;i<count;++i)
+            rms(current+(static_cast<std::size_t>(i)*L+1)*kHidden,lead.norm,
+                b.final_norm+static_cast<std::size_t>(i)*P*kHidden,P);
+        if(proposal_rows>16) {
+            b.ws_head32->set_active_output_features(head_columns<kVocab?head_columns:0);
+            b.ws_head32->forward(target_head,target_head_metadata,b.final_norm,b.head_out,proposal_rows,stream);
+            b.ws_head32->set_active_output_features(0);
+        } else {
+        b.ws_head->set_active_output_features(head_columns<kVocab?head_columns:0);
+        for(int first=0;first<proposal_rows;first+=16) {
+            const int n=std::min(16,proposal_rows-first);
+            b.ws_head->forward(target_head,target_head_metadata,b.final_norm+static_cast<std::size_t>(first)*kHidden,
+                b.head_out+static_cast<std::size_t>(first)*kVocab,n,stream);
+        }
+        b.ws_head->set_active_output_features(0);
+        }
+        cuda_check(cudaMemsetAsync(b.liveness,0,sizeof(unsigned int),stream),"batched draft liveness zero");
+        dflash_nonfinite_flag_kernel<<<(proposal_rows*head_columns+255)/256,256,0,stream>>>(
+            b.head_out,proposal_rows*head_columns,b.liveness,head_columns,kVocab);
+        cuda_check(cudaGetLastError(),"batched draft liveness");
+        for(int i=0;i<count;++i) {
+            Impl& m=*members[i]->draft->impl_;
+            const auto* head=b.head_out+static_cast<std::size_t>(i)*P*kVocab;
+            dense(b.final_norm+static_cast<std::size_t>(i)*P*kHidden,lead.hidden_proj,m.s.hidden_proj_out,
+                P,kHidden,kRank,DraftBatchedScratch::rows_capacity()-i*P);
+            launch_dflash_topk16_segmented(head,P,head_columns,m.s.cand_ids,m.s.cand_unary,m.s.topk_segments,
+                stream,kVocab);
+            dflash_selector_fused_chain_kernel<<<1,kSelectorFusedThreads,0,stream>>>(
+                P,members[i]->block[0],device_scalars?b.ids+static_cast<std::size_t>(i)*L:nullptr,
+                m.s.cand_ids,m.s.hidden_proj_out,lead.pred_cb,lead.succ_cb,m.s.cand_unary,m.s.proposal_out,
+                b.sampling+i);
+            cuda_check(cudaGetLastError(),"batched draft selector");
+        }
+    };
+    {
+        std::array<DraftSelectSampling,8> sampling{};
+        for(int i=0;i<count;++i) {
+            const auto& cfg=members[i]->draft->impl_->sampling;
+            auto& value=sampling[static_cast<std::size_t>(i)];
+            if(cfg.sampled()) {
+                value.inv_temperature=1.0f/cfg.temperature;value.top_p=cfg.top_p;value.min_p=cfg.min_p;
+                value.top_k=cfg.top_k;value.seed=cfg.seed;
+                value.presence_penalty=cfg.presence_penalty;value.first_occurrence=cfg.first_occurrence;
+            }
+            value.key_base=members[i]->block_pos0+1;
+        }
+        cuda_check(exl3_h2d_async(b.sampling,sampling.data(),count*sizeof(DraftSelectSampling),stream),"upload batched draft sampling");
+    }
+    // Full rings (steady state): replay one captured graph per member set and
+    // head width instead of ~250 eager launches.
+    static const bool graphed_drafts=[] {
+        const char* value=std::getenv("VOIDINFER_DFLASH2_BATCHED_DRAFT_GRAPH");
+        return !value || std::string(value)!="0";
+    }();
+    bool graphed=graphed_drafts && dflash_ring_split_selected(kRingKeep);
+    for(auto* member:members) graphed=graphed && member->draft->impl_->ring_count==kRingKeep;
+    if(graphed) {
+        std::array<int,8> starts{};
+        for(int i=0;i<count;++i)
+            starts[static_cast<std::size_t>(i)]=static_cast<int>(members[i]->draft->impl_->ring_base_abs & kRingMask);
+        cuda_check(exl3_h2d_async(b.ring_start,starts.data(),count*sizeof(int),stream),
+            "upload batched draft ring starts");
+        DraftBatchedScratch::Graph* entry=nullptr;
+        for(auto& candidate:b.graphs) {
+            bool match=candidate.count==count && candidate.head_columns==head_columns;
+            for(int i=0;i<count && match;++i)
+                match=candidate.members[static_cast<std::size_t>(i)]==members[i]->draft->impl_.get();
+            if(match){entry=&candidate;break;}
+        }
+        if(!entry) {
+            DraftBatchedScratch::Graph created;
+            created.count=count;created.head_columns=head_columns;
+            for(int i=0;i<count;++i)created.members[static_cast<std::size_t>(i)]=members[i]->draft->impl_.get();
+            cudaGraph_t graph=nullptr;
+            const voidinfer::CudaCaptureScope capture_scope;
+            cuda_check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"capture batched draft");
+            try {enqueue(true);}
+            catch(...) {
+                cudaGraph_t abandoned=nullptr;
+                (void)cudaStreamEndCapture(stream,&abandoned);
+                if(abandoned)cudaGraphDestroy(abandoned);
+                throw;
+            }
+            cuda_check(cudaStreamEndCapture(stream,&graph),"capture batched draft end");
+            const auto instantiated=cudaGraphInstantiate(&created.exec,graph,0);
+            cudaGraphDestroy(graph);
+            cuda_check(instantiated,"instantiate batched draft graph");
+            b.graphs.push_back(created);
+            entry=&b.graphs.back();
+        }
+        cuda_check(cudaGraphLaunch(entry->exec,stream),"launch batched draft graph");
+    } else enqueue(false);
+    for(int i=0;i<count;++i) {
+        Impl& m=*members[i]->draft->impl_;
+        if(head_columns<kVocab)++m.head_prefix_calls;
+        members[i]->proposals.resize(P);
+        cuda_check(exl3_d2h_async(members[i]->proposals.data(),m.s.proposal_out,P*sizeof(std::int64_t),stream),"read batched draft proposals");
+        const std::size_t candidates=m.proposal_candidates?static_cast<std::size_t>(P)*kTopK:0;
+        m.last_candidate_ids.resize(candidates);
+        m.last_candidate_unary.resize(candidates);
+        if(candidates) {
+            cuda_check(exl3_d2h_async(m.last_candidate_ids.data(),m.s.cand_ids,candidates*sizeof(std::int64_t),stream),"read batched draft candidate IDs");
+            cuda_check(exl3_d2h_async(m.last_candidate_unary.data(),m.s.cand_unary,candidates*sizeof(float),stream),"read batched draft candidate scores");
+        }
+        m.last_position_confidence.clear();
+        ++m.fused_selector_calls;
+        ++m.local_merge_topk_calls;
+    }
+    unsigned int bad=0;
+    cuda_check(exl3_d2h_async(&bad,b.liveness,sizeof(bad),stream),
+        "read batched draft liveness");
+    cuda_check(cudaStreamSynchronize(stream),"synchronize batched draft");
+    require(bad==0,"batched draft head logits non-finite; proposals would be degenerate");
+    for(auto* member:members) {
+        ++member->draft->impl_->device_liveness_checks;
+        for(const auto token:member->proposals)
+            require(token>=0 && token<kVocab,"batched draft proposal outside vocabulary");
+    }
+}
+
+void Exl3Dflash2DraftModel::commit_prefill_bulk(const std::uint16_t* const* taps,int rows,
+    long long abs_pos0,cudaStream_t stream) {
+    auto& m=*impl_; auto& f=m.fresh_prefill;
+    static const bool bulk=[] {
+        const char* value=std::getenv("VOIDINFER_DFLASH2_PREFILL_BULK");
+        return !value || std::string(value)!="0";
+    }();
+    require(taps && rows>=1,"draft bulk prefill commit extent");
+    for(int t=0;t<kLayers;++t)require(taps[t]!=nullptr,"draft bulk prefill tap pointer missing");
+    if(!bulk || !m.prefill_batch || m.gaming[Gopt::DraftRingNormRope]) {
+        // The 16-row call protocol of the same rows.
+        for(int first=0;first<rows;first+=16) {
+            const int count=std::min(16,rows-first);
+            const std::uint16_t* part[kLayers];
+            for(int t=0;t<kLayers;++t)part[t]=taps[t]+static_cast<std::size_t>(first)*kHidden;
+            commit_prefill_block(part,count,abs_pos0+first,stream);
+        }
+        return;
+    }
+    Exl3DraftHostRing::require_transfer_healthy();
+    try {
+        require(f.active && !f.failed,"draft bulk prefill requires an active fresh scope");
+        require(stream==m.fresh_prefill_stream,"draft bulk prefill stream mismatch");
+        require(m.ring_undo.phase==Impl::RingUndo::Phase::Idle,"draft bulk prefill during ring undo");
+        require(abs_pos0==f.submitted_cursor && abs_pos0+rows<=f.end &&
+                abs_pos0+16>f.end-kRingCap,
+            "draft bulk prefill must cover the remaining committed calls in order");
+        cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+        cuda_check(cudaStreamIsCapturing(stream,&capture),"draft bulk prefill capture status");
+        require(capture==cudaStreamCaptureStatusNone,"draft bulk prefill requires eager stream");
+        require(m.ring_count==0 || abs_pos0==m.ring_base_abs+m.ring_count,
+            "draft bulk prefill must extend committed span");
+        m.invalidate_ring_witness();
+        if(m.ring_count==0)m.ring_base_abs=abs_pos0;
+        auto& b=draft_batched_scratch();
+        const DraftBatchedScratchUse use(b,stream);
+        constexpr int n=kKVHeads*kHeadDim;
+        constexpr int kChunk=4*kBlockCap;   // bulk prefill chunk (fixed: draft numerics)
+        const auto admission=Exl3CudaLinearAdmission::draft_prefill_fc;
+        const auto advance_ring=[&](int count) {
+            const int dropped=std::max(0,m.ring_count+count-kRingKeep);
+            m.ring_count=std::min(kRingKeep,m.ring_count+count);
+            m.ring_base_abs+=dropped;
+        };
+        // Whole chunks replay one captured chain (device tap pointers and base
+        // position advance inside it); the tail chunk runs eagerly below.
+        const int whole=rows/kChunk;
+        static const bool graphed=[] {
+            const char* value=std::getenv("VOIDINFER_DFLASH2_BULK_GRAPH");
+            return !value || std::string(value)!="0";
+        }();
+        int first=0;
+        if(graphed && whole>0 && !m.projection_timing.enabled && !m.projection_observer) {
+            auto& g=m.bulk_graph;
+            // The legacy default stream cannot be captured: replay on the
+            // draft side stream, ordered after and before `stream`.
+            const DraftSideStream* side=stream?nullptr:&draft_side_stream();
+            const cudaStream_t replay=side?side->side:stream;
+            if(side) {
+                cuda_check(cudaEventRecord(side->fork,stream),"draft bulk prefill fork");
+                cuda_check(cudaStreamWaitEvent(replay,side->fork,0),"draft bulk prefill fork");
+            }
+            if(!g.base)
+                cuda_check(cudaMalloc(reinterpret_cast<void**>(&g.base),sizeof(std::int32_t)),
+                    "draft bulk prefill position");
+            cuda_check(exl3_h2d_async(b.tap_ptr,taps,kLayers*sizeof(*taps),replay),"draft bulk prefill tap pointers");
+            dflash_set_position_kernel<<<1,1,0,replay>>>(g.base,static_cast<int>(abs_pos0));
+            cuda_check(cudaGetLastError(),"draft bulk prefill position");
+            if(!g.exec) {
+                cudaGraph_t graph=nullptr;
+                const voidinfer::CudaCaptureScope capture_scope;
+                cuda_check(cudaStreamBeginCapture(replay,cudaStreamCaptureModeThreadLocal),
+                    "draft bulk prefill capture");
+                try {
+                    dflash_tap_concat_kernel<<<(kChunk*kLayers*kHidden+255)/256,256,0,replay>>>(
+                        b.tap_ptr,b.tcat,kChunk);
+                    b.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,kChunk,replay);
+                    dflash_rms_norm_kernel<DFlashFmt::F16><<<kChunk,256,256*sizeof(float),replay>>>(
+                        b.fc_raw,m.hidden_norm,b.hctx,kChunk,kHidden);
+                    dflash_prefill_positions_device_kernel<<<1,kChunk,0,replay>>>(b.cpos,kChunk,g.base);
+                    for(int layer=0;layer<kLayers;++layer) {
+                        const auto& lay=m.layers[layer];
+                        b.ws_kv->forward(lay.k,lay.km,b.hctx,b.kblk,kChunk,replay);
+                        b.ws_kv->forward(lay.v,lay.vm,b.hctx,b.vblk,kChunk,replay);
+                        dflash_head_norm_kernel<<<kChunk*kKVHeads,128,128*sizeof(float),replay>>>(
+                            b.kblk,lay.k_norm,b.kblk_n,kChunk*kKVHeads,kHeadDim);
+                        dflash_rope_kernel<<<(kChunk*n+255)/256,256,0,replay>>>(
+                            b.kblk_n,b.kblk_r,b.cpos,kChunk,kKVHeads,kHeadDim);
+                        dflash_prefill_ring_scatter_positions_kernel<<<(kChunk*n+255)/256,256,0,replay>>>(
+                            b.kblk_r,b.vblk,m.ring_k[layer],m.ring_v[layer],kChunk,b.cpos);
+                    }
+                    dflash_bulk_advance_kernel<<<1,32,0,replay>>>(b.tap_ptr,g.base,kChunk);
+                    cuda_check(cudaGetLastError(),"draft bulk prefill capture launches");
+                } catch(...) {
+                    cudaGraph_t abandoned=nullptr;
+                    (void)cudaStreamEndCapture(replay,&abandoned);
+                    if(abandoned)cudaGraphDestroy(abandoned);
+                    throw;
+                }
+                cuda_check(cudaStreamEndCapture(replay,&graph),"draft bulk prefill capture end");
+                const auto instantiated=cudaGraphInstantiate(&g.exec,graph,0);
+                cudaGraphDestroy(graph);
+                cuda_check(instantiated,"draft bulk prefill graph instantiate");
+            }
+            for(int chunk=0;chunk<whole;++chunk) {
+                cuda_check(cudaGraphLaunch(g.exec,replay),"draft bulk prefill graph launch");
+                advance_ring(kChunk);
+            }
+            if(side) {
+                cuda_check(cudaEventRecord(side->join,replay),"draft bulk prefill join");
+                cuda_check(cudaStreamWaitEvent(stream,side->join,0),"draft bulk prefill join");
+            }
+            first=whole*kChunk;
+        }
+        for(;first<rows;first+=kChunk) {
+            const int count=std::min(kChunk,rows-first);
+            const int pos=static_cast<int>(abs_pos0+first);
+            const bool batched=count>8;
+            const std::uint16_t* ptrs[kLayers];
+            for(int t=0;t<kLayers;++t)ptrs[t]=taps[t]+static_cast<std::size_t>(first)*kHidden;
+            cuda_check(exl3_h2d_async(b.tap_ptr,ptrs,sizeof(ptrs),stream),
+                "draft bulk prefill tap pointers");
+            dflash_tap_concat_kernel<<<(count*kLayers*kHidden+255)/256,256,0,stream>>>(b.tap_ptr,b.tcat,count);
+            cuda_check(cudaGetLastError(),"draft bulk prefill concat");
+            if(batched)b.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,count,stream);
+            else if(count>1)m.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,count,stream,admission);
+            else m.ws_fc->forward(m.fc,m.fc_meta,b.tcat,b.fc_raw,1,stream);
+            dflash_rms_norm_kernel<DFlashFmt::F16><<<count,256,256*sizeof(float),stream>>>(
+                b.fc_raw,m.hidden_norm,b.hctx,count,kHidden);
+            dflash_prefill_positions_kernel<<<1,kChunk,0,stream>>>(b.cpos,count,pos);
+            cuda_check(cudaGetLastError(),"draft bulk prefill hidden norm");
+            for(int layer=0;layer<kLayers;++layer) {
+                const auto& lay=m.layers[layer];
+                auto& kv=batched?*b.ws_kv:*m.ws_kv;
+                kv.forward(lay.k,lay.km,b.hctx,b.kblk,count,stream);
+                kv.forward(lay.v,lay.vm,b.hctx,b.vblk,count,stream);
+                dflash_head_norm_kernel<<<count*kKVHeads,128,128*sizeof(float),stream>>>(
+                    b.kblk,lay.k_norm,b.kblk_n,count*kKVHeads,kHeadDim);
+                dflash_rope_kernel<<<(count*n+255)/256,256,0,stream>>>(b.kblk_n,b.kblk_r,b.cpos,count,kKVHeads,kHeadDim);
+                dflash_prefill_ring_scatter_kernel<<<(count*n+255)/256,256,0,stream>>>(
+                    b.kblk_r,b.vblk,m.ring_k[layer],m.ring_v[layer],count,pos);
+                cuda_check(cudaGetLastError(),"draft bulk prefill ring");
+            }
+            advance_ring(count);
+        }
+        f.encoded_rows+=rows;
+        f.submitted_rows+=rows;
+        f.submitted_cursor+=rows;
+    } catch(...) {
+        f.failed=true;
+        m.host_ring_failed=true;
+        m.host_ring_parent.reset();
+        throw;
+    }
 }
 
 std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_cached_device_seed(
@@ -4669,7 +5757,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     if (use_ring) {
         require(m.ring_count >= 0 && m.ring_count <= kRingKeep,
                 "E5A3 ring length outside bounded capacity");
-        require(m.ring_base_abs>=0 && m.ring_base_abs<=std::numeric_limits<int>::max()-m.ring_count,
+        require(m.ring_base_abs>=-kRingKeep && m.ring_base_abs<=std::numeric_limits<int>::max()-m.ring_count,
                 "E5A3 committed ring position overflow");
         require(static_cast<std::int64_t>(block_pos0) == m.ring_base_abs + m.ring_count,
                 "E5A3 cached block must immediately extend the committed span");
@@ -4722,18 +5810,18 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     }
     if (projection_timing.enabled) {
         for (const char* incompatible : {
-                 "NINFER_DFLASH2_TIMING", "NINFER_DFLASH2_DEBUG_LOGITS",
-                 "NINFER_DFLASH2_REF_FP32", "NINFER_DFLASH2_DIFF_L0_OPROJ",
-                 "NINFER_DFLASH2_DIFF_L0_ATTN", "NINFER_DFLASH2_DIFF_L0_CONV"}) {
+                 "VOIDINFER_DFLASH2_TIMING", "VOIDINFER_DFLASH2_DEBUG_LOGITS",
+                 "VOIDINFER_DFLASH2_REF_FP32", "VOIDINFER_DFLASH2_DIFF_L0_OPROJ",
+                 "VOIDINFER_DFLASH2_DIFF_L0_ATTN", "VOIDINFER_DFLASH2_DIFF_L0_CONV"}) {
             require(std::getenv(incompatible) == nullptr,
-                    std::string("NINFER_DFLASH2_PROJECTION_TIMING is incompatible with ") +
+                    std::string("VOIDINFER_DFLASH2_PROJECTION_TIMING is incompatible with ") +
                         incompatible);
         }
         cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
         cuda_check(cudaStreamIsCapturing(stream, &capture_status),
                    "P2 projection timing capture query");
         require(capture_status == cudaStreamCaptureStatusNone,
-                "NINFER_DFLASH2_PROJECTION_TIMING supports eager propose only");
+                "VOIDINFER_DFLASH2_PROJECTION_TIMING supports eager propose only");
         projection_api_begin = std::chrono::steady_clock::now();
         projection_timing.begin(stream);
     }
@@ -4808,9 +5896,9 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         }
     };
 
-    // E5A3 latency attribution (env-gated NINFER_DFLASH2_TIMING; serializes phases
+    // E5A3 latency attribution (env-gated VOIDINFER_DFLASH2_TIMING; serializes phases
     // when active, so GPU times are exact but the timed run is not a perf baseline).
-    const bool e5a3_timing = (std::getenv("NINFER_DFLASH2_TIMING") != nullptr);
+    const bool e5a3_timing = (std::getenv("VOIDINFER_DFLASH2_TIMING") != nullptr);
     cudaEvent_t ph_a = nullptr, ph_b = nullptr;
     std::vector<std::pair<std::string, float>> ph_ms;
     auto ph_begin = [&]() {
@@ -4842,13 +5930,12 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         for (int t = 0; t < kLayers; ++t) {
             tap_base[t] = layer_taps[t] + static_cast<std::size_t>(ctx_skip) * kHidden;
         }
-        cuda_check(cudaMemcpyAsync(m.s.tap_ptr, tap_base.data(),
-                                   kLayers * sizeof(void*), cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.tap_ptr, tap_base.data(),
+                                   kLayers * sizeof(void*), stream),
                    "E5A2 upload draft tap pointer array");
     }
-    cuda_check(cudaMemcpyAsync(m.s.ids, block_ids.data(),
-                               static_cast<std::size_t>(block_len) * sizeof(std::int64_t),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(m.s.ids, block_ids.data(),
+                               static_cast<std::size_t>(block_len) * sizeof(std::int64_t), stream),
                "E5A2 upload draft block ids");
     if(device_seed) {
         cuda_check(cudaStreamWaitEvent(stream,device_seed->producer_ready,0),
@@ -4870,14 +5957,12 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     for (int i = 0; i < window_rows && !use_ring; ++i) host_pos_ctx[i] = ctx_begin_pos + i;
     for (int i = 0; i < block_len; ++i) host_pos_blk[i] = block_pos0 + i;
     if (!use_ring) {
-        cuda_check(cudaMemcpyAsync(m.s.pos_ctx, host_pos_ctx.data(),
-                                   host_pos_ctx.size() * sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, stream),
+        cuda_check(exl3_h2d_async(m.s.pos_ctx, host_pos_ctx.data(),
+                                   host_pos_ctx.size() * sizeof(std::int32_t), stream),
                    "E5A2 upload draft ctx positions");
     }
-    cuda_check(cudaMemcpyAsync(m.s.pos_blk, host_pos_blk.data(),
-                               host_pos_blk.size() * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream),
+    cuda_check(exl3_h2d_async(m.s.pos_blk, host_pos_blk.data(),
+                               host_pos_blk.size() * sizeof(std::int32_t), stream),
                "E5A2 upload draft block positions");
     ph_end("uploads");
     ph_begin();
@@ -4958,7 +6043,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     std::unique_ptr<DeviceAllocation> nan_alloc;
     unsigned long long* nan_count = nullptr;
     static bool g_traced_once = false;
-    const bool stage_trace = (std::getenv("NINFER_DFLASH2_DEBUG_LOGITS") != nullptr) &&
+    const bool stage_trace = (std::getenv("VOIDINFER_DFLASH2_DEBUG_LOGITS") != nullptr) &&
                              !g_traced_once;
     if (stage_trace) {
         g_traced_once = true;
@@ -4970,8 +6055,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     auto stage_maxabs = [&](const std::string& label, const std::uint16_t* buf, int count, bool is_bf16 = false) {
         if (!stage_trace) return;
         std::vector<std::uint16_t> host(static_cast<std::size_t>(count));
-        cuda_check(cudaMemcpyAsync(host.data(), buf, host.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream), "E5A2 maxabs download");
+        cuda_check(exl3_d2h_async(host.data(), buf, host.size() * sizeof(std::uint16_t), stream), "E5A2 maxabs download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 maxabs sync");
         float maxabs = 0.0f;
         std::size_t over30k = 0, over60k = 0;
@@ -4993,8 +6077,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
             buf, count, nan_count, is_bf16 ? 1 : 0);
         cuda_check(cudaGetLastError(), "E5A2 nan count launch");
         unsigned long long value = 0;
-        cuda_check(cudaMemcpyAsync(&value, nan_count, sizeof(value),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(&value, nan_count, sizeof(value), stream),
                    "E5A2 nan read");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 nan sync");
         if (value > 0) {
@@ -5034,12 +6117,11 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     // FP32 storage with the same EXL3 oracle. Decides FP16-range vs decode bug.
     // No effect on the device path.
     static bool g_ref32_done = false;
-    if (!use_ring && !g_ref32_done && std::getenv("NINFER_DFLASH2_REF_FP32") != nullptr) {
+    if (!use_ring && !g_ref32_done && std::getenv("VOIDINFER_DFLASH2_REF_FP32") != nullptr) {
         g_ref32_done = true;
         auto ref32_grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
-            cuda_check(cudaMemcpyAsync(h.data(), d, n * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(h.data(), d, n * sizeof(std::uint16_t), stream),
                        "E5A2 ref32 download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 ref32 sync");
             return h;
@@ -5062,7 +6144,7 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     static bool g_l0_diff_done = false;
     auto diff_l0_oproj = [&](int m_rows) {
         if (g_l0_diff_done) return;
-        if (std::getenv("NINFER_DFLASH2_DIFF_L0_OPROJ") == nullptr) return;
+        if (std::getenv("VOIDINFER_DFLASH2_DIFF_L0_OPROJ") == nullptr) return;
         g_l0_diff_done = true;
         const int in = kQHeads * kHeadDim;   // 4096
         const int out = kHidden;             // 5120
@@ -5070,13 +6152,11 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
         const auto& md = m.layers[0].om;
         std::vector<std::uint16_t> attn_h((size_t)m_rows * in);
         std::vector<std::uint16_t> oproj_dev((size_t)m_rows * out);
-        cuda_check(cudaMemcpyAsync(attn_h.data(), m.s.attn,
-                                   attn_h.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(attn_h.data(), m.s.attn,
+                                   attn_h.size() * sizeof(std::uint16_t), stream),
                    "E5A2 diff attn download");
-        cuda_check(cudaMemcpyAsync(oproj_dev.data(), m.s.oproj,
-                                   oproj_dev.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(oproj_dev.data(), m.s.oproj,
+                                   oproj_dev.size() * sizeof(std::uint16_t), stream),
                    "E5A2 diff oproj download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 diff sync");
         const auto host_mod = read_host_linear(m.directory, m.header,
@@ -5143,9 +6223,8 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
             if (mm >= m_rows) continue;
             m.ws_o->forward(w, md, m.s.attn, m.s.oproj, mm, stream);
             std::vector<std::uint16_t> dev_mm((size_t)mm * out);
-            cuda_check(cudaMemcpyAsync(dev_mm.data(), m.s.oproj,
-                                       dev_mm.size() * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(dev_mm.data(), m.s.oproj,
+                                       dev_mm.size() * sizeof(std::uint16_t), stream),
                        "E5A2 diff M download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 diff M sync");
             report(("device_M" + std::to_string(mm)).c_str(), mm, dev_mm);
@@ -5160,12 +6239,11 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
     static bool g_l0_attn_done = false;
     auto diff_l0_attention = [&](int q_rows, int ctx_rows) {
         if (g_l0_attn_done) return;
-        if (std::getenv("NINFER_DFLASH2_DIFF_L0_ATTN") == nullptr) return;
+        if (std::getenv("VOIDINFER_DFLASH2_DIFF_L0_ATTN") == nullptr) return;
         g_l0_attn_done = true;
         auto grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
-            cuda_check(cudaMemcpyAsync(h.data(), d, n * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(h.data(), d, n * sizeof(std::uint16_t), stream),
                        "E5A2 attn diff download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 attn diff sync");
             return h;
@@ -5245,12 +6323,11 @@ std::vector<std::int64_t> Exl3Dflash2DraftModel::propose_internal(
                                    const std::uint16_t* out_dev,
                                    const std::string& tag) {
         if (g_l0_conv_count >= 2) return;
-        if (std::getenv("NINFER_DFLASH2_DIFF_L0_CONV") == nullptr) return;
+        if (std::getenv("VOIDINFER_DFLASH2_DIFF_L0_CONV") == nullptr) return;
         ++g_l0_conv_count;
         auto grab = [&](const std::uint16_t* d, std::size_t n) {
             std::vector<std::uint16_t> h(n);
-            cuda_check(cudaMemcpyAsync(h.data(), d, n * sizeof(std::uint16_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(h.data(), d, n * sizeof(std::uint16_t), stream),
                        "E5A2 conv diff download");
             cuda_check(cudaStreamSynchronize(stream), "E5A2 conv diff sync");
             return h;
@@ -5374,19 +6451,23 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             if (m.parallel_ring_attention && dflash_ring_split_selected(private_ring_count))
                 launch_ring_attention_split(m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index],
                     ring_start, private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len,
-                    block_len, scale, m.s.ring_partial_o, m.s.ring_partial_ml, stream);
+                    block_len, scale, m.s.ring_partial_o, m.s.ring_partial_ml, stream, nullptr,
+                    m.s.pos_blk);
             else if (m.parallel_ring_attention && dflash_ring_staged_enabled())
                 dflash_attention_ring_staged_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
-                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale,
+                    m.s.pos_blk);
             else if (m.parallel_ring_attention)
                 dflash_attention_ring_parallel_kernel<<<block_len * kQHeads, kHeadDim, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
-                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale,
+                    m.s.pos_blk);
             else
                 dflash_attention_ring_kernel<<<block_len * kQHeads, 1, 0, stream>>>(
                     m.s.qr, m.ring_k[layer_index], m.ring_v[layer_index], ring_start,
-                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale);
+                    private_ring_count, m.s.kblk_r, m.s.vblk, m.s.attn, block_len, block_len, scale,
+                    m.s.pos_blk);
             cuda_check(cudaGetLastError(), "launch ring attention");
             if (m.ring_attention_observer) {
                 RingAttentionObservation observation{m.s.qr, m.ring_k[layer_index],
@@ -5561,12 +6642,11 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     // E5A2 diagnostic (env-gated, no effect on gates): report per-row head-logit
     // finiteness/spread so a dead/zero or NaN draft path is distinguishable from a
     // live-but-degenerate one. Not part of the forced-rejection contract.
-    if (std::getenv("NINFER_DFLASH2_DEBUG_LOGITS") != nullptr) {
+    if (std::getenv("VOIDINFER_DFLASH2_DEBUG_LOGITS") != nullptr) {
         std::vector<std::uint16_t> raw_logits(
             static_cast<std::size_t>(proposal_rows) * kVocab);
-        cuda_check(cudaMemcpyAsync(raw_logits.data(), m.s.head_out,
-                                   raw_logits.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(raw_logits.data(), m.s.head_out,
+                                   raw_logits.size() * sizeof(std::uint16_t), stream),
                    "E5A2 debug logits download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 debug logits sync");
         for (int r = 0; r < proposal_rows; ++r) {
@@ -5606,8 +6686,9 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
                 m.s.head_out,count,m.s.liveness_flag,head_columns,kVocab);
             cuda_check(cudaGetLastError(),"E5A2 fast liveness launch");
         }
-        cuda_check(cudaMemcpyAsync(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),
-                                   cudaMemcpyDeviceToHost,stream),
+        if (!fused_liveness)
+            cuda_check(voidinfer::cuda_poll_stream(stream),"E5A2 fast liveness poll");
+        cuda_check(exl3_d2h_async(&fused_bad,m.s.liveness_flag,sizeof(fused_bad),stream),
                    "E5A2 fast liveness read");
         if (!fused_liveness)
             cuda_check(cudaStreamSynchronize(stream),"E5A2 fast liveness sync");
@@ -5618,9 +6699,8 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     } else {
         std::vector<std::uint16_t> logits_h(
             static_cast<std::size_t>(proposal_rows) * kVocab);
-        cuda_check(cudaMemcpyAsync(logits_h.data(), m.s.head_out,
-                                   logits_h.size() * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream),
+        cuda_check(exl3_d2h_async(logits_h.data(), m.s.head_out,
+                                   logits_h.size() * sizeof(std::uint16_t), stream),
                    "E5A2 draft logits guard download");
         cuda_check(cudaStreamSynchronize(stream), "E5A2 draft logits guard sync");
         std::size_t bad = 0;
@@ -5641,29 +6721,42 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     std::int64_t anchor = block_ids[0];
     require(anchor >= 0 && anchor < kVocab, "E5A2 draft anchor outside vocabulary");
     if (fused_selector) {
+        // Sampled requests draft with the target's coupled draw (same noise,
+        // truncation and presence penalty), as the batched path does: the
+        // proposals are the tokens the verifier most likely selects.
+        const DraftSelectSampling* select_sampling = nullptr;
+        if (m.sampling.sampled()) {
+            DraftSelectSampling value{};
+            value.inv_temperature=1.0f/m.sampling.temperature;value.top_p=m.sampling.top_p;
+            value.min_p=m.sampling.min_p;value.top_k=m.sampling.top_k;value.seed=m.sampling.seed;
+            value.key_base=block_pos0+1;
+            value.presence_penalty=m.sampling.presence_penalty;
+            value.first_occurrence=m.sampling.first_occurrence;
+            cuda_check(exl3_h2d_async(m.s.select_sampling,&value,sizeof(value),stream),
+                       "E5A2 upload draft selection sampling");
+            select_sampling = m.s.select_sampling;
+        }
         dflash_selector_fused_chain_kernel<<<1, kSelectorFusedThreads, 0, stream>>>(
             proposal_rows, anchor, device_seed ? m.s.ids : nullptr,
             m.s.cand_ids, m.s.hidden_proj_out, m.pred_cb, m.succ_cb,
-            m.s.cand_unary, m.s.proposal_out);
+            m.s.cand_unary, m.s.proposal_out, select_sampling);
         cuda_check(cudaGetLastError(), "E5A2 launch fused draft selector");
         ++m.fused_selector_calls;
-        cuda_check(cudaMemcpyAsync(result.data(), m.s.proposal_out,
+        cuda_check(voidinfer::cuda_poll_stream(stream), "E5A2 fused draft proposals poll");
+        cuda_check(exl3_d2h_async(result.data(), m.s.proposal_out,
                                    static_cast<std::size_t>(proposal_rows) *
-                                       sizeof(std::int64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+                                       sizeof(std::int64_t), stream),
                    "E5A2 read fused draft proposals");
         const auto candidates =
             m.proposal_candidates ? static_cast<std::size_t>(proposal_rows) * kTopK : 0;
         m.last_candidate_ids.resize(candidates);
         m.last_candidate_unary.resize(candidates);
         if (candidates) {
-            cuda_check(cudaMemcpyAsync(m.last_candidate_ids.data(), m.s.cand_ids,
-                                       candidates * sizeof(std::int64_t),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(m.last_candidate_ids.data(), m.s.cand_ids,
+                                       candidates * sizeof(std::int64_t), stream),
                        "E5A2 read fused draft candidate IDs");
-            cuda_check(cudaMemcpyAsync(m.last_candidate_unary.data(), m.s.cand_unary,
-                                       candidates * sizeof(float),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(m.last_candidate_unary.data(), m.s.cand_unary,
+                                       candidates * sizeof(float), stream),
                        "E5A2 read fused draft candidate scores");
         }
         timing_close(Impl::TimingCategory::Selector,
@@ -5688,17 +6781,15 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
         cuda_check(cudaGetLastError(),
                    "E5A2 launch batched draft selector anchor chain");
         ++m.selector_batched_anchor_chain_calls;
-        cuda_check(cudaMemcpyAsync(result.data(), m.s.proposal_out,
+        cuda_check(exl3_d2h_async(result.data(), m.s.proposal_out,
                                    static_cast<std::size_t>(proposal_rows) *
-                                       sizeof(std::int64_t),
-                                   cudaMemcpyDeviceToHost, stream),
+                                       sizeof(std::int64_t), stream),
                    "E5A2 read batched draft proposals");
         if (m.position_confidence)
-            cuda_check(cudaMemcpyAsync(m.last_position_confidence.data(),
+            cuda_check(exl3_d2h_async(m.last_position_confidence.data(),
                                        m.s.confidence_out,
                                        static_cast<std::size_t>(proposal_rows) *
-                                           sizeof(DraftPositionConfidence),
-                                       cudaMemcpyDeviceToHost, stream),
+                                           sizeof(DraftPositionConfidence), stream),
                        "E5A2 read batched draft position confidence");
         timing_close(Impl::TimingCategory::Selector,
                      "selector_batched_final_sync");
@@ -5726,14 +6817,12 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
             }
             cuda_check(cudaGetLastError(), "E5A2 launch draft selector argmax");
             std::int64_t selected = 0;
-            cuda_check(cudaMemcpyAsync(&selected, m.s.proposal_out + p, sizeof(selected),
-                                       cudaMemcpyDeviceToHost, stream),
+            cuda_check(exl3_d2h_async(&selected, m.s.proposal_out + p, sizeof(selected), stream),
                        "E5A2 read draft proposal");
             if (m.position_confidence)
-                cuda_check(cudaMemcpyAsync(
+                cuda_check(exl3_d2h_async(
                                &m.last_position_confidence[static_cast<std::size_t>(p)],
-                               m.s.confidence_out + p, sizeof(DraftPositionConfidence),
-                               cudaMemcpyDeviceToHost, stream),
+                               m.s.confidence_out + p, sizeof(DraftPositionConfidence), stream),
                            "E5A2 read draft position confidence");
             if (p + 1 == proposal_rows)
                 timing_close(Impl::TimingCategory::Selector, "selector_serial_final_sync");
@@ -5746,8 +6835,7 @@ for (int layer_index = 0; layer_index < kLayers; ++layer_index) {
     }
     if(device_seed) {
         std::int64_t invalid=1;
-        cuda_check(cudaMemcpyAsync(&invalid,m.s.proposal_out+7,sizeof(invalid),
-            cudaMemcpyDeviceToHost,stream),"E5A3 read device seed validity");
+        cuda_check(exl3_d2h_async(&invalid,m.s.proposal_out+7,sizeof(invalid),stream),"E5A3 read device seed validity");
         cuda_check(cudaStreamSynchronize(stream),"E5A3 synchronize device seed validity");
         require(!invalid,"E5A3 authoritative device seed invalid/nonfinite");
         require(m.ring_revision==seed_ring_revision &&
@@ -6023,4 +7111,4 @@ const std::uint16_t* Exl3Dflash2TapHistory::latest_row_device(
         static_cast<std::size_t>(impl_->stored - 1) * kHidden;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

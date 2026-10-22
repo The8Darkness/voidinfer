@@ -2,7 +2,7 @@
 
 #include "product/media_acquire/source.h"
 
-#include <ninfer/types.h>
+#include <voidinfer/types.h>
 
 // Internal, wire-format-independent representation of a generation request.
 //
@@ -20,7 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 // A structured API error mapped onto an error object + HTTP status. Wire-format
 // independent: each protocol layer renders it into its own error body shape.
@@ -45,7 +45,7 @@ private:
 
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
-    int default_max_tokens = 8192;
+    int default_max_tokens = 262144;
 };
 
 struct CompletionUsage {
@@ -65,7 +65,7 @@ struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
     std::string type_raw; // original OpenAI "type" string (diagnostics / future use)
-    ninfer::product::media_acquire::Source source;
+    voidinfer::product::media_acquire::Source source;
 };
 
 struct ToolDefinition {
@@ -209,4 +209,4 @@ struct GenerationRequest {
     }
 };
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

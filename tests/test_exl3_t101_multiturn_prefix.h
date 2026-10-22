@@ -3,9 +3,9 @@
 void run_t101_multiturn_prefix(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose, const std::filesystem::path& output) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t initial_rows=3136,tail_rows=128;
     constexpr int response_rows=8;
     require(target.max_context()>=3600 && code.size()>=3800 && prose.size()>=3800,
@@ -13,8 +13,8 @@ void run_t101_multiturn_prefix(
     require(!output.empty() && !std::filesystem::exists(output),
         "T101 output must be new");
     std::filesystem::create_directories(output);
-    const std::uint64_t reserve=std::stoull(env("NINFER_T101_RESERVE_GIB"))*(1ULL<<30);
-    const std::uint64_t budget=std::stoull(env("NINFER_T101_CACHE_MIB"))*(1ULL<<20);
+    const std::uint64_t reserve=std::stoull(env("VOIDINFER_T101_RESERVE_GIB"))*(1ULL<<30);
+    const std::uint64_t budget=std::stoull(env("VOIDINFER_T101_CACHE_MIB"))*(1ULL<<20);
     require(reserve>=(4ULL<<30) && budget>=(512ULL<<20),"T101 memory policy extent");
     MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
     require(GlobalMemoryStatusEx(&memory)!=0 && memory.ullAvailPhys>reserve,
@@ -24,20 +24,20 @@ void run_t101_multiturn_prefix(
         require(GlobalMemoryStatusEx(&state)!=0,"T101 physical memory query");
         return state.ullAvailPhys;
     };
-    Identity identity{env("NINFER_T101_NAMESPACE"),env("NINFER_T101_ARTIFACT_ID"),
-        env("NINFER_T101_TOKENIZER_ID"),env("NINFER_T101_CONFIGURATION_ID"),
-        env("NINFER_T101_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    Identity identity{env("VOIDINFER_T101_NAMESPACE"),env("VOIDINFER_T101_ARTIFACT_ID"),
+        env("VOIDINFER_T101_TOKENIZER_ID"),env("VOIDINFER_T101_CONFIGURATION_ID"),
+        env("VOIDINFER_T101_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     Cache cache(Cache::Policy{1,64,budget,reserve},identity);
-    ninfer::exl3::Exl3HostResidentSet residency(memory.ullTotalPhys-reserve,reserve);
+    voidinfer::exl3::Exl3HostResidentSet residency(memory.ullTotalPhys-reserve,reserve);
     auto cached_context=target.create_context(true);cached_context->prepare_continuation(8);
     auto fresh_context=target.create_context(true);fresh_context->prepare_continuation(8);
 
-    struct Pin {ninfer::exl3::Exl3HostResidentSet::Stats update;Exl3HostResidency observed;};
+    struct Pin {voidinfer::exl3::Exl3HostResidentSet::Stats update;Exl3HostResidency observed;};
     const auto pin=[&](std::shared_ptr<const Request> active={}) {
         auto roots=cache.roots();if(active) roots.push_back(std::move(active));
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for(const auto& root:roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,[&](const void* p,std::size_t n){snapshot.add(p,n);},false);
         auto update=residency.replace(std::move(snapshot));Exl3HostResidencyProbe probe;

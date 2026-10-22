@@ -1,68 +1,86 @@
 # Architecture
 
-VoidInfer separates model semantics, resource ownership, execution, and serving. The separation is
-important because a fast harness route is not automatically a supported HTTP route.
+VoidInfer is one engine: the EXL3 coherent-device lane engine behind the public `Engine` facade.
+The CLI, the HTTP server and the benchmark harness all drive it; research tools under
+`tests/research_exl3_*` drive the text model directly.
 
 ```mermaid
 flowchart LR
-  A[CLI or HTTP request] --> B[Frontend and prompt preparation]
-  B --> C[Engine admission and resource manager]
-  C --> D[Model artifact / EXL3 weights]
-  D --> E[Prefill]
-  E --> F[Decode transaction]
-  F --> G[Draft proposal]
-  G --> H[Exact target verification]
-  H -->|accept| I[Publish token and state]
-  H -->|reject| J[Rollback KV and recurrent state]
-  J --> F
-  I --> K[Response / stream]
+  A[CLI or HTTP request] --> B[Qwen frontend: template, media, M-RoPE]
+  B --> C[Engine admission: FIFO, VRAM-aware lanes]
+  C --> D[Prefill: layer-major, exact history ingestion]
+  D --> E[DFlash2 round over all decode-ready lanes]
+  E --> F[Target verifies 8 rows per lane on L0 history]
+  F --> G[VeriCache: exact FP16-history check]
+  G -->|verified| H[Publish tokens, advance exact root]
+  G -->|mismatch| I[Exact argmax, rewind draft to root]
+  I --> E
+  H --> J[Response / stream]
 ```
 
-## Retained execution paths
+## Request path
 
-1. The public `.ninfer` CLI/server loads an artifact, admits requests, owns contexts, and exposes
-   HTTP schemas and streaming. It includes historical NVFP4/OSCAR/VeriCache development.
-2. The explicit EXL3 Engine path loads target and optional draft weight directories and supports a
-   narrow qualified greedy-text slice. Host-backed exact state and lifecycle rules are part of this
-   path.
-3. The native same-weight FP16 device-KV DFlash2 test harness is an evidence-producing research
-   route. It owns frozen fixtures, exact target/state/tap/ring comparisons, and grouped wall timing.
-4. Target-only and numerical/cache experiments are separate opt-in routes. A passing local gate is
-   not sufficient for default promotion.
+1. **Frontend** (`src/targets/qwen3_6`): chat template rendering, tool and reasoning semantics,
+   media decode/resize/BF16 packing and three-axis M-RoPE prompt positions. The output session
+   splits reasoning, content and tool calls.
+2. **Admission** (`src/exl3/exl3_engine_core.cpp`): bounded FIFO, one to eight lanes. A lane is
+   admitted only when its L0 history codes fit in free VRAM, so long agents never oversubscribe the
+   device under WDDM.
+3. **Prefill**: layer-major prompt ingestion with fused EXL3 weight decode, FA2-style GQA attention
+   and a chunk-parallel Gated-DeltaNet recurrence. Prompts under 2,048 rows use the row-wise path.
+   Prompt history is attended exactly (FP16 history).
+4. **Decode**: every round batches the decode-ready lanes. The 5-layer DFlash2 draft proposes seven
+   tokens per lane; one target pass verifies a verification tree (main chain plus sibling leaves,
+   8 rows) per lane. Rejected rows roll back exactly (device KV transactions with checkpoint graphs,
+   retained-prefix GDN repair).
+5. **VeriCache**: drafted tokens are published only after an exact pass rescored them against FP16
+   history streamed from host memory. The pass runs asynchronously on the exact line (a second
+   context on the lane's planes with its own GDN state and stream) while the lane keeps drafting: for
+   every request with one lane, for sampled requests with several lanes (greedy ones from 12K tokens
+   at two lanes). One line serves all lanes (`Exl3ExactLinePool`): each lane parks the line's GDN
+   root in its own host slots and a lane taking the line restores its root and window rows. Other
+   requests verify in exclusive passes.
+6. **Publication and reuse**: the verified prefix becomes the next exact root (device GDN checkpoint
+   plus L0 rewind). A finished conversation's root keeps its plane set; a follow-up turn resumes by
+   remapping that set behind the lane's window. Media prompts neither reuse nor publish roots.
 
-## State and ownership
+## KV tiers
 
-The target is authoritative. Speculative work occurs inside a transaction: proposal state is
-provisional, exact verification decides the accepted prefix, and rejection restores KV and GDN
-recurrent state. Resource records prevent contexts, roots, or host extents from outliving their
-owners. Cold and reused arms intentionally have different context-construction lifetimes, while
-both retire intermediate roots and include final teardown in the recorded workload wall.
+| Tier | Where | Contents |
+|---|---|---|
+| Exact window | device | 64-token sink, 960-token recent window, 1,024-row prefill chunk, ring |
+| Hot rows | device | 512 rows per KV head as exact FP16 copies, refreshed from the code pass's nominations |
+| L0 | device | calibrated-rotation INT4 (or `VOIDINFER_EXL3_L0_CODE_BITS=2`: INT2) history codes (`<target>/l0_oscar` rotations) |
+| L2 | pinned host memory | exact FP16 planes per conversation (plane sets in growable CUDA VMM regions); packed when idle, spilled to disk under pressure |
+
+The lane's window virtual address aliases the chunks of the plane set it serves
+(`Exl3GrowableDeviceRegion::attach_window`), which is why resuming an agent is a remap, not a copy.
+
+## Profile
+
+The Engine applies its benchmarked kernel and route profile at core construction
+(`src/exl3/engine_profile.cpp`): every listed `VOIDINFER_*` switch that the process has not set is
+set to its profile value, and the startup check rejects values that leave the qualified route.
+`VOIDINFER_*` variables therefore act as overrides for experiments, not as required configuration.
+Strict opt-in switches share one parser (`src/exl3/environment_options.h`): absent and `0` disable,
+`1` enables, anything else is an error.
 
 ## Source map
 
 | Area | Primary locations |
 | --- | --- |
-| Public API and lifecycle | `include/ninfer/engine.h`, `src/runtime/engine/` |
+| Public API and lifecycle | `include/voidinfer/engine.h`, `include/voidinfer/types.h`, `src/runtime/engine/` |
 | CLI and server | `apps/cli/`, `apps/serve/`, `src/serve/` |
-| Artifact loading | `src/artifact/`, `src/targets/` |
-| EXL3 model/runtime | `src/exl3/` |
-| Strict EXL3 setup controls | `src/exl3/environment_options.h`; callers in `full_attention_layer.cu`, `linear_cuda.cu`, `exl3_engine_core.cpp` |
-| CUDA operations | `src/ops/`, `include/ninfer/ops/` |
-| KV, recurrent, and host state | `src/core/`, `src/targets/qwen3_6/impl/runtime/` |
-| Exact DFlash2 authority | `tests/test_exl3_dflash2_accept.cpp`, `tests/test_exl3_real_dflash_execution.h` |
+| Engine core, lanes, admission | `src/exl3/exl3_engine_core.*`, `src/exl3/vericache_serving_*` |
+| Text model, attention, GDN, L0 OSCAR | `src/exl3/text_model.*`, `full_attention_layer.*`, `gdn_layer.*`, `l0_oscar.cuh` |
+| EXL3 weights and linears | `src/exl3/safetensors.*`, `linear_cuda.*`, `src/exl3/mia_exllamav3/` |
+| DFlash2 draft | `src/exl3/dflash2_*` |
+| VeriCache | `src/exl3/vericache_*`, `fast_device_round.h` |
+| Vision tower | `src/exl3/vision_dense.*`, `src/ops/` |
+| Frontend | `src/targets/qwen3_6/`, `src/media/`, `src/product/` |
+| Engine profile | `src/exl3/engine_profile.*` |
+| Exact DFlash2 oracle | `tests/test_exl3_dflash2_accept.cpp` |
 | Serving contracts | `src/serve/`, `tests/test_*schema*`, `tests/test_*http*` |
 
-Strict opt-in setup controls share a small host parser: absent and `0` disable,
-`1` enables, and other strings (including empty) raise the caller's existing
-diagnostic. Callers retain ownership/dependency checks and the time at which the
-environment is read. Presence-only controls, permissive legacy controls and
-default-on options retain their separate contracts; this is not a feature registry.
-
-Qualification fixtures use `tests/scoped_environment.h` to restore selected
-Windows process-local variables on normal exit or exception. Each fixture still
-owns its option list, numerical oracle and dispatch/state assertions. The shared
-header is included at file scope in the DFlash2 harness, before the anonymous
-namespace containing its fixture headers.
-
-The principal tradeoff is explicit specialization: Blackwell- and model-specific code can reduce
-overhead and expose ownership precisely, but it increases qualification cost and limits portability.
+The principal tradeoff is explicit specialization: one model on one GPU class lets the kernels and
+state ownership be exact and fast, at the price of portability.

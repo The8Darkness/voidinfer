@@ -8,7 +8,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // One retained same-stream prefill projection chain. The body must enqueue the
 // identical selected kernels on the supplied stream; it must not allocate,
@@ -54,4 +54,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

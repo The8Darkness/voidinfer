@@ -8,7 +8,7 @@
 #include <iostream>
 #include <mma.h>
 #include <vector>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void ck(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 static void require(bool x,const char* s){if(!x)throw std::runtime_error(s);}
 template<class T> struct Buffer {

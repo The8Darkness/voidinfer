@@ -5,7 +5,7 @@
 #include <thread>
 
 struct T88RequestTrace {
-    std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> root;
+    std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> root;
     std::vector<std::int64_t> published;
     std::vector<double> releases_ms;
     double queue_wait_ms=0,restore_ms=0,p95_interval_ms=0;
@@ -30,9 +30,9 @@ double t88_p95(std::vector<double> values) {
 void run_t88_unequal_tail_fairness(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,const std::filesystem::path& output) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t kPrefix=3840;
     constexpr int kWarmups=1,kMeasured=4;
     constexpr std::array<int,8> tails{32,64,96,128,160,192,224,256};
@@ -41,8 +41,8 @@ void run_t88_unequal_tail_fairness(
             "T88 serving fixture extent");
     require(!output.empty()&&!std::filesystem::exists(output),"T88 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib=std::stoull(env("NINFER_T88_RESERVE_GIB"));
-    const auto cache_mib=std::stoull(env("NINFER_T88_CACHE_MIB"));
+    const auto reserve_gib=std::stoull(env("VOIDINFER_T88_RESERVE_GIB"));
+    const auto cache_mib=std::stoull(env("VOIDINFER_T88_CACHE_MIB"));
     require(reserve_gib>=8&&cache_mib>=1024,"T88 memory policy extent");
     const std::uint64_t reserve=reserve_gib*(1ULL<<30);
     MEMORYSTATUSEX memory{};memory.dwLength=sizeof(memory);
@@ -53,13 +53,13 @@ void run_t88_unequal_tail_fairness(
         require(GlobalMemoryStatusEx(&value)!=0,"T88 physical memory query");
         return value.ullAvailPhys;
     };
-    const Identity identity{env("NINFER_T88_NAMESPACE"),env("NINFER_T88_ARTIFACT_ID"),
-        env("NINFER_T88_TOKENIZER_ID"),env("NINFER_T88_CONFIGURATION_ID"),
-        env("NINFER_T88_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    const Identity identity{env("VOIDINFER_T88_NAMESPACE"),env("VOIDINFER_T88_ARTIFACT_ID"),
+        env("VOIDINFER_T88_TOKENIZER_ID"),env("VOIDINFER_T88_CONFIGURATION_ID"),
+        env("VOIDINFER_T88_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     Cache cache(Cache::Policy{16,64,cache_mib*(1ULL<<20),reserve},identity);
-    ninfer::exl3::Exl3HostResidentSet residency(memory.ullTotalPhys-reserve,reserve);
+    voidinfer::exl3::Exl3HostResidentSet residency(memory.ullTotalPhys-reserve,reserve);
     auto context_a=target.create_context(true),context_b=target.create_context(true);
     context_a->prepare_continuation(8);context_b->prepare_continuation(8);
     Exl3TextContext* contexts[2]{context_a.get(),context_b.get()};
@@ -83,10 +83,10 @@ void run_t88_unequal_tail_fairness(
         require(prompts[request].size()==kPrefix+static_cast<std::size_t>(rows),
                 "T88 prompt extent");
     }
-    struct PinResult {ninfer::exl3::Exl3HostResidentSet::Stats update;Exl3HostResidency observed;};
+    struct PinResult {voidinfer::exl3::Exl3HostResidentSet::Stats update;Exl3HostResidency observed;};
     const auto pin=[&](const std::array<std::shared_ptr<const Request>,8>& active,bool observe) {
         auto roots=cache.roots();for(const auto& root:active)if(root)roots.push_back(root);
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for(const auto& root:roots)snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,[&](const void* data,std::size_t bytes){
             snapshot.add(data,bytes);},false);
@@ -284,7 +284,7 @@ void run_t88_unequal_tail_fairness(
     std::array<std::int64_t,2> pending{sample_target(*contexts[0],streams[0].value),
         sample_target(*contexts[1],streams[1].value)};
     std::array<std::shared_ptr<const Request>,2> updated;
-    std::array<ninfer::exl3::Exl3OuterReferenceResult,2> verified;
+    std::array<voidinfer::exl3::Exl3OuterReferenceResult,2> verified;
     std::array<std::exception_ptr,2> errors;std::thread cancellation_workers[2];
     for(int physical=0;physical<2;++physical)cancellation_workers[physical]=std::thread([&,physical]{
         try{const std::array<std::int64_t,1> token{pending[physical]};auto result=initial[physical]->verify(

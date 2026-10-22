@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
@@ -271,4 +271,4 @@ void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
-} // namespace ninfer
+} // namespace voidinfer

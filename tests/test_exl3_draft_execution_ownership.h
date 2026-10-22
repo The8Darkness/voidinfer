@@ -3,10 +3,10 @@
 void run_draft_execution_ownership(Exl3TextModel& target,
     std::unique_ptr<Exl3Dflash2DraftModel>& source,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose){
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     using Lane=Exl3Dflash2Execution;using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
     using Clock=std::chrono::steady_clock;
-    const auto retirement_mode=env("NINFER_TEST_DRAFT_LINEAR_RETIREMENT");
+    const auto retirement_mode=env("VOIDINFER_TEST_DRAFT_LINEAR_RETIREMENT");
     if(!retirement_mode.empty() && retirement_mode!="0") {
         require(retirement_mode=="1" || retirement_mode=="partial","draft retirement selector");
         // Terminal fixture: quarantine deliberately survives until process exit.
@@ -39,7 +39,7 @@ void run_draft_execution_ownership(Exl3TextModel& target,
         std::cout<<"DRAFT_LINEAR_RETIREMENT_COMPLETE numerical_coverage=0\n";
         return;
     }
-    const std::filesystem::path output=env("NINFER_REAL_DFLASH_OUT");
+    const std::filesystem::path output=env("VOIDINFER_REAL_DFLASH_OUT");
     require(!output.empty()&&!std::filesystem::exists(output),"draft ownership receipt");std::filesystem::create_directories(output);
     std::ofstream checks(output/"checks.csv");checks<<"case,pass\n";
     auto gate=[&](const char* name,bool pass){checks<<name<<','<<pass<<'\n';checks.flush();require(pass,std::string("draft execution ownership ")+name);};
@@ -48,9 +48,9 @@ void run_draft_execution_ownership(Exl3TextModel& target,
     const auto loaded_private_requirement=source->execution_bytes_required();
     gate("loaded_private_plan_matches_construction",loaded_private_requirement!=0 &&
         loaded_private_requirement==source->execution_bytes());
-    const bool simultaneous=env("NINFER_DRAFT_OWNERSHIP_STREAMS")=="1";
-    const bool device_prefix=env("NINFER_EXL3_HOST_KV_DEVICE_PREFIX")=="1";
-    if(device_prefix)_putenv_s("NINFER_EXL3_HOST_KV_DEVICE_PREFIX","0");
+    const bool simultaneous=env("VOIDINFER_DRAFT_OWNERSHIP_STREAMS")=="1";
+    const bool device_prefix=env("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX")=="1";
+    if(device_prefix)_putenv_s("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX","0");
     struct Stream {cudaStream_t value=nullptr;~Stream(){if(value)cudaStreamDestroy(value);}};
     std::array<Stream,2> streams;
     if(simultaneous)for(auto& stream:streams)cuda_check(cudaStreamCreateWithFlags(&stream.value,cudaStreamNonBlocking),"private draft/L2 stream");
@@ -64,13 +64,13 @@ void run_draft_execution_ownership(Exl3TextModel& target,
         for(int j=0;j<outputs;++j){auto token=sample_target(*context);ref[i].tokens.push_back(token);context->decode(token);auto taps=context->exact_tap_rows_host();for(int t=0;t<5;++t)ref[i].taps[t].insert(ref[i].taps[t].end(),taps[t].begin(),taps[t].end());}
         ref[i].final=context->export_exact_host_state();
     }
-    if(device_prefix)_putenv_s("NINFER_EXL3_HOST_KV_DEVICE_PREFIX","1");
+    if(device_prefix)_putenv_s("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX","1");
     gate("private_plan_survives_reference_ring_work",
         source->execution_bytes_required()==loaded_private_requirement &&
         source->execution_bytes()==loaded_private_requirement);
     Exl3VeriCacheServingIdentity identity{"solo-physical-draft-ownership","SC_6.00bpw_H6_V6","pinned-token-ids","exact-B8-greedy","text"};
     Exl3VeriCacheServingPrefixCache cache({2,64,2ULL<<30,8ULL<<30},identity);
-    const bool reserved_clone=env("NINFER_TEST_DRAFT_RESERVED_CLONE")=="1";
+    const bool reserved_clone=env("VOIDINFER_TEST_DRAFT_RESERVED_CLONE")=="1";
     if(reserved_clone) {
         using Inventory=Exl3ResourceInventory;
         Exl3VeriCacheServingCoordinator grants(cache,{2,2,memory.ullTotalPhys-(8ULL<<30),8ULL<<30});
@@ -165,12 +165,12 @@ void run_draft_execution_ownership(Exl3TextModel& target,
     std::array<std::unique_ptr<Lane>,2> lanes;
     lanes[0]=std::make_unique<Lane>(target.create_context(true),*source,identity.contract(),streams[0].value);
     lanes[1]=std::make_unique<Lane>(target.create_context(true),*child,identity.contract(),streams[1].value);
-    const auto scope_fault_mode=env("NINFER_TEST_DRAFT_CALLBACK_SCOPE");
+    const auto scope_fault_mode=env("VOIDINFER_TEST_DRAFT_CALLBACK_SCOPE");
     require(scope_fault_mode.empty() || scope_fault_mode=="0" || scope_fault_mode=="1" || scope_fault_mode=="same_scope",
         "unknown draft callback scope fixture");
     const bool same_scope_fault=scope_fault_mode=="same_scope";
     const bool scope_fault=scope_fault_mode=="1" || same_scope_fault;
-    const auto fault_family_name=env("NINFER_TEST_DRAFT_CALLBACK_FAMILY");
+    const auto fault_family_name=env("VOIDINFER_TEST_DRAFT_CALLBACK_FAMILY");
     const std::array<std::pair<const char*,Exl3TargetSharedFamily>,7> fault_families{{
         {"q",Exl3TargetSharedFamily::draft_q},{"k",Exl3TargetSharedFamily::draft_k},
         {"v",Exl3TargetSharedFamily::draft_v},{"o",Exl3TargetSharedFamily::draft_o},
@@ -180,7 +180,7 @@ void run_draft_execution_ownership(Exl3TextModel& target,
     bool family_found=fault_family_name.empty();
     for(const auto& [name,family]:fault_families)if(fault_family_name==name){fault_family=family;family_found=true;}
     require(family_found && (scope_fault || fault_family_name.empty()),"draft callback family requires valid scope fixture");
-    const auto fault_layer_text=env("NINFER_TEST_DRAFT_CALLBACK_LAYER");
+    const auto fault_layer_text=env("VOIDINFER_TEST_DRAFT_CALLBACK_LAYER");
     require(fault_layer_text.empty() || (scope_fault && fault_layer_text.size()==1 &&
         fault_layer_text[0]>='0' && fault_layer_text[0]<='4'),"draft callback layer requires0..4 and scope fixture");
     const int fault_layer=fault_layer_text.empty()?0:fault_layer_text[0]-'0';
@@ -502,7 +502,7 @@ void run_draft_execution_ownership(Exl3TextModel& target,
     std::array<std::array<std::vector<std::uint16_t>,5>,2> taps;
     std::array<std::uint64_t,2> verified{},replayed{},calls{};
     std::array<Exl3VeriCacheServingCoordinator::Lease,2> published_leases{lanes[0]->lease(),lanes[1]->lease()};
-    const bool profile=env("NINFER_DRAFT_OWNERSHIP_PROFILE")=="1";
+    const bool profile=env("VOIDINFER_DRAFT_OWNERSHIP_PROFILE")=="1";
     if(profile)cuda_check(cudaProfilerStart(),"begin C2 diagnostic trace");
     start=Clock::now();
     auto round=[&](int i){
@@ -555,7 +555,7 @@ void run_draft_execution_ownership(Exl3TextModel& target,
     const auto exports0=lanes[0]->context().recurrent_export_stats(),exports1=lanes[1]->context().recurrent_export_stats();
     nlohmann::ordered_json history=nlohmann::ordered_json::array();
     if(device_prefix)for(int i=0;i<2;++i){const auto h=lanes[i]->context().host_kv_stats();
-        if(env("NINFER_EXL3_SEGMENTED_DEVICE_PREFIX")=="1")
+        if(env("VOIDINFER_EXL3_SEGMENTED_DEVICE_PREFIX")=="1")
             gate("segmented_prefix_read_without_staging",h.device_prefix_segmented_bytes>0 &&
                 h.device_prefix_segmented_bytes<=h.device_prefix_hit_bytes);
         gate("device_prefix_actual_hit_no_fallback",h.device_prefix_bytes==256ULL*1024*1024&&h.device_prefix_hit_bytes>0&&h.device_prefix_fallbacks==0);

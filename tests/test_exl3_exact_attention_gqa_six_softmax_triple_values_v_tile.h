@@ -97,7 +97,7 @@ void run_exact_attention_gqa_six_softmax_triple_values_v_tile_operator() {
                            bool two_query=false,bool warp_broadcast=false,
                            bool scalar_single_load=false,
                            bool key_pair_pipeline=false) {
-            ninfer::exl3::exl3_exact_attention_for_test(
+            voidinfer::exl3::exl3_exact_attention_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),
                 static_cast<const std::uint16_t*>(dk.get()),
                 static_cast<const std::uint16_t*>(dv.get()),
@@ -305,10 +305,10 @@ void run_exact_attention_gqa_six_softmax_triple_values_v_tile_operator() {
         output_values+=output_elements;
         score_values+=score_elements;
     }
-    require(ninfer::exl3::Exl3FullAttentionLayer::
+    require(voidinfer::exl3::Exl3FullAttentionLayer::
                 gqa_six_softmax_triple_v_tile_shared_bytes()==8192,
         "V-tile16 operator shared-memory accounting");
-    require(ninfer::exl3::Exl3FullAttentionLayer::
+    require(voidinfer::exl3::Exl3FullAttentionLayer::
                 gqa_six_softmax_triple_v_tile_shared_bytes(64)==32768,
         "V-tile64 operator shared-memory accounting");
     std::cout<<"EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE_OPERATOR PASS"

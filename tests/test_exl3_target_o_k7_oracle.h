@@ -32,8 +32,8 @@ std::uint16_t target_o_k7_decode_state(const std::uint16_t* packed, int encoded)
 // Planned groups{0,3,4,19,20,39} cover512-column tile boundaries and the tail.
 // Selected-column oracle coverage is separate from full-output M1 parity.
 H6OracleStats target_o_k7_check_oracle_groups(
-    const ninfer::exl3::Exl3CudaLinearWeights& weights,
-    const ninfer::exl3::Exl3CudaLinearMetadata& metadata,
+    const voidinfer::exl3::Exl3CudaLinearWeights& weights,
+    const voidinfer::exl3::Exl3CudaLinearMetadata& metadata,
     const std::vector<std::uint16_t>& input,
     const std::vector<std::uint16_t>& actual_with_guards,
     std::size_t guard,

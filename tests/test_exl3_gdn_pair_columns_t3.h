@@ -3,12 +3,12 @@
 void run_gdn_pair_columns_t3(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose,
     const std::vector<std::int64_t>& structured,const std::vector<std::int64_t>& heldout) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352,"GDN pair-columns T3 context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
@@ -27,14 +27,14 @@ void run_gdn_pair_columns_t3(Exl3TextModel& target,
         require(fixture.second->size()>=prefix,"GDN pair-columns T3 fixture extent");
         const std::vector<std::int64_t> input(
             fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT_PAIR_COLUMNS","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         struct Result {
             double prefill_ms=0;
             std::vector<std::int64_t> tokens;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
         };
         const auto run=[&](Exl3TextContext& context) {
             const auto started=std::chrono::steady_clock::now();

@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace voidinfer::targets::qwen3_6::frontend_internal {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -446,4 +446,4 @@ MediaCacheStats MediaPreprocessCache::stats() const {
     return out;
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace voidinfer::targets::qwen3_6::frontend_internal

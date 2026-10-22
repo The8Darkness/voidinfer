@@ -3,7 +3,7 @@
 #include "exl3/resource_inventory.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3DevicePageStorageProvider {
     cudaError_t (*allocate)(void**,std::size_t) noexcept=
         [](void** pointer,std::size_t bytes) noexcept {return cudaMalloc(pointer,bytes);};

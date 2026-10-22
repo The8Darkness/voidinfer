@@ -6,7 +6,7 @@
 #include <cstdint>
 #include "exl3/retained_descriptor_ledger.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Shared across allocator rebinds; counts blocks until their last weak owner dies.
 struct Exl3SharedControlAccounting {
     inline static std::atomic<std::uint64_t> live_bytes{0};
@@ -61,4 +61,4 @@ public:
         return admitted_==other.admitted_ && credit_slot_==other.credit_slot_;
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

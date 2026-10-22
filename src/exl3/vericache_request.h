@@ -9,7 +9,7 @@
 #include "exl3/reserved_host_payload_union.h"
 #include "exl3/pending_payload_extent.h"
 #include "exl3/encoded_media_cache.h"
-#include <ninfer/targets/qwen3_6/vision_control.h>
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -30,11 +30,10 @@
 #include <condition_variable>
 #include <thread>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class Exl3VeriCacheReplay;
 class Exl3PreparedMediaReplay;
 class Exl3VeriCachePrefixIndex;
-class Exl3VisionContext;
 
 struct Exl3MediaTapOrigin {
     std::shared_ptr<const Exl3PreparedIdentity> prepared_identity;
@@ -139,12 +138,6 @@ class Exl3VeriCacheRequest {
             std::move(*credit),dynamic))throw std::logic_error("media tap origin metadata attachment");
         media_tap_origin_=std::move(origin);
     }
-    static std::shared_ptr<const Exl3VeriCacheRequest> initialize_prepared_numeric_data(
-        Exl3TextContext&,Exl3VisionContext&,
-        const targets::qwen3_6::PreparedPromptData&,
-        const targets::qwen3_6::VisionControl*,
-        std::shared_ptr<const Exl3VeriCacheRequest>,const std::function<bool()>&,
-        const Exl3EncodedMediaRetentionReserve&);
 
     static std::size_t planned_descriptor_count(std::size_t existing,std::size_t incoming_rows) {
         const auto limit=static_cast<std::size_t>(Exl3Dflash2DraftModel::ring_capacity())+1;
@@ -941,18 +934,6 @@ public:
             prepared_identity_->equals(*other.prepared_identity_) :
             !prepared_identity_ && !other.prepared_identity_;
     }
-    // Research-only native encoder -> exact represented-media L2 execution.
-    // No constructor accepts arbitrary embeddings beside caller-supplied identity.
-    static std::shared_ptr<const Exl3VeriCacheRequest> initialize_prepared_numeric(
-        Exl3TextContext& exact,Exl3VisionContext& vision,
-        const targets::qwen3_6::PreparedPrompt& prompt,
-        const std::function<bool()>& cancelled={},
-        const Exl3EncodedMediaRetentionReserve& reserve={});
-    static std::shared_ptr<const Exl3VeriCacheRequest> replay_prepared_numeric(
-        Exl3TextContext& exact,Exl3VisionContext& vision,
-        const Exl3PreparedMediaReplay& replay,
-        const std::function<bool()>& cancelled={},
-        const Exl3EncodedMediaRetentionReserve& reserve={});
     bool is_child_of(const Exl3VeriCacheRequest& root) const noexcept {
         return parent_revision_==root.revision_;
     }
@@ -1008,6 +989,9 @@ public:
     std::size_t token_count() const noexcept {return static_cast<std::size_t>(history_.position());}
     std::uint64_t token_fingerprint() const noexcept {return history_.fingerprint();}
     bool matches_tokens(std::span<const std::int64_t> tokens) const noexcept {return history_.equals(tokens);}
+    std::size_t common_prefix_tokens(std::span<const std::int64_t> tokens) const noexcept {
+        return history_.common_prefix(tokens);
+    }
     bool same_tokens(const Exl3VeriCacheRequest& other) const noexcept {return history_.same_tokens(other.history_);}
     Exl3VeriCacheReplay replay_plan(std::shared_ptr<const Exl3VeriCacheRequest> anchor={}) const;
     static Exl3TokenHistory::Stats token_storage_stats(std::span<const std::shared_ptr<const Exl3VeriCacheRequest>> requests) {
@@ -1034,6 +1018,14 @@ public:
         std::vector<std::shared_ptr<const Exl3DraftHostRing>> rings;
         for(const auto& request:requests) if(request && request->projected_) rings.push_back(request->projected_);
         return Exl3DraftHostRing::visit_allocations(rings);
+    }
+    // Logical bytes of the requests' lane-backed exact-KV pages (not host
+    // allocations of the image, so visit_host_allocations skips them).
+    static std::uint64_t lane_backed_kv_bytes(std::span<const std::shared_ptr<const Exl3VeriCacheRequest>> requests) {
+        std::vector<std::shared_ptr<const Exl3ExactHostState>> images;
+        images.reserve(requests.size());
+        for(const auto& request:requests) if(request && request->state_) images.push_back(request->state_);
+        return Exl3ExactHostState::lane_backed_kv_bytes(images);
     }
     static void visit_host_allocations(std::span<const std::shared_ptr<const Exl3VeriCacheRequest>> requests,
         const std::function<void(const void*,std::size_t)>& visitor,bool include_unused_capacity=true) {
@@ -1328,15 +1320,15 @@ public:
         unsigned tap_copy_fault_for_test=0) const {
         if(!projected_ || exact.model_identity()!=state_->model_identity())
             throw std::invalid_argument("compact verification reference mismatch");
-        const char* direct_requested=std::getenv("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
+        const char* direct_requested=std::getenv("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
         if(direct_requested && std::string_view(direct_requested)!="0" &&
             std::string_view(direct_requested)!="1")
             throw std::invalid_argument("compact direct tap staging must be 0 or 1");
         const bool direct_staging=direct_requested && std::string_view(direct_requested)=="1";
-        const auto* device_requested=std::getenv("NINFER_EXL3_COMMITTED_TAP_D2D");
+        const auto* device_requested=std::getenv("VOIDINFER_EXL3_COMMITTED_TAP_D2D");
         if(device_requested && std::string_view(device_requested)!="0" && std::string_view(device_requested)!="1")
             throw std::invalid_argument("committed tap D2D must be 0 or 1");
-        const auto* device_only_requested=std::getenv("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
+        const auto* device_only_requested=std::getenv("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
         if(device_only_requested && std::string_view(device_only_requested)!="0" &&
             std::string_view(device_only_requested)!="1")
             throw std::invalid_argument("compact device taps only must be 0 or 1");
@@ -1355,7 +1347,7 @@ public:
         if(tap_copy_fault_for_test && (!device_staging || tap_copy_fault_for_test>80))
             throw std::invalid_argument("tap copy fault requires active D2D copy1..80");
         for(auto pointer:staging) if(!pointer) throw std::invalid_argument("compact draft staging missing");
-        const auto* witness=std::getenv("NINFER_EXL3_RESIDENT_DRAFT_RING");
+        const auto* witness=std::getenv("VOIDINFER_EXL3_RESIDENT_DRAFT_RING");
         if(witness && std::string_view(witness)!="0" && std::string_view(witness)!="1")
             throw std::invalid_argument("resident draft ring must be 0 or 1");
         auto result=Exl3VeriCacheRequest::create_planned(this,tentative.size(),false,exact.request_metadata_reservation(),exact.request_metadata_reservation());
@@ -1531,6 +1523,12 @@ public:
         std::size_t entries=0;
         std::uint64_t payload_allocated_bytes=0;
         std::uint64_t identity_allocated_bytes=0;
+        // Retained exact KV of lane-backed pages: once their lane moves on the
+        // rows are filled into host planes, packed or spilled to disk, none of
+        // which is a host allocation of the image, but all of it is retained
+        // by this cache (without it the byte budget never saw long histories
+        // and spills grew without bound).
+        std::uint64_t lane_backed_bytes=0;
         std::uint64_t accounted_bytes=0;
         // Inline owner storage, not evictable entry data. Already included when
         // the enclosing cache object is inventoried by sizeof; do not add twice.
@@ -1576,10 +1574,14 @@ public:
         return false;
     }
 
-    explicit Exl3VeriCachePrefixIndex(std::size_t capacity,HashFunction hasher={})
-        : capacity_(capacity),hasher_(std::move(hasher)) {
+    // capacity bounds conversation roots; shared_capacity bounds the separate
+    // class of cross-conversation shared-prefix roots (admit(...,shared=true)),
+    // so conversation turnover never evicts a shared prefix.
+    explicit Exl3VeriCachePrefixIndex(std::size_t capacity,HashFunction hasher={},
+        std::size_t shared_capacity=0)
+        : capacity_(capacity),shared_capacity_(shared_capacity),hasher_(std::move(hasher)) {
         if(!capacity_) throw std::invalid_argument("prefix index capacity must be positive");
-        if(capacity_>maximum_entries)
+        if(shared_capacity_>maximum_entries || capacity_>maximum_entries-shared_capacity_)
             throw std::invalid_argument("prefix index capacity exceeds bounded range index");
     }
     Exl3VeriCachePrefixIndex(const Exl3VeriCachePrefixIndex&)=delete;
@@ -1588,7 +1590,27 @@ public:
     std::size_t size() const noexcept {
         std::shared_lock<std::shared_mutex> lock(mutex_);return entries_.size();
     }
-    std::size_t capacity() const noexcept {return capacity_;}
+    std::size_t capacity() const noexcept {return capacity_+shared_capacity_;}
+    // A reused root becomes the newest of its class: entry bounds evict the
+    // least recently used root, not the oldest publication.
+    bool refresh(const std::shared_ptr<const Exl3VeriCacheRequest>& root) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        const auto it=std::find_if(entries_.begin(),entries_.end(),
+            [&](const Entry& entry){return entry.root==root;});
+        if(it==entries_.end())return false;
+        std::rotate(it,it+1,entries_.end());rebuild_lengths();return true;
+    }
+    // Optional queue demand for eviction (Belady-style): the queue position
+    // of the earliest waiting request whose input this root prefixes, or
+    // nullopt when no waiting request would restore it. Whenever a bound
+    // forces an eviction, roots nobody waits for go first (oldest first),
+    // then the root the queue needs last. Retention only: which roots exist
+    // never changes what a request computes.
+    using DemandFunction=std::function<std::optional<std::size_t>(const Exl3VeriCacheRequest&)>;
+    void set_demand(DemandFunction demand) {
+        auto next=demand?std::make_shared<const DemandFunction>(std::move(demand)):nullptr;
+        std::lock_guard<std::mutex> lock(demand_mutex_);demand_=std::move(next);
+    }
     void exhaust_generations_for_test() {
         std::unique_lock<std::shared_mutex> lock(mutex_);next_generation_=std::numeric_limits<std::uint64_t>::max();
     }
@@ -1627,9 +1649,9 @@ public:
         std::unique_lock<std::shared_mutex> lock(mutex_);
         // Obtain any new vector slot before erasing a replacement or FIFO root.
         // Entry moves below transfer only already-owned buffers and shared roots.
-        if(entries_.size()<capacity_ && entries_.capacity()==entries_.size()) {
+        if(entries_.size()<capacity() && entries_.capacity()==entries_.size()) {
             if(fail_publication_growth_) {fail_publication_growth_=false;throw std::bad_alloc();}
-            const auto remaining=capacity_-entries_.size();
+            const auto remaining=capacity()-entries_.size();
             const auto growth=std::min(remaining,std::max<std::size_t>(1,entries_.size()));
             entries_.reserve(entries_.size()+growth);
         }
@@ -1642,7 +1664,9 @@ public:
                 entries_.erase(it);entries_.push_back(std::move(replacement));rebuild_lengths();return;
             }
         }
-        if(entries_.size()==capacity_) entries_.erase(entries_.begin());
+        if(class_count(false)==capacity_)
+            entries_.erase(std::find_if(entries_.begin(),entries_.end(),
+                [](const Entry& entry){return !entry.shared;}));
         entries_.push_back(Entry{hash,generation,std::move(model),
             std::move(compatibility_contract),std::move(root)});
         rebuild_lengths();
@@ -1729,10 +1753,11 @@ public:
     Admission admit(std::shared_ptr<const Exl3VeriCacheRequest> root,
         std::string compatibility_contract,std::uint64_t byte_budget,
         std::uint64_t available_physical_bytes,std::uint64_t physical_reserve_bytes,
-        std::optional<std::span<const RetentionDecision>> retention=std::nullopt) {
+        std::optional<std::span<const RetentionDecision>> retention=std::nullopt,bool shared=false) {
         if(!byte_budget) throw std::invalid_argument("prefix index byte budget must be positive");
         Admission result;result.configured_budget_bytes=byte_budget;
         std::unique_lock<std::shared_mutex> lock(mutex_);
+        if(shared && !shared_capacity_) {result.storage=current_stats_locked();return result;}
         // Retained roots already occupy physical memory and are reclaimable by
         // eviction: the physical bound is available plus currently retained.
         const auto retained_bytes=current_stats_locked().accounted_bytes;
@@ -1750,6 +1775,12 @@ public:
                 }
         }
         Entry candidate=make_entry(std::move(root),std::move(compatibility_contract));
+        candidate.shared=shared;
+        const auto class_capacity=shared?shared_capacity_:capacity_;
+        const auto class_entries=[&](std::span<const Entry* const> entries) {
+            return static_cast<std::size_t>(std::count_if(entries.begin(),entries.end(),
+                [&](const Entry* entry){return entry->shared==shared;}));
+        };
         std::vector<const Entry*> prospective;prospective.reserve(entries_.size()+1);
         for(std::size_t i=0;i<entries_.size();++i) {
             if(!same_identity(entries_[i],candidate)) {
@@ -1775,16 +1806,23 @@ public:
         }
         if(retention) {
             auto policy_stats=account(prospective);
-            while(prospective.size()>capacity_ || policy_stats.accounted_bytes>result.effective_budget_bytes) {
+            while(class_entries(prospective)>class_capacity ||
+                policy_stats.accounted_bytes>result.effective_budget_bytes) {
                 const auto decision=[&](const Entry* entry)->const RetentionDecision& {
                     return (*retention)[static_cast<std::size_t>(entry-entries_.data())];
                 };
+                // An exceeded entry bound evicts only within the candidate's class.
+                const bool class_full=class_entries(prospective)>class_capacity;
+                const auto eligible=[&](const Entry* entry) {
+                    return entry!=&candidate && !decision(entry).required &&
+                        (!class_full || entry->shared==shared);
+                };
                 bool measured=true;
-                for(const auto* entry:prospective)if(entry!=&candidate && !decision(entry).required &&
+                for(const auto* entry:prospective)if(eligible(entry) &&
                     !decision(entry).value_per_byte)measured=false;
                 auto victim=prospective.end();
                 for(auto it=prospective.begin();it!=prospective.end();++it) {
-                    if(*it==&candidate || decision(*it).required)continue;
+                    if(!eligible(*it))continue;
                     if(victim==prospective.end() || (measured &&
                         *decision(*it).value_per_byte<*decision(*victim).value_per_byte))victim=it;
                 }
@@ -1792,19 +1830,45 @@ public:
                 prospective.erase(victim);policy_stats=account(prospective);
             }
         }
-        std::size_t first=prospective.size()>capacity_?prospective.size()-capacity_:0;
-        auto selected=[&] {return std::span<const Entry* const>(prospective).subspan(first);};
-        auto stats=account(selected());
-        while(stats.accounted_bytes>result.effective_budget_bytes && first+1<prospective.size()) {
-            ++first;stats=account(selected());
+        // The candidate's class bound evicts that class's least recently used
+        // roots; the byte bound then evicts the oldest conversation roots before
+        // any shared prefix. The candidate itself is kept, except under queue
+        // demand: a candidate no waiting request restores is not admitted when
+        // admitting it would evict a root a waiting request does restore.
+        std::vector<const Entry*> selected(prospective);
+        const auto demand=demand_snapshot();
+        const auto deref=[](const Entry* entry)->const Entry&{return *entry;};
+        const bool candidate_idle=demand && *demand && candidate.root && !(*demand)(*candidate.root);
+        const auto demanded=[&](const Entry* entry) {
+            return demand && *demand && entry->root && (*demand)(*entry->root).has_value();
+        };
+        const auto decline=[&] {result.storage=current_stats_locked();return result;};
+        while(class_entries(selected)>class_capacity) {
+            // The candidate is last and never a victim.
+            auto victim=demand_victim(selected.begin(),selected.end()-1,demand,
+                [&](const Entry& entry){return entry.shared==shared;},deref);
+            if(victim==selected.end()-1)
+                victim=std::find_if(selected.begin(),selected.end(),
+                    [&](const Entry* entry){return entry->shared==shared;});
+            if(candidate_idle && victim!=selected.end()-1 && demanded(*victim))return decline();
+            selected.erase(victim);
+        }
+        auto stats=account(selected);
+        while(stats.accounted_bytes>result.effective_budget_bytes && selected.size()>1) {
+            auto victim=demand_victim(selected.begin(),selected.end()-1,demand,
+                [](const Entry& entry){return !entry.shared;},deref);
+            if(victim==selected.end()-1)victim=demand_victim(selected.begin(),selected.end()-1,demand,
+                [](const Entry&){return true;},deref);
+            if(candidate_idle && demanded(*victim))return decline();
+            selected.erase(victim);stats=account(selected);
         }
         if(retention && fail_policy_commit_) {fail_policy_commit_=false;throw std::bad_alloc();}
-        std::vector<Entry> next;next.reserve(selected().size());
+        std::vector<Entry> next;next.reserve(selected.size());
         result.replaced=std::any_of(entries_.begin(),entries_.end(),
             [&](const Entry& entry){return same_identity(entry,candidate);});
         std::size_t kept_old=0;
         auto found=entries_.begin();
-        for(const Entry* wanted:selected()) if(wanted!=&candidate) {
+        for(const Entry* wanted:selected) if(wanted!=&candidate) {
             // prospective/selected preserve publication order. Never rescan
             // previously consumed entries when moving the retained suffix.
             while(found!=entries_.end() && &*found!=wanted)++found;
@@ -1827,9 +1891,32 @@ public:
             std::min(byte_budget,available_physical_bytes-physical_reserve_bytes):0;
         std::unique_lock<std::shared_mutex> lock(mutex_);std::size_t count=0;auto stats=current_stats_locked();
         while(!entries_.empty() && stats.accounted_bytes>effective) {
-            entries_.erase(entries_.begin());rebuild_lengths();++count;stats=current_stats_locked();
+            // Oldest conversation roots first; shared prefixes last (roots the
+            // queue waits for after the others within each class).
+            const auto demand=demand_snapshot();
+            auto victim=demand_victim(entries_.begin(),entries_.end(),demand,
+                [](const Entry& entry){return !entry.shared;},[](const Entry& entry)->const Entry&{return entry;});
+            if(victim==entries_.end())victim=demand_victim(entries_.begin(),entries_.end(),demand,
+                [](const Entry&){return true;},[](const Entry& entry)->const Entry&{return entry;});
+            entries_.erase(victim);rebuild_lengths();++count;stats=current_stats_locked();
         }
         if(evicted) *evicted=count;return stats;
+    }
+
+    // Host memory pressure: removes the oldest conversation root (shared
+    // prefixes last) and hands it to the caller, which drops it outside the
+    // index lock. Null when the index is empty.
+    std::shared_ptr<const Exl3VeriCacheRequest> evict_oldest() {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if(entries_.empty())return nullptr;
+        const auto demand=demand_snapshot();
+        auto victim=demand_victim(entries_.begin(),entries_.end(),demand,
+            [](const Entry& entry){return !entry.shared;},[](const Entry& entry)->const Entry&{return entry;});
+        if(victim==entries_.end())victim=demand_victim(entries_.begin(),entries_.end(),demand,
+            [](const Entry&){return true;},[](const Entry& entry)->const Entry&{return entry;});
+        auto root=std::move(victim->root);
+        entries_.erase(victim);rebuild_lengths();
+        return root;
     }
 
     struct PolicyTrim {
@@ -1940,7 +2027,12 @@ private:
         std::shared_ptr<const Exl3VeriCacheRequest> root;
         std::optional<std::uint64_t> preparation_microseconds,observed_accesses;
         SelectionCount lookup_selections;
+        bool shared=false; // cross-conversation shared-prefix root
     };
+    std::size_t class_count(bool shared) const noexcept {
+        return static_cast<std::size_t>(std::count_if(entries_.begin(),entries_.end(),
+            [&](const Entry& entry){return entry.shared==shared;}));
+    }
     static std::shared_ptr<const Exl3VeriCacheRequest> selected_root(const Entry& entry) {
         auto count=entry.lookup_selections.value.load(std::memory_order_relaxed);
         while(count!=std::numeric_limits<std::uint64_t>::max() &&
@@ -1987,7 +2079,8 @@ private:
             });
         if(result.identity_allocated_bytes>std::numeric_limits<std::uint64_t>::max()-result.payload_allocated_bytes)
             throw std::overflow_error("prefix index total accounting overflow");
-        result.accounted_bytes=result.payload_allocated_bytes+result.identity_allocated_bytes;
+        if(!roots.empty()) result.lane_backed_bytes=Exl3VeriCacheRequest::lane_backed_kv_bytes(roots);
+        result.accounted_bytes=result.payload_allocated_bytes+result.identity_allocated_bytes+result.lane_backed_bytes;
         return result;
     }
     StorageStats current_stats_locked() const {
@@ -2005,9 +2098,31 @@ private:
         return hash_contract(Exl3TokenHistory::extend_fingerprint(1469598103934665603ULL,tokens),contract);
     }
 
-    const std::size_t capacity_;
+    const std::size_t capacity_,shared_capacity_;
     HashFunction hasher_;
     mutable std::shared_mutex mutex_;
+    mutable std::mutex demand_mutex_;
+    std::shared_ptr<const DemandFunction> demand_;
+    std::shared_ptr<const DemandFunction> demand_snapshot() const {
+        std::lock_guard<std::mutex> lock(demand_mutex_);return demand_;
+    }
+    // First eligible entry in [first,last) that no waiting request needs
+    // (publication / LRU order); otherwise the eligible entry needed last.
+    // last when nothing is eligible.
+    template<class It,class Eligible,class Deref>
+    static It demand_victim(It first,It last,const std::shared_ptr<const DemandFunction>& demand,
+        Eligible eligible,Deref deref) {
+        It needed_last=last;std::size_t needed_rank=0;
+        for(It it=first;it!=last;++it) {
+            const Entry& entry=deref(*it);
+            if(!eligible(entry))continue;
+            if(!demand || !*demand || !entry.root)return it;
+            const auto rank=(*demand)(*entry.root);
+            if(!rank)return it;
+            if(needed_last==last || *rank>needed_rank) {needed_last=it;needed_rank=*rank;}
+        }
+        return needed_last;
+    }
     std::vector<Entry> entries_;
     bool fail_publication_growth_=false;
     bool fail_policy_commit_=false;
@@ -2037,7 +2152,7 @@ struct Exl3VeriCacheServingIdentity {
     std::string process_namespace,artifact_identity,tokenizer_identity,
         configuration_identity,modality_identity;
     std::string contract() const {
-        std::string result="ninfer-exl3-serving-prefix-v1";
+        std::string result="voidinfer-exl3-serving-prefix-v1";
         const auto append=[&](std::string_view name,const std::string& value) {
             if(value.empty() || value.size()>(1U<<20))
                 throw std::invalid_argument("serving prefix identity component extent");
@@ -2056,8 +2171,10 @@ struct Exl3VeriCacheServingIdentity {
 class Exl3VeriCacheServingPrefixCache {
 public:
     struct Policy {
+        // entry_capacity: conversation roots; shared_prefix_capacity: shared-prefix roots.
         std::size_t entry_capacity=1,minimum_prefix_tokens=64;
         std::uint64_t byte_budget=0,physical_reserve_bytes=0;
+        std::size_t shared_prefix_capacity=0;
     };
     struct Metrics {
         std::size_t prompt_tokens=0,reused_prompt_tokens=0,executed_prompt_tokens=0;
@@ -2074,7 +2191,8 @@ public:
     };
 
     Exl3VeriCacheServingPrefixCache(Policy policy,Exl3VeriCacheServingIdentity identity)
-        : policy_(policy),contract_(identity.contract()),index_(policy.entry_capacity) {
+        : policy_(policy),contract_(identity.contract()),
+          index_(policy.entry_capacity,{},policy.shared_prefix_capacity) {
         if(!policy_.entry_capacity || !policy_.minimum_prefix_tokens || !policy_.byte_budget ||
             !policy_.physical_reserve_bytes)
             throw std::invalid_argument("serving prefix cache policy extent");
@@ -2147,11 +2265,6 @@ public:
         if(!metrics.cache_storage.entries) metrics.cache_storage=index_.storage_stats();
         return output;
     }
-
-    Result prepare_media(Exl3TextContext& exact,Exl3VisionContext& vision,
-        const targets::qwen3_6::PreparedPrompt& prompt,bool cacheable_input,
-        std::uint64_t available_physical_bytes,const std::function<bool()>& cancelled={},
-        const Exl3EncodedMediaRetentionReserve& reserve={});
 
     // Explicit independent-context preparation path. Cache lookup and the
     // numerical suffix remain outside the service lock; reload identity is
@@ -2318,6 +2431,24 @@ public:
                 preparation_microseconds,std::nullopt);
         return admission;
     }
+    // A cross-conversation shared prefix (exact input prefix of several
+    // conversations) is retained in its own class: conversation turnover does
+    // not evict it, only another shared prefix or the byte budget does.
+    Exl3VeriCachePrefixIndex::Admission admit_shared_prefix(
+        std::shared_ptr<const Exl3VeriCacheRequest> root,std::span<const std::int64_t> input,
+        std::uint64_t available_physical_bytes) {
+        if(!root || root->prepared_identity() || input.size()<policy_.minimum_prefix_tokens ||
+            !root->matches_tokens(input))
+            throw std::invalid_argument("shared prefix exact token identity");
+        std::unique_lock<std::mutex> lock(service_mutex_);
+        return index_.admit(std::move(root),contract_,policy_.byte_budget,
+            available_physical_bytes,policy_.physical_reserve_bytes,std::nullopt,true);
+    }
+    bool refresh(const std::shared_ptr<const Exl3VeriCacheRequest>& root) {return index_.refresh(root);}
+    void set_demand(Exl3VeriCachePrefixIndex::DemandFunction demand) {index_.set_demand(std::move(demand));}
+    // Host memory pressure (the serving coordinator): removes the oldest
+    // retained root under the index lock alone, as copy_roots_into reads it.
+    std::shared_ptr<const Exl3VeriCacheRequest> evict_oldest_root() {return index_.evict_oldest();}
 
     // One-shot cold concurrent preparation fault after numerical completion,
     // before index mutation. Warm hits do not consume it.
@@ -2719,4 +2850,4 @@ inline Exl3VeriCacheReplay Exl3VeriCacheRequest::replay_plan(
     result.partitions_=partitions_;
     result.anchor_=std::move(anchor);return result;
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

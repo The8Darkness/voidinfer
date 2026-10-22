@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_6/vision_control.h>
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 #include "exl3/retained_descriptor_ledger.h"
 
 #include <algorithm>
@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 inline bool exl3_same_vision_control(
     const targets::qwen3_6::VisionItemControl& left,
@@ -233,4 +233,4 @@ private:
     std::optional<RetainedHostAllocationLedger::Ticket> external_output_credit_;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

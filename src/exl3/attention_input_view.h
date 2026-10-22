@@ -5,7 +5,7 @@
 #include <array>
 #include <memory>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Read-only numerical projection of retained input owners. Lifetime/readiness
 // remain in the context's working allocation, prefix Use and page reader leases.
 // This object is deliberately unable to certify ownership from a raw pointer.

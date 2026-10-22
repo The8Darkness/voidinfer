@@ -1,7 +1,7 @@
 #pragma once
 
 struct PrefillK6GateupWarpgroupQualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_wide_prefill;
     static constexpr std::size_t guard = 128;
     static constexpr int max_rows = 128;
@@ -19,13 +19,13 @@ struct PrefillK6GateupWarpgroupQualification {
     }
 
     static void callback(
-        const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+        const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
         void* user) {
         static_cast<PrefillK6GateupWarpgroupQualification*>(user)->check(
             observation);
     }
 
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         ++observations;
         if (checked) return;
         checked = true;
@@ -36,15 +36,15 @@ struct PrefillK6GateupWarpgroupQualification {
         cuda_check(cudaStreamSynchronize(x.stream),
                    "K6 gate/up warp-group input ready");
 
-        _putenv_s("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC", "0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC", "0");
         Exl3CudaLinearWorkspace baseline(
             kHidden, intermediate, max_rows, false,
             true, false, false, false, true);
-        _putenv_s("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC", "1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC", "1");
         Exl3CudaLinearWorkspace candidate(
             kHidden, intermediate, max_rows, false,
             true, false, false, false, true);
-        _putenv_s("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC", "0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC", "0");
 
         require(std::string(baseline.dispatch_name(
                     x.metadata, max_rows, admit)) ==
@@ -116,9 +116,9 @@ struct PrefillK6GateupWarpgroupQualification {
 };
 
 void run_prefill_k6_gateup_warpgroup_qualification(Exl3TextModel& target) {
-    require(env("NINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC") == "0",
+    require(env("VOIDINFER_EXL3_PREFILL_K6_GATEUP_WARPGROUP_ASYNC") == "0",
             "K6 gate/up warp-group capture needs control flag");
-    auto ids = load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids = load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     constexpr int initial_rows = 16;
     require(ids.size() >= initial_rows +
                 PrefillK6GateupWarpgroupQualification::max_rows,
@@ -127,11 +127,11 @@ void run_prefill_k6_gateup_warpgroup_qualification(Exl3TextModel& target) {
                PrefillK6GateupWarpgroupQualification::max_rows);
     auto context = target.create_context(true);
     PrefillK6GateupWarpgroupQualification qualification(
-        env("NINFER_E5A4_OUT"));
+        env("VOIDINFER_E5A4_OUT"));
     context->set_target_projection_observer_for_test(
         PrefillK6GateupWarpgroupQualification::callback, &qualification,
         nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k6);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::gate_up_k6);
     context->prefill(std::span<const std::int64_t>(ids.data(), initial_rows));
     context->append_exact_prefill_wide(std::span<const std::int64_t>(
         ids.data() + initial_rows,

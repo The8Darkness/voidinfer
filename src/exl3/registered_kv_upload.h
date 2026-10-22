@@ -5,7 +5,7 @@
 #include <limits>
 #include <array>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3KVUploadProvider {
     cudaError_t (*copy)(void*,const void*,std::size_t,cudaMemcpyKind,cudaStream_t) noexcept=
         [](void* out,const void* in,std::size_t bytes,cudaMemcpyKind kind,cudaStream_t stream) noexcept {

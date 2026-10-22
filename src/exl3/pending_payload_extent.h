@@ -5,7 +5,7 @@
 #include <limits>
 #include <optional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 inline std::optional<std::size_t> pending_payload_extent(std::size_t tokens,
     const std::array<std::size_t,5>& taps,std::size_t wrapper=0) noexcept {
     auto total=wrapper;

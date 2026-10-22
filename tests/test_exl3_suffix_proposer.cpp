@@ -1,7 +1,7 @@
 #include "exl3/suffix_proposer.h"
 #include <iostream>
 #include <vector>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void need(bool x){if(!x)throw std::runtime_error("suffix proposal assertion");}
 int main() {
     try {

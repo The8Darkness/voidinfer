@@ -2,16 +2,16 @@
 
 void run_vericache_request_qualification(Exl3TextModel& target,
     Exl3Dflash2DraftModel& draft,const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     const int prefix=target.max_context()==4096 ? 2061 : 321;
     require(source.size()>=prefix+350,"VeriCache request fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    const bool compact_l0=env("NINFER_TEST_VERICACHE_L0_ONLY")=="1";
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY",compact_l0?"1":"0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    const bool compact_l0=env("VOIDINFER_TEST_VERICACHE_L0_ONLY")=="1";
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY",compact_l0?"1":"0");
     auto inner=target.create_context(true);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    const bool host_kv=env("NINFER_TEST_VERICACHE_HOST_KV")=="1";
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV",host_kv?"1":"0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    const bool host_kv=env("VOIDINFER_TEST_VERICACHE_HOST_KV")=="1";
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV",host_kv?"1":"0");
     auto exact=target.create_context(true);
     exact->prepare_continuation(8);
     require(inner->try_enable_oscar_from_environment(),"VeriCache inner OSCAR");
@@ -34,7 +34,7 @@ void run_vericache_request_qualification(Exl3TextModel& target,
     // Wrong request's warm pages must fail before changing visible L0 state.
     requests[0]->restore_inner(*inner,draft,staging);
     const auto root_logits=inner->logits_host();
-    const auto wrong=ninfer::exl3::Exl3TextContext::make_turboangle_warm_pages(requests[1]->state(),64);
+    const auto wrong=voidinfer::exl3::Exl3TextContext::make_turboangle_warm_pages(requests[1]->state(),64);
     bool rejected=false;
     try {requests[0]->restore_inner(*inner,draft,staging,wrong.get());}
     catch(const std::exception&) {rejected=true;}

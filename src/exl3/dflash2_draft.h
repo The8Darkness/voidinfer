@@ -1,4 +1,5 @@
 #pragma once
+#include "exl3/sampled_select.h"
 #include "exl3/gaming_optimizations.h"
 #include "exl3/target_q_continuation.h"
 #include "exl3/draft_distribution_contract.h"
@@ -20,7 +21,7 @@
 #include <limits>
 #include <atomic>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3DeviceGreedySeed;
 
@@ -229,18 +230,30 @@ void dflash2_dense_t_for_test(const std::uint16_t* input,
 //
 // All draft kernels run natively on the target GPU. EXL3-quantized projections
 // (fc/q/k/v/o/gate/up/down) reuse the qualified Exl3CudaLinearWorkspace family.
-// NINFER_DFLASH2_PROJECTION_TIMING=1 is an eager-only diagnostic sampled at
+// VOIDINFER_DFLASH2_PROJECTION_TIMING=1 is an eager-only diagnostic sampled at
 // load: it allocates persistent CUDA events and prints per-call/aggregate GPU
 // stream elapsed attribution after propose()'s existing final synchronization.
 // Intervals include host-feed gaps. The disabled model creates, records and
 // resolves no timing events and emits no timing output. Internal wall timing
 // excludes entry validation and CSV output; use the harness for full API cost.
-// NINFER_DFLASH2_FUSED_SELECTOR=1 is a separate default-off physical-C1
+// VOIDINFER_DFLASH2_FUSED_SELECTOR=1 is a separate default-off physical-C1
 // proposal-chain candidate. It preserves the candidate order, FP32 reduction
 // order, strict-greater tie rule, device-seed status slot, and proposal rows,
 // but evaluates the bounded autoregressive chain in one 256-thread kernel.
 // It falls back for position-confidence/timing diagnostics and does not alter
 // acceptance counts, ring/W+1 semantics, or target/draft ordering.
+
+class Exl3BatchedVerifyCoordinator;
+class Exl3Dflash2DraftModel;
+// One lane's cached-ring proposal inside a batched multi-agent draft forward
+// (Exl3Dflash2DraftModel::propose_batched). The block and the result are host
+// owned by the requesting lane for the duration of the call.
+struct Exl3DraftBatchedRequest {
+    Exl3Dflash2DraftModel* draft = nullptr;
+    std::span<const std::int64_t> block;
+    int block_pos0 = 0;
+    std::vector<std::int64_t> proposals;
+};
 
 class Exl3Dflash2DraftModel {
 public:
@@ -364,7 +377,7 @@ public:
     std::uint64_t local_topk_calls() const noexcept;
     std::uint64_t fused_topk_liveness_calls() const noexcept;
     // Test-only host telemetry for the most recent proposal. Empty unless the
-    // model was loaded with NINFER_DFLASH2_POSITION_CONFIDENCE=1. Each entry
+    // model was loaded with VOIDINFER_DFLASH2_POSITION_CONFIDENCE=1. Each entry
     // corresponds to one proposed position and is copied at the selector's
     // existing per-position synchronization; no post-verification label is
     // stored here.
@@ -431,6 +444,9 @@ public:
 
     // Resets draft KV/position scratch. Does not touch the target.
     void reset(cudaStream_t stream = nullptr);
+    // Coupled sampled proposals for the request this draft serves
+    // (temperature 0 = greedy chain).
+    void set_sampling(const Exl3DeviceSampling& sampling) noexcept;
 
     // ===== E5A3 bounded draft KV ring (sliding window 2048, keep 2047) =====
     // The reference (RotatingKVCache max_size=sliding_window-1) proves draft KV
@@ -452,6 +468,11 @@ public:
     //1..16 contiguous new rows; opt-in batches native projections at most8 rows.
     void commit_prefill_block(const std::uint16_t* const* taps, int rows,
                               long long abs_pos0, cudaStream_t stream = nullptr);
+    // Fresh prefill: every remaining committed row of the scope at once
+    // (taps[t] holds `rows` contiguous rows), in 32-row row-batched chunks.
+    // Same ring result as the equivalent 16-row commit_prefill_block calls.
+    void commit_prefill_bulk(const std::uint16_t* const* taps, int rows,
+                             long long abs_pos0, cudaStream_t stream = nullptr);
     // Optional request-scoped undo for one saturated-ring prefill commit of 1..8
     // rows. begin snapshots the affected physical slots on the same eager stream;
     // exactly one matching commit_prefill_block may follow. accept keeps it;
@@ -465,8 +486,11 @@ public:
     // commits overwrite and the ring metadata at the current frontier; restore
     // (frontier at most `rows` past the checkpoint) returns the ring to that
     // frontier so verified rows can be recommitted. Same eager stream.
-    void save_ring_checkpoint(int rows, cudaStream_t stream = nullptr);
+    void save_ring_checkpoint(int rows, cudaStream_t stream = nullptr, bool pending = false);
     void restore_ring_checkpoint(cudaStream_t stream = nullptr);
+    // Folded VeriCache: the pending checkpoint (saved where the next block's
+    // verification starts) becomes the restorable one.
+    void promote_ring_checkpoint();
     void rollback_prefill_ring_undo(cudaStream_t stream = nullptr);
     // Explicit eager fresh initialization on an empty logical ring. Submit the
     // original ordered1..16-row calls on the declared stream through exact end.
@@ -518,6 +542,29 @@ public:
         std::int64_t mask_token_id,cudaStream_t stream=nullptr);
     int ring_count() const noexcept;
     std::size_t ring_bytes() const noexcept;
+    // Batched multi-agent drafting: lanes of one coherent-device coordinator
+    // meet at their cached-ring proposals; one forward runs every member's
+    // block rows through the shared draft weights (row-concatenated
+    // projections, per-lane ring attention, per-lane selector).
+    void set_batched_propose(Exl3BatchedVerifyCoordinator* coordinator) noexcept;
+    // True when this lane's rounds may batch with other lanes.
+    bool batched_rounds() const noexcept;
+    // propose_cached_view without the batched rendezvous (solo coordinator path).
+    std::vector<std::int64_t> propose_cached_private(
+        std::span<const std::int64_t> block_ids,int block_pos0,
+        const std::uint16_t* target_embedding_bf16,
+        const Exl3CudaLinearWeights& target_head,
+        const Exl3CudaLinearMetadata& target_head_metadata,
+        std::int64_t mask_token_id,cudaStream_t stream=nullptr);
+    // The configuration propose_batched implements (default fused selector
+    // route, no observers or shared executors) and a full-width block.
+    bool batched_proposal_supported(std::span<const std::int64_t> block) const noexcept;
+    // Runs on `stream` after every member's queued work; members' own scratch
+    // receives their selector state. Up to max_batched_members() 8-row blocks.
+    static std::size_t max_batched_members() noexcept;
+    static void propose_batched(std::span<Exl3DraftBatchedRequest* const> members,
+        const std::uint16_t* target_embedding_bf16,const Exl3CudaLinearWeights& target_head,
+        const Exl3CudaLinearMetadata& target_head_metadata,cudaStream_t stream);
     // Immutable FP16 projected K/V, bound to this resident drafter. Only proven
     // append lineage shares pages; false downloads all logical rows for audits.
     // Caller serializes commits and these eager operations on the same stream.
@@ -625,4 +672,4 @@ private:
     int capacity_ = 0;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

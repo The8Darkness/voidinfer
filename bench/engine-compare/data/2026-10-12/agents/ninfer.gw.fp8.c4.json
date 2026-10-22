@@ -1,0 +1,53 @@
+{
+ "agents": 8,
+ "chars": 400000,
+ "tokens": 256,
+ "turns": [
+  {
+   "turn": 0,
+   "wall_s": 225.65816164016724,
+   "ok": 6,
+   "errors": [
+    "HTTP Error 400: Bad Request",
+    "HTTP Error 400: Bad Request"
+   ],
+   "prompt_tokens": 636988,
+   "completion_tokens": 1340,
+   "per_request_s": [
+    189.2,
+    206.5,
+    167.8,
+    0.1,
+    132.7,
+    0.1,
+    102.7,
+    225.5
+   ],
+   "peak_gpu_mib": 27528
+  },
+  {
+   "turn": 1,
+   "wall_s": 5.5825231075286865,
+   "ok": 4,
+   "errors": [
+    "HTTP Error 400: Bad Request",
+    "HTTP Error 400: Bad Request",
+    "HTTP Error 400: Bad Request",
+    "HTTP Error 400: Bad Request"
+   ],
+   "prompt_tokens": 417258,
+   "completion_tokens": 1024,
+   "per_request_s": [
+    1.2,
+    2.6,
+    3.8,
+    0.0,
+    5.6,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "peak_gpu_mib": 27528
+  }
+ ]
+}

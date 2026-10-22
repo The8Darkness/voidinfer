@@ -12,7 +12,7 @@
 #include <atomic>
 #include <functional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // A physical C1 execution resource, never a scheduler. The caller obtains a
 // coordinator lease first. It owns the context and fixed staging across turns;
@@ -264,10 +264,10 @@ public:
             throw std::invalid_argument("reserved lane requires prepared continuation");
         using Inventory=Exl3ResourceInventory;
         using Domain=Inventory::Domain;
-        const auto* suffix=std::getenv("NINFER_EXL3_SUFFIX_PROPOSALS");
+        const auto* suffix=std::getenv("VOIDINFER_EXL3_SUFFIX_PROPOSALS");
         if(suffix && std::string_view(suffix)!="0" && std::string_view(suffix)!="1")
             throw std::invalid_argument("suffix proposals must be0 or1");
-        const auto* fast_mia_parity_w1=std::getenv("NINFER_EXL3_FAST_MIA_PARITY_W1");
+        const auto* fast_mia_parity_w1=std::getenv("VOIDINFER_EXL3_FAST_MIA_PARITY_W1");
         if(fast_mia_parity_w1 && std::string_view(fast_mia_parity_w1)!="0" &&
            std::string_view(fast_mia_parity_w1)!="1")
             throw std::invalid_argument("FAST_MIA_PARITY W+1 must be 0 or 1");
@@ -345,30 +345,30 @@ public:
         if (!context_ || context_->oscar_enabled() || compatibility_.empty() ||
             draft_.draft_layers()!=5 || draft_.block_capacity()!=8)
             throw std::invalid_argument("DFlash execution requires exact context and pinned five-layer B8 draft");
-        const auto* suffix=std::getenv("NINFER_EXL3_SUFFIX_PROPOSALS");
+        const auto* suffix=std::getenv("VOIDINFER_EXL3_SUFFIX_PROPOSALS");
         if(suffix && std::string_view(suffix)!="0" && std::string_view(suffix)!="1")
             throw std::invalid_argument("suffix proposals must be0 or1");
         const bool suffix_enabled=suffix && std::string_view(suffix)=="1";
         const unsigned suffix_key_tokens=suffix_key_tokens_option(suffix_enabled);
-        const auto* horizon=std::getenv("NINFER_EXL3_BOUNDED_VERIFIER_HORIZON");
+        const auto* horizon=std::getenv("VOIDINFER_EXL3_BOUNDED_VERIFIER_HORIZON");
         if(horizon && std::string_view(horizon)!="0" && std::string_view(horizon)!="1")
             throw std::invalid_argument("bounded verifier horizon must be0 or1");
         horizon_enabled_=horizon && std::string_view(horizon)=="1";
-        const auto* native_horizon=std::getenv("NINFER_EXL3_NATIVE_VERIFIER_HORIZON");
+        const auto* native_horizon=std::getenv("VOIDINFER_EXL3_NATIVE_VERIFIER_HORIZON");
         if(native_horizon && std::string_view(native_horizon)!="0" &&
             std::string_view(native_horizon)!="1")
             throw std::invalid_argument("native verifier horizon must be0 or1");
         native_horizon_enabled_=native_horizon && std::string_view(native_horizon)=="1";
         if(native_horizon_enabled_ && !horizon_enabled_)
             throw std::invalid_argument("native verifier horizon requires bounded verifier horizon");
-        const auto* staged_b8=std::getenv("NINFER_EXL3_STAGED_B8_VERIFIER");
+        const auto* staged_b8=std::getenv("VOIDINFER_EXL3_STAGED_B8_VERIFIER");
         if(staged_b8 && std::string_view(staged_b8)!="0" &&
             std::string_view(staged_b8)!="1")
             throw std::invalid_argument("staged B8 verifier must be0 or1");
         staged_b8_verifier_enabled_=staged_b8 && std::string_view(staged_b8)=="1";
         if(staged_b8_verifier_enabled_ && native_horizon_enabled_)
             throw std::invalid_argument("staged B8 verifier is incompatible with native verifier horizon");
-        const auto* staged_split=std::getenv("NINFER_EXL3_STAGED_B8_SPLIT_ROWS");
+        const auto* staged_split=std::getenv("VOIDINFER_EXL3_STAGED_B8_SPLIT_ROWS");
         if(staged_split && !staged_b8_verifier_enabled_)
             throw std::invalid_argument("staged B8 split requires staged verifier");
         if(staged_split) {
@@ -376,13 +376,13 @@ public:
             else if(std::string_view(staged_split)=="6")staged_b8_split_rows_=6;
             else throw std::invalid_argument("staged B8 split must be4 or6");
         }
-        const auto* repair=std::getenv("NINFER_EXL3_REPAIR_CHECKPOINT");
+        const auto* repair=std::getenv("VOIDINFER_EXL3_REPAIR_CHECKPOINT");
         if(repair && std::string_view(repair)!="0" && std::string_view(repair)!="1")
             throw std::invalid_argument("repair checkpoint must be0 or1");
         const bool repair_requested=repair && std::string_view(repair)=="1";
         repair_checkpoint_enabled_=repair_requested &&
             (!reserved_startup || context_->transaction_prepared());
-        const auto* device_seed=std::getenv("NINFER_EXL3_DEVICE_SEED_HANDOFF");
+        const auto* device_seed=std::getenv("VOIDINFER_EXL3_DEVICE_SEED_HANDOFF");
         if(device_seed && std::string_view(device_seed)!="0" &&
             std::string_view(device_seed)!="1")
             throw std::invalid_argument("device seed handoff must be0 or1");
@@ -1457,7 +1457,7 @@ public:
     std::size_t context_entry_device_bytes() const noexcept {return context_entry_device_bytes_;}
 private:
     static unsigned suffix_key_tokens_option(bool suffix_enabled) {
-        const auto* value=std::getenv("NINFER_EXL3_SUFFIX_KEY_TOKENS");
+        const auto* value=std::getenv("VOIDINFER_EXL3_SUFFIX_KEY_TOKENS");
         if(!value)return 4;
         if(!suffix_enabled)
             throw std::invalid_argument("suffix key tokens require suffix proposals");
@@ -1467,7 +1467,7 @@ private:
         throw std::invalid_argument("suffix key tokens must be2,3,or4");
     }
     static bool preserve_acquired_root_option() {
-        const auto* value=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
+        const auto* value=std::getenv("VOIDINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
         if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
             throw std::invalid_argument("preserve acquired root must be0 or1");
         return value && std::string_view(value)=="1";
@@ -1717,4 +1717,4 @@ private:
     Stats stats_;
     std::unique_lock<std::mutex> draft_owner_;
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

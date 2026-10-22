@@ -1,7 +1,7 @@
 #pragma once
 
 struct TargetK6M1SimtQualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     std::filesystem::path directory;
     std::ofstream csv;
     std::vector<std::string> shapes;
@@ -25,7 +25,7 @@ struct TargetK6M1SimtQualification {
         return Admission::ordinary;
     }
 
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,
                          void* user) {
         auto* self=static_cast<TargetK6M1SimtQualification*>(user);
         const auto admit=admission(x.operation);
@@ -39,20 +39,20 @@ struct TargetK6M1SimtQualification {
         self->shapes.push_back(key);
     }
 
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x,
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x,
                const std::string& key,Admission admit) {
         require(x.rows==8 && x.metadata.mul1 && !x.metadata.mcg &&
                     !x.metadata.has_bias,
                 "target K6 M1 SIMT capture contract");
-        _putenv_s("NINFER_EXL3_TARGET_K6_M1_SIMT","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_K6_M1_SIMT","0");
         Exl3CudaLinearWorkspace baseline(
             x.metadata.in_features,x.metadata.out_features,8,
             false,true,true,true,true,false,false,{}, {},true,true,true);
-        _putenv_s("NINFER_EXL3_TARGET_K6_M1_SIMT","1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_K6_M1_SIMT","1");
         Exl3CudaLinearWorkspace candidate(
             x.metadata.in_features,x.metadata.out_features,8,
             false,true,true,true,true,false,false,{}, {},true,true,true);
-        _putenv_s("NINFER_EXL3_TARGET_K6_M1_SIMT","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_K6_M1_SIMT","0");
         require(candidate.target_k6_m1_simt_candidate(x.metadata,1,admit) &&
                     !candidate.target_k6_m1_simt_candidate(x.metadata,2,admit) &&
                     !candidate.target_k6_m1_simt_candidate(
@@ -112,9 +112,9 @@ struct TargetK6M1SimtQualification {
 
 void run_target_k6_m1_simt_qualification(Exl3TextModel& target,
                                          Exl3Dflash2DraftModel& draft) {
-    require(env("NINFER_EXL3_TARGET_K6_M1_SIMT")=="0",
+    require(env("VOIDINFER_EXL3_TARGET_K6_M1_SIMT")=="0",
             "target K6 M1 SIMT capture requires construction flag0");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=512,"target K6 M1 SIMT prompt extent");
     std::vector<std::int64_t> prompt(ids.begin(),ids.begin()+512);
     TapStage stage;
@@ -149,12 +149,12 @@ void run_target_k6_m1_simt_qualification(Exl3TextModel& target,
     block.assign(1,pending);
     block.insert(block.end(),proposals.begin(),proposals.end());
 
-    TargetK6M1SimtQualification check(env("NINFER_E5A4_OUT"));
+    TargetK6M1SimtQualification check(env("VOIDINFER_E5A4_OUT"));
     context->prepare_transaction();
     context->prepare_continuation(8);
     context->set_target_projection_observer_for_test(
         TargetK6M1SimtQualification::callback,&check,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     context->begin_transaction();
     context->continue_rows(block);
     context->set_target_projection_observer_for_test(nullptr,nullptr);

@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 void timing_check(cudaError_t error, const char* operation) {
@@ -164,4 +164,4 @@ const char* target_projection_topology_name(Exl3TargetProjectionTopology topolog
     return "unknown";
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

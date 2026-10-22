@@ -46,8 +46,8 @@ void run_exact_attention_gqa_six_segmented_prefix_operator() {
             "six segmented clear candidate scores");
         const auto run=[&](const std::uint16_t* key,const std::uint16_t* value,
             DeviceBuffer& output,DeviceBuffer& scores,
-            ninfer::exl3::Exl3AttentionPageRanges pages={}) {
-            ninfer::exl3::exl3_exact_attention_for_test(
+            voidinfer::exl3::Exl3AttentionPageRanges pages={}) {
+            voidinfer::exl3::exl3_exact_attention_for_test(
                 static_cast<const std::uint16_t*>(dq.get()),key,value,
                 static_cast<std::uint16_t*>(output.get()),
                 static_cast<float*>(scores.get()),rows,position,capacity,true,
@@ -57,7 +57,7 @@ void run_exact_attention_gqa_six_segmented_prefix_operator() {
         };
         run(static_cast<const std::uint16_t*>(dk.get()),
             static_cast<const std::uint16_t*>(dv.get()),control_output,control_scores);
-        ninfer::exl3::Exl3AttentionPageRanges pages;
+        voidinfer::exl3::Exl3AttentionPageRanges pages;
         pages.append(static_cast<const std::uint16_t*>(dprefix_k.get()),
             static_cast<const std::uint16_t*>(dprefix_v.get()),0,position,position);
         run(static_cast<const std::uint16_t*>(dprivate_k.get()),
@@ -98,19 +98,19 @@ void run_exact_attention_gqa_six_segmented_prefix_operator() {
 void run_exact_attention_gqa_six_softmax_triple_values_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     const int prefix=target.max_context()>=4352?4096:96;
     require(code.size()>=prefix&&prose.size()>=prefix,
         "GQA-six softmax triple-values fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -153,26 +153,26 @@ void run_exact_attention_gqa_six_softmax_triple_values_screen(
 
 void run_exact_attention_gqa_six_softmax_triple_pair_dimensions_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()>=4352&&code.size()>=prefix,
         "pair-dimension triple-values fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -208,27 +208,27 @@ void run_exact_attention_gqa_six_softmax_triple_pair_dimensions_state(
 
 void run_exact_attention_gqa_six_softmax_six_values_single_load_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()>=4352&&code.size()>=prefix,
         "single-load six-values fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -264,34 +264,34 @@ void run_exact_attention_gqa_six_softmax_six_values_single_load_state(
 
 void run_exact_attention_gqa_six_softmax_six_values_scalar_single_load_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()>=4352&&code.size()>=prefix,
         "scalar single-load six-values fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
     for(const char* option:{
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD"})
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD"})
         _putenv_s(option,"0");
     auto control=target.create_context(true);control->prepare_continuation(8);
     _putenv_s(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
         "1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
@@ -328,35 +328,35 @@ void run_exact_attention_gqa_six_softmax_six_values_scalar_single_load_state(
 
 void run_exact_attention_gqa_six_softmax_triple_key_pair_pipeline_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()>=4352&&code.size()>=prefix,
         "key-pair pipeline fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
     for(const char* option:{
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE"})
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE"})
         _putenv_s(option,"0");
     auto control=target.create_context(true);control->prepare_continuation(8);
     _putenv_s(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_KEY_PAIR_PIPELINE",
         "1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
@@ -393,29 +393,29 @@ void run_exact_attention_gqa_six_softmax_triple_key_pair_pipeline_state(
 
 void run_exact_attention_gqa_six_softmax_triple_score_tile_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()>=4352&&code.size()>=prefix,
         "score-tile triple-values fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE","0");
     auto control=target.create_context(true);control->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE","1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
         const auto logits=context.logits_host();
@@ -451,34 +451,34 @@ void run_exact_attention_gqa_six_softmax_triple_score_tile_state(
 
 void run_exact_attention_gqa_six_softmax_triple_warp_score_broadcast_state(
     Exl3TextModel& target,const std::vector<std::int64_t>& code) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()>=4352&&code.size()>=prefix,
         "warp-score-broadcast triple-values fixture/context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","1");
     for(const char* option:{
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST"})
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_V_TILE64",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FULL_CTA",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_THREADS128",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCORE_TILE",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_PAIR_DIMENSIONS",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_SCALAR_DIM",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_TWO_QUERY",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_FUSED",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SINGLE_LOAD",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_SIX_VALUES_SCALAR_SINGLE_LOAD",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST"})
         _putenv_s(option,"0");
     auto control=target.create_context(true);control->prepare_continuation(8);
     _putenv_s(
-        "NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
+        "VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES_WARP_SCORE_BROADCAST",
         "1");
     auto candidate=target.create_context(true);candidate->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {

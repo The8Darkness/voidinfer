@@ -7,9 +7,9 @@ void run_t81_cached_prefix_c4_admission(
     const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
     constexpr std::size_t kPromptRows = 4096;
     constexpr std::size_t kPrefixRows = 3968;
     constexpr std::size_t kTailRows = 128;
@@ -22,8 +22,8 @@ void run_t81_cached_prefix_c4_admission(
             "T81 output must be new");
     std::filesystem::create_directories(output);
 
-    const auto reserve_gib = std::stoull(env("NINFER_T81_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T81_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T81_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T81_CACHE_MIB"));
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
     const std::uint64_t cache_budget = cache_mib * (1ULL << 20);
     require(reserve_gib >= 8 && cache_mib >= 1024,
@@ -41,13 +41,13 @@ void run_t81_cached_prefix_c4_admission(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T81_NAMESPACE"), env("NINFER_T81_ARTIFACT_ID"),
-        env("NINFER_T81_TOKENIZER_ID"), env("NINFER_T81_CONFIGURATION_ID"),
-        env("NINFER_T81_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T81_NAMESPACE"), env("VOIDINFER_T81_ARTIFACT_ID"),
+        env("VOIDINFER_T81_TOKENIZER_ID"), env("VOIDINFER_T81_CONFIGURATION_ID"),
+        env("VOIDINFER_T81_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{8, 64, cache_budget, reserve}, identity);
-    ninfer::exl3::Exl3HostResidentSet residency(
+    voidinfer::exl3::Exl3HostResidentSet residency(
         memory.ullTotalPhys - reserve, reserve);
 
     std::vector<std::int64_t> common(code.begin(), code.begin() + kPrefixRows);
@@ -71,14 +71,14 @@ void run_t81_cached_prefix_c4_admission(
                     "T81 tails must be pairwise distinct");
 
     struct LockResult {
-        ninfer::exl3::Exl3HostResidentSet::Stats update;
+        voidinfer::exl3::Exl3HostResidentSet::Stats update;
         Exl3HostResidency observed;
     };
     const auto pin = [&](const std::array<std::shared_ptr<const Request>, 4>* active = nullptr) {
         auto roots = cache.roots();
         if (active)
             for (const auto& root : *active) roots.push_back(root);
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         for (const auto& root : roots) snapshot.owners.push_back(root);
         Request::visit_host_allocations(roots,
             [&](const void* data, std::size_t bytes) { snapshot.add(data, bytes); },
@@ -160,7 +160,7 @@ void run_t81_cached_prefix_c4_admission(
         }
     }
 
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "0");
     auto draft_b = Exl3Dflash2DraftModel::load(draft_path);
     TargetGraphC2VerifierLane lane_a(target, draft_a, prompts[0]);
     TargetGraphC2VerifierLane lane_b(target, *draft_b, prompts[1]);

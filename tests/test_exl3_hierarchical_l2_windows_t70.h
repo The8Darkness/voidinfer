@@ -4,29 +4,29 @@ void run_hierarchical_l2_windows_t70(
     Exl3TextModel& target, Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Frontiers = ninfer::exl3::Exl3HierarchyFrontiers;
-    using L1 = ninfer::exl3::Exl3TurboAngleL1Context;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Frontiers = voidinfer::exl3::Exl3HierarchyFrontiers;
+    using L1 = voidinfer::exl3::Exl3TurboAngleL1Context;
     constexpr int prefix = 96, budget = 64, block = 4;
     require(target.max_context() == 256 && code.size() >= prefix &&
             prose.size() >= prefix, "T70 fixture/context extent");
     run_hierarchical_frontier_logic();
 
-    _putenv_s("NINFER_EXL3_WIDE_PREFILL", "0");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_REDUCTION", "0");
-    _putenv_s("NINFER_EXL3_SHARED_ACCUM", "0");
-    _putenv_s("NINFER_EXL3_SHARED_TRANSFORM", "0");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH", "0");
-    _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB", "0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL", "1");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+    _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL", "0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION", "0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_ACCUM", "0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_TRANSFORM", "0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH", "0");
+    _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL", "1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     auto exact = target.create_context(true);
     exact->prepare_continuation(8);
     const auto exact_persistent = exact->persistent_bytes();
 
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "1");
     auto l0 = target.create_context(true);
     auto l1_native = target.create_context(true);
     require(l0->try_enable_oscar_from_environment() &&
@@ -140,7 +140,7 @@ void run_hierarchical_l2_windows_t70(
                     return result;
                 }
                 if (std::any_of(pending.begin(), pending.end(), [&](auto token) {
-                        return ninfer::exl3::exl3_terminal_token(token, terminal);
+                        return voidinfer::exl3::exl3_terminal_token(token, terminal);
                     })) break;
             }
             require(!pending.empty() && pending.size() <=
@@ -241,13 +241,13 @@ void run_hierarchical_l2_windows_t70(
     for (const auto& [name, source] :
          std::array<std::pair<const char*, const std::vector<std::int64_t>*>, 2>{
              std::pair{"code", &code}, std::pair{"prose", &prose}}) {
-        _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-        _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+        _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
         const auto root = Request::initialize(*exact,
             std::span<const std::int64_t>(source->data(), prefix), 8);
         const auto compact = root->compact_draft(draft, staging);
         std::vector<std::int64_t> reference;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> reference50;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> reference50;
         exact->restore_exact_host_state(*root->state());
         for (int row = 0; row < budget; ++row) {
             const auto token = greedy(*exact);

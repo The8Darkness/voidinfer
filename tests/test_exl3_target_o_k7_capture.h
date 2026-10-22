@@ -6,7 +6,7 @@
 using TargetOK7CapturedProjection = TargetK6CapturedProjection;
 
 void capture_target_o_k7_projection(
-    const ninfer::exl3::Exl3TargetProjectionObservation& observation,
+    const voidinfer::exl3::Exl3TargetProjectionObservation& observation,
     void* user) {
     require(observation.rows == 8 && observation.operation != nullptr &&
                 std::strcmp(observation.operation, "o") == 0 &&
@@ -26,17 +26,17 @@ std::vector<TargetOK7CapturedProjection> run_target_o_k7_capture(
     require(target.max_context() >= 520,
             "target O K7 capture requires context capacity at least 520");
     require(oscar, "target O K7 capture requires canonical OSCAR");
-    require(env("NINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
-                env("NINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
+    require(env("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M") == "1" &&
+                env("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M") == "1",
             "target O K7 capture requires accepted gate/up and down candidates");
     for (const char* name : {
-             "NINFER_EXL3_TARGET_PROJECTION_TIMING",
-             "NINFER_EXL3_TARGET_PROJECTION_TIMING_OUT",
-             "NINFER_EXL3_LARGE_DOWN_TOPOLOGY",
-             "NINFER_EXL3_LARGE_DOWN_SPLITS",
-             "NINFER_EXL3_GENERIC_SPLITS",
-             "NINFER_EXL3_H6_SMALL_M",
-             "NINFER_EXL3_DRAFT_SMALL_M"}) {
+             "VOIDINFER_EXL3_TARGET_PROJECTION_TIMING",
+             "VOIDINFER_EXL3_TARGET_PROJECTION_TIMING_OUT",
+             "VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY",
+             "VOIDINFER_EXL3_LARGE_DOWN_SPLITS",
+             "VOIDINFER_EXL3_GENERIC_SPLITS",
+             "VOIDINFER_EXL3_H6_SMALL_M",
+             "VOIDINFER_EXL3_DRAFT_SMALL_M"}) {
         require(env(name).empty(),
                 std::string("target O K7 capture forbids override ") + name);
     }
@@ -106,7 +106,7 @@ std::vector<TargetOK7CapturedProjection> run_target_o_k7_capture(
     captured.reserve(expected_records);
     context->set_target_projection_observer_for_test(
         capture_target_o_k7_projection, &captured, nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::output_k7);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::output_k7);
     bool observer_installed = true;
     try {
         context->begin_transaction();

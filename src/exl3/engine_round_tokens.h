@@ -1,12 +1,12 @@
 #pragma once
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 #include <array>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 class EngineRoundTokenStorage {
     // Fixed request-owned capacity includes two dependent B8 blocks. This
     // storage bound does not change the legal per-call verifier horizon.

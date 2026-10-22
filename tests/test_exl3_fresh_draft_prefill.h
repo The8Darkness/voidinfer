@@ -29,7 +29,7 @@ inline void fresh_draft_equal(const FreshDraftProposal& a,const FreshDraftPropos
         a.topk==b.topk && a.proposal==b.proposal && a.values.size()==b.values.size() &&
         std::memcmp(a.values.data(),b.values.data(),a.values.size()*sizeof(float))==0;
     if(!exact) {
-        const auto root=std::filesystem::path(env("NINFER_E5A4_OUT"));
+        const auto root=std::filesystem::path(env("VOIDINFER_E5A4_OUT"));
         auto save=[&](const std::string& name,const auto& values){std::ofstream f(root/(label+"-"+name+".bin"),std::ios::binary);f.write(reinterpret_cast<const char*>(values.data()),values.size()*sizeof(values[0]));require(f.good(),"fresh failure payload write");};
         save("reference-attention",a.attention.bytes);save("candidate-attention",b.attention.bytes);
         save("reference-head",a.head);save("candidate-head",b.head);save("reference-logits",a.logits);save("candidate-logits",b.logits);
@@ -40,8 +40,8 @@ inline void fresh_draft_equal(const FreshDraftProposal& a,const FreshDraftPropos
 void run_fresh_draft_prefill_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
                                          const std::vector<std::int64_t>& ids) {
     require(target.max_context()>=8192 && ids.size()>=4097,"fresh draft oracle requires8192 capacity and4097 real rows");
-    require(env("NINFER_EXL3_TARGET_QKV_K6_SMALL_M")=="1","fresh draft oracle P9 flag1");
-    const auto directory=std::filesystem::path(env("NINFER_E5A4_OUT"));
+    require(env("VOIDINFER_EXL3_TARGET_QKV_K6_SMALL_M")=="1","fresh draft oracle P9 flag1");
+    const auto directory=std::filesystem::path(env("VOIDINFER_E5A4_OUT"));
     require(!std::filesystem::exists(directory) && std::filesystem::create_directories(directory),"fresh draft new evidence directory");
     std::ofstream report(directory/"cases.csv");report<<"length,start,partition,submitted,encoded,skipped,physical_slots,layers,proposals,observed_bytes_per_proposal,exact\n";
     auto ctx=target.create_context(true);require(ctx->try_enable_oscar_from_environment(),"fresh draft target OSCAR");

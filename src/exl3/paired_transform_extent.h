@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 enum class Exl3PairedTransformAdmission {
     admitted, disabled, invalid_rows, timing, observer, preserved_multirow
 };
@@ -45,4 +45,4 @@ inline void exl3_require_paired_transform_extents(int rows,int features,
                addresses[other]<addresses[output]+sizes[output])
                 throw std::invalid_argument("paired transform overlapping live buffers");
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

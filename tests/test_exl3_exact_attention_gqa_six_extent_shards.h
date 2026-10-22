@@ -3,22 +3,22 @@
 void run_exact_attention_gqa_six_extent_shards_screen(
     Exl3TextModel& target,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==4352,
         "GQA-six extent-shards screen context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE","");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED","");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","0");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES","0");
-    const int measured_pairs=env_int("NINFER_T23_MEASURED_PAIRS",4);
-    const bool candidate_uses_default=env_int("NINFER_T23_CANDIDATE_DEFAULT",0)==1;
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE","");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_SOFTMAX_STAGED","");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_VALUES_SHARDED","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_TRIPLE_VALUES4","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SOFTMAX_TRIPLE_VALUES","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_PACKED_TRIPLES","0");
+    const int measured_pairs=env_int("VOIDINFER_T23_MEASURED_PAIRS",4);
+    const bool candidate_uses_default=env_int("VOIDINFER_T23_CANDIDATE_DEFAULT",0)==1;
     require(measured_pairs>=1&&measured_pairs<=4,
         "GQA-six extent-shards measured pair extent");
     const auto greedy=[](Exl3TextContext& context) {
@@ -33,7 +33,7 @@ void run_exact_attention_gqa_six_extent_shards_screen(
         double prefill_ms=0;
         double route_ms=0;
         std::vector<std::int64_t> tokens;
-        std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;
+        std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;
     };
     for(const int prefix:std::array<int,2>{512,4096}) {
         for(const auto& fixture:std::array<
@@ -43,9 +43,9 @@ void run_exact_attention_gqa_six_extent_shards_screen(
                 "GQA-six extent-shards fixture extent");
             const std::vector<std::int64_t> input(
                 fixture.second->begin(),fixture.second->begin()+prefix);
-            _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS","0");
+            _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS","0");
             auto control=target.create_context(true);control->prepare_continuation(8);
-            _putenv_s("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS",
+            _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_EXTENT_SHARDS",
                 candidate_uses_default?"":"1");
             auto candidate=target.create_context(true);candidate->prepare_continuation(8);
             const auto run=[&](Exl3TextContext& context) {

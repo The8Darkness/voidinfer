@@ -1,8 +1,8 @@
 #pragma once
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 #include "exl3/resource_inventory.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Fixed option objects belong to Request::Storage. Count dynamic capacities,
 // conservatively including inline string bytes; exclude allocator overhead.
 inline std::uint64_t request_stop_storage_bytes(const StopPolicy& stop) {

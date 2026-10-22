@@ -13,7 +13,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer {
+namespace voidinfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
@@ -373,4 +373,4 @@ private:
     std::vector<std::uint32_t> row_generations_;
 };
 
-} // namespace ninfer
+} // namespace voidinfer

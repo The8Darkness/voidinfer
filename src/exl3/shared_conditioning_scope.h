@@ -1,7 +1,7 @@
 #pragma once
 #include "exl3/vericache_request.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // A supplied projection root may be the acquired root or one verified private
 // transition from it. This is a conditioning check, not a lease-authority check.
 inline bool shared_conditioning_scope_valid(

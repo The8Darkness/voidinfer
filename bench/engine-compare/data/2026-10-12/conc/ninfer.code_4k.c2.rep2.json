@@ -1,0 +1,22 @@
+{
+ "engine": "ninfer",
+ "kv": "fp8",
+ "spec": "dflash2",
+ "conc": 2,
+ "prompt": "code_4k",
+ "wall_s": 6.022216796875,
+ "completion_tokens": 2048,
+ "aggregate_tps": 340.07410710666073,
+ "per_request": [
+  {
+   "s": 5.207888841629028,
+   "tokens": 1024,
+   "tps": 196.62478043208247
+  },
+  {
+   "s": 6.020216464996338,
+   "tokens": 1024,
+   "tps": 170.09355161129125
+  }
+ ]
+}

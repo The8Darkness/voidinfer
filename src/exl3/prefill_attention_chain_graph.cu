@@ -8,7 +8,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 struct GlobalCounters {
     std::atomic<std::uint64_t> capture_setups{0},captures{0},replays{0};
@@ -41,10 +41,10 @@ struct Exl3PrefillAttentionChainGraph::Impl {
 
 Exl3PrefillAttentionChainGraph::Exl3PrefillAttentionChainGraph()
     : impl_(std::make_unique<Impl>()) {
-    const char* value=std::getenv("NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
+    const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH");
     if(value && std::strcmp(value,"0")!=0 && std::strcmp(value,"1")!=0)
         throw std::invalid_argument(
-            "NINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH must be 0 or 1");
+            "VOIDINFER_EXL3_PREFILL_ATTENTION_CHAIN_GRAPH must be 0 or 1");
     impl_->enabled=value && std::strcmp(value,"1")==0;
 }
 
@@ -168,4 +168,4 @@ exl3_prefill_attention_chain_global_snapshot() noexcept {
     return result;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -1,0 +1,45 @@
+{
+ "agents": 8,
+ "chars": 400000,
+ "tokens": 256,
+ "turns": [
+  {
+   "turn": 0,
+   "wall_s": 309.8359076976776,
+   "ok": 8,
+   "errors": [],
+   "prompt_tokens": 865256,
+   "completion_tokens": 2048,
+   "per_request_s": [
+    286.2,
+    252.4,
+    238.0,
+    123.6,
+    166.4,
+    309.7,
+    148.6,
+    206.3
+   ],
+   "peak_gpu_mib": 27533
+  },
+  {
+   "turn": 1,
+   "wall_s": 11.245587587356567,
+   "ok": 8,
+   "errors": [],
+   "prompt_tokens": 867536,
+   "completion_tokens": 2048,
+   "per_request_s": [
+    1.2,
+    2.6,
+    3.9,
+    8.1,
+    9.9,
+    5.6,
+    6.7,
+    11.2
+   ],
+   "peak_gpu_mib": 27533
+  }
+ ]
+}

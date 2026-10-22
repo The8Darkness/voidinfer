@@ -4,12 +4,12 @@
 #include "test_exl3_packed_projection_prefix.h"
 
 inline void run_packed_head_projection(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     constexpr int hidden=5120,vocab=248320;
     require(source.size()>=1040,"held head needs two real requests");
     struct Capture {std::shared_ptr<DeviceBuffer> input;Exl3CudaLinearWeights weights{};Exl3CudaLinearMetadata metadata{};};
     std::array<Capture,2> captures;
-    const bool observe_families=env("NINFER_TEST_HELD_TARGET_FAMILY_OFFERS")=="1";
+    const bool observe_families=env("VOIDINFER_TEST_HELD_TARGET_FAMILY_OFFERS")=="1";
     for(int lane=0;lane<2;++lane) {
         std::uint32_t offered_families=0;
         auto context=target.create_context(true);

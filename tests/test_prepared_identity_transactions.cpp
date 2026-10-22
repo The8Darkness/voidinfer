@@ -2,7 +2,7 @@
 #include <limits>
 #include <iostream>
 
-namespace family = ninfer::targets::qwen3_6;
+namespace family = voidinfer::targets::qwen3_6;
 using family::detail::ResidentPrefixIdentity;
 using family::detail::PrefixShortlistDigests;
 
@@ -27,7 +27,7 @@ int main() {
         shortlist.assign(prompt);
         const auto original = identity;
         const auto digest = shortlist.at(2);
-        const std::array<ninfer::TokenId, 2> suffix{9, 10};
+        const std::array<voidinfer::TokenId, 2> suffix{9, 10};
         // The first new position fits, the second overflows. Neither operation
         // may retain the first position/token when the complete append fails.
         const auto delta = std::numeric_limits<std::int32_t>::max() - 2;
@@ -53,9 +53,9 @@ int main() {
         item.token_spans = {{0, 2}};
         item.timestamps = {0.0};
         prompt.vision_items = {item};
-        ninfer::exl3::Exl3PreparedIdentity bf16(prompt);
-        prompt.vision_items[0].patch_storage = ninfer::VisionPatchStorage::Float16;
-        ninfer::exl3::Exl3PreparedIdentity fp16(prompt);
+        voidinfer::exl3::Exl3PreparedIdentity bf16(prompt);
+        prompt.vision_items[0].patch_storage = voidinfer::VisionPatchStorage::Float16;
+        voidinfer::exl3::Exl3PreparedIdentity fp16(prompt);
         need(!bf16.equals(fp16), "different encoder representations alias");
         need(!bf16.append_text(1)->equals(*fp16.append_text(1)),
              "generated append lost encoder representation");

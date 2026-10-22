@@ -1,23 +1,23 @@
 #pragma once
 
 void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& draft) {
-    const auto directory=std::filesystem::path(env("NINFER_E5A4_OUT"));
+    const auto directory=std::filesystem::path(env("VOIDINFER_E5A4_OUT"));
     require(!directory.empty() && !std::filesystem::exists(directory),"chunk qualification output must be new");
     std::filesystem::create_directories(directory);
     std::ofstream out(directory/"boundaries.csv");
     out << "position,rows,taps_exact,full_state_checked,continuation_bytes\n";
-    require(env("NINFER_EXL3_WIDE_PREFILL")=="1","wide state needs flag1");
-    auto source=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
-    const int total=env_int("NINFER_E5A4_CONTEXTS",512);
+    require(env("VOIDINFER_EXL3_WIDE_PREFILL")=="1","wide state needs flag1");
+    auto source=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
+    const int total=env_int("VOIDINFER_E5A4_CONTEXTS",512);
     require((total==512 || total==2080 || total==4160) && target.max_context()>=total+16,"chunk qualification extent");
     std::vector<std::int64_t> ids(total+16);
     for(std::size_t i=0;i<ids.size();++i) ids[i]=source[i%source.size()];
-    const auto gdn_slab_setting=env("NINFER_EXL3_GDN_WIDE_SLAB");
+    const auto gdn_slab_setting=env("VOIDINFER_EXL3_GDN_WIDE_SLAB");
     {
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
-        _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB","0");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
+        _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB","0");
         auto disabled=target.create_context(true);
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","1");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","1");
         require(disabled->try_enable_oscar_from_environment(),"disabled wide context OSCAR");
         disabled->prefill(std::span<const std::int64_t>(ids.data(),16));
         const auto before=prefix_retention_snapshot(*disabled);
@@ -29,38 +29,38 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
     // The serial reference needs no expanded64 scratch. Its M1 arithmetic is
     // unchanged; keep the qualified32 allocation to avoid two wide contexts
     // exhausting VRAM during the long serial oracle phase.
-    const auto wide64_setting=env("NINFER_EXL3_PREFILL_WIDE64");
-    _putenv_s("NINFER_EXL3_PREFILL_WIDE64","0");
-    const auto shared_layer_setting=env("NINFER_EXL3_SHARED_LAYER_SCRATCH");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-    const auto direct_async_a_setting=env("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A","0");
-    const auto direct_partials_setting=env("NINFER_EXL3_PREFILL_DIRECT_PARTIALS");
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_PARTIALS","0");
-    const auto staged_shape4_setting=env("NINFER_EXL3_PREFILL_STAGED_SHAPE4");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_SHAPE4","0");
+    const auto wide64_setting=env("VOIDINFER_EXL3_PREFILL_WIDE64");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE64","0");
+    const auto shared_layer_setting=env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+    const auto direct_async_a_setting=env("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A","0");
+    const auto direct_partials_setting=env("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS","0");
+    const auto staged_shape4_setting=env("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4","0");
     auto reference=[&] {
         struct ScopedRowpairOff {
-            std::string saved=env("NINFER_EXL3_PREFILL_ROWPAIR_K6");
-            ScopedRowpairOff(){_putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6","0");}
-            ~ScopedRowpairOff(){_putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6",saved.c_str());}
+            std::string saved=env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6");
+            ScopedRowpairOff(){_putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6","0");}
+            ~ScopedRowpairOff(){_putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6",saved.c_str());}
         } off;
         return target.create_context(true);
     }();
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_SHAPE4",staged_shape4_setting.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_PARTIALS",direct_partials_setting.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A",direct_async_a_setting.c_str());
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH",shared_layer_setting.c_str());
-    _putenv_s("NINFER_EXL3_PREFILL_WIDE64",wide64_setting.c_str());
-    _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB",gdn_slab_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_SHAPE4",staged_shape4_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",direct_partials_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A",direct_async_a_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH",shared_layer_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE64",wide64_setting.c_str());
+    _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB",gdn_slab_setting.c_str());
     auto candidate=target.create_context(true);
     {
         struct ScopedSerialOscarEnvironment {
             std::vector<std::pair<std::string,std::string>> saved;
             ScopedSerialOscarEnvironment() {
-                for(const char* name : {"NINFER_OSCAR_PREFILL_PACKED_BYTE4", "NINFER_OSCAR_PREFILL_QUERY_PARALLEL",
-                    "NINFER_OSCAR_PREFILL_PARALLEL_MERGE", "NINFER_OSCAR_PREFILL_PARALLEL_SCORES",
-                    "NINFER_OSCAR_PREFILL_COALESCED_ROTATIONS"}) {
+                for(const char* name : {"VOIDINFER_OSCAR_PREFILL_PACKED_BYTE4", "VOIDINFER_OSCAR_PREFILL_QUERY_PARALLEL",
+                    "VOIDINFER_OSCAR_PREFILL_PARALLEL_MERGE", "VOIDINFER_OSCAR_PREFILL_PARALLEL_SCORES",
+                    "VOIDINFER_OSCAR_PREFILL_COALESCED_ROTATIONS"}) {
                     saved.emplace_back(name,env(name));
                     _putenv_s(name,"0");
                 }
@@ -91,7 +91,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
     {
         const auto before=prefix_retention_snapshot(*candidate);
         reject([&]{candidate->append_prefill_wide({});});
-        std::vector<std::int64_t> oversized((env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16)+1,0);
+        std::vector<std::int64_t> oversized((env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16)+1,0);
         reject([&]{candidate->append_prefill_wide(oversized);});
         reject([&]{candidate->append_prefill(std::span<const std::int64_t>(ids.data(),9));});
         std::int64_t bad=-1;
@@ -117,7 +117,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
         reference_taps[t].reserve(static_cast<std::size_t>(total)*kHidden);
     }
     draft.reset();commit_current_rows(*candidate,draft,stage,16,0);
-    if (env("NINFER_DFLASH2_PREFILL_BATCH")=="1") {
+    if (env("VOIDINFER_DFLASH2_PREFILL_BATCH")=="1") {
         const auto digest=draft.ring_digest();
         const auto base=draft.ring_base_abs();const auto size=draft.ring_count();
         const auto taps=const_cast<const std::uint16_t**>(stage.bulk_ptrs.data());
@@ -133,7 +133,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
         require(draft.ring_digest()==digest && draft.ring_base_abs()==base &&
                 draft.ring_count()==size,"draft prefill rejection mutated ring");
     }
-    const int width=env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
+    const int width=env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
     int next_width=1,boundaries=0,last_state_cut=16;
     // All128 operator widths are checked separately. Exercise every16-row
     // boundary and tail transition here without doubling the serial context.
@@ -170,7 +170,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
         require(candidate->embedding_bits_host_for_test()==embeddings,"chunk embedding mismatch");
         require(target_continue_device_bits(candidate->logits_device(),kVocab,"chunk logits")==
                 target_continue_device_bits(reference->logits_device(),kVocab,"serial logits"),"chunk final-row logits mismatch");
-        if(env("NINFER_EXL3_SHARED_LAYER_SCRATCH")=="1") {
+        if(env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH")=="1") {
             for(int layer=3;layer<64;layer+=4) {
                 const auto actual=candidate->full_attention_qkv_host(layer);
                 const auto expected=reference->full_attention_qkv_host(layer);
@@ -260,7 +260,7 @@ void run_wide_prefill_state_qualification(Exl3TextModel& target, Exl3Dflash2Draf
     std::ofstream result(directory/"result.txt");
     result << "PASS total=" << total << " max_width=" << width << " boundaries=" << boundaries
            << " all_taps_embeddings_logits=exact native_state=exact ring_digest=exact target_only=exact next8=exact extra_workspace=0"
-           << " qkv_last_row=" << (env("NINFER_EXL3_SHARED_LAYER_SCRATCH")=="1" ? "exact" : "not_requested") << "\n";
+           << " qkv_last_row=" << (env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH")=="1" ? "exact" : "not_requested") << "\n";
     require(result.good(),"chunk result write");
     std::cout << "WIDE_PREFILL_STATE PASS total=" << total << " boundaries=" << boundaries << "\n";
 }

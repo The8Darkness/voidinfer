@@ -3,7 +3,7 @@
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <array>
 #include <cstddef>
@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace voidinfer::targets::qwen3_6::frontend_internal {
 
 class MediaPreprocessCache;
 
@@ -206,4 +206,4 @@ private:
     std::shared_ptr<MediaPreprocessCache> media_cache_;
 };
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace voidinfer::targets::qwen3_6::frontend_internal

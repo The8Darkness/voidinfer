@@ -1,10 +1,10 @@
 #pragma once
 
 void run_hierarchical_4k_profile(Exl3TextModel& target) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using ninfer::exl3::Exl3TextContext;
-    using ninfer::exl3::Exl3TurboAngleL1Context;
-    using ninfer::exl3::Exl3TurboAngleL1Stats;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using voidinfer::exl3::Exl3TextContext;
+    using voidinfer::exl3::Exl3TurboAngleL1Context;
+    using voidinfer::exl3::Exl3TurboAngleL1Stats;
     constexpr int block=4;
     require(target.max_context()==4352,"hierarchical 4K profile context extent");
     auto greedy=[](Exl3TextContext& context) {
@@ -13,30 +13,30 @@ void run_hierarchical_4k_profile(Exl3TextModel& target) {
             [](float value){return !std::isfinite(value);}),"hierarchical 4K finite logits");
         return static_cast<std::int64_t>(std::max_element(logits.begin(),logits.end())-logits.begin());
     };
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
-    _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
-    _putenv_s("NINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
-    _putenv_s("NINFER_EXL3_SHARED_ACCUM","0");
-    _putenv_s("NINFER_EXL3_SHARED_TRANSFORM","0");
-    _putenv_s("NINFER_EXL3_SHARED_LAYER_SCRATCH","0");
-    _putenv_s("NINFER_EXL3_GDN_WIDE_SLAB","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_ACCUM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_TRANSFORM","0");
+    _putenv_s("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH","0");
+    _putenv_s("VOIDINFER_EXL3_GDN_WIDE_SLAB","0");
     auto l0=target.create_context(true),l1_native=target.create_context(true);
     require(l0->try_enable_oscar_from_environment() && l1_native->try_enable_oscar_from_environment(),
         "hierarchical 4K OSCAR contexts");
     std::unique_ptr<Exl3TurboAngleL1Context> l1;
     for(const std::string fixture:{"code","prose"}) {
-        const auto ids=load_ids((std::filesystem::path(env("NINFER_COMPACT_PERF_DIR"))/(fixture+".ids")).string());
+        const auto ids=load_ids((std::filesystem::path(env("VOIDINFER_COMPACT_PERF_DIR"))/(fixture+".ids")).string());
         require(ids.size()==4096,"hierarchical 4K fixture extent");
         const auto prefill_start=std::chrono::steady_clock::now();
         const auto request=Request::initialize(*exact,ids,1024);
         const auto root=request->state();
         const double prefill_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-prefill_start).count();
         std::array<std::int64_t,block> reference{};
-        std::array<std::shared_ptr<const ninfer::exl3::Exl3ExactHostState>,block> reference_states;
+        std::array<std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState>,block> reference_states;
         exact->restore_exact_host_state(*root);
         for(int row=0;row<block;++row) {
             reference[row]=greedy(*exact);exact->decode(reference[row]);
@@ -48,7 +48,7 @@ void run_hierarchical_4k_profile(Exl3TextModel& target) {
         std::array<std::int64_t,block> w_candidates{};
         for(auto& token:w_candidates) {token=greedy(*l0);l0->decode(token);}
         const auto w_proposed=std::chrono::steady_clock::now();
-        const auto w_verified=ninfer::exl3::verify_exl3_outer_batched_reference(
+        const auto w_verified=voidinfer::exl3::verify_exl3_outer_batched_reference(
             *exact,*root,w_candidates,false,{},nullptr,true);
         const auto w_end=std::chrono::steady_clock::now();
         require(std::equal(w_verified.committed_tokens.begin(),w_verified.committed_tokens.end(),reference.begin()) &&
@@ -69,9 +69,9 @@ void run_hierarchical_4k_profile(Exl3TextModel& target) {
         const auto screened=l1->screen(c_candidates);
         const auto c_screened=std::chrono::steady_clock::now();
         const auto c_verified=screened.authorized_tokens.size()==1
-            ? ninfer::exl3::verify_exl3_outer_reference(
+            ? voidinfer::exl3::verify_exl3_outer_reference(
                 *exact,*root,screened.authorized_tokens,false,{},nullptr,true)
-            : ninfer::exl3::verify_exl3_outer_batched_reference(
+            : voidinfer::exl3::verify_exl3_outer_batched_reference(
                 *exact,*root,screened.authorized_tokens,false,{},nullptr,true);
         const auto c_released=std::chrono::steady_clock::now();
         require(std::equal(c_verified.committed_tokens.begin(),c_verified.committed_tokens.end(),reference.begin()) &&

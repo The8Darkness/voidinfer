@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 template<class Request> class ReservedRequestQueue {
 public:
     using Entry=std::shared_ptr<Request>;

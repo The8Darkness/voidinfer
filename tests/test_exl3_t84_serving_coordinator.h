@@ -9,19 +9,19 @@ void run_t84_serving_coordinator(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using Coordinator = ninfer::exl3::Exl3VeriCacheServingCoordinator;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using Coordinator = voidinfer::exl3::Exl3VeriCacheServingCoordinator;
     constexpr std::size_t kPrompt = 4096;
     constexpr std::size_t kPrefix = 3968;
     constexpr std::size_t kTail = 128;
     constexpr int kOutputs = 8;
-    require(unsigned(env("NINFER_TEST_RESIDENT_CLOSE_QUARANTINE")=="1") +
-            unsigned(env("NINFER_TEST_RESIDENT_POISON_METADATA")=="1") +
-            unsigned(env("NINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="1" ||
-                     env("NINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="startup") +
-            unsigned(env("NINFER_TEST_COORDINATOR_LATE_RELEASE")=="1") <= 1,
+    require(unsigned(env("VOIDINFER_TEST_RESIDENT_CLOSE_QUARANTINE")=="1") +
+            unsigned(env("VOIDINFER_TEST_RESIDENT_POISON_METADATA")=="1") +
+            unsigned(env("VOIDINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="1" ||
+                     env("VOIDINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="startup") +
+            unsigned(env("VOIDINFER_TEST_COORDINATOR_LATE_RELEASE")=="1") <= 1,
             "T84 terminal quarantine modes require separate processes");
     require(target.max_context() >= 4352 && code.size() >= kPrompt &&
                 prose.size() >= 2 * kTail,
@@ -29,8 +29,8 @@ void run_t84_serving_coordinator(
     require(!output.empty() && !std::filesystem::exists(output),
             "T84 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib = std::stoull(env("NINFER_T84_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T84_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T84_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T84_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024,
             "T84 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
@@ -47,11 +47,11 @@ void run_t84_serving_coordinator(
         return state.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T84_NAMESPACE"), env("NINFER_T84_ARTIFACT_ID"),
-        env("NINFER_T84_TOKENIZER_ID"), env("NINFER_T84_CONFIGURATION_ID"),
-        env("NINFER_T84_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T84_NAMESPACE"), env("VOIDINFER_T84_ARTIFACT_ID"),
+        env("VOIDINFER_T84_TOKENIZER_ID"), env("VOIDINFER_T84_CONFIGURATION_ID"),
+        env("VOIDINFER_T84_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{8, 64, cache_budget, reserve}, identity);
     auto context_a = target.create_context(true);
     auto context_b = target.create_context(true);
@@ -84,7 +84,7 @@ void run_t84_serving_coordinator(
 
     {
         std::vector<std::shared_ptr<const Request>> roots;
-        ninfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
+        voidinfer::exl3::Exl3HostResidentSet::Snapshot snapshot;
         snapshot.reserve_regions(2);
         const auto* range_backing=snapshot.regions.data();
         const auto range_capacity=snapshot.regions.capacity();
@@ -104,18 +104,18 @@ void run_t84_serving_coordinator(
         auto descriptor_payload=std::make_shared<const int>(7);
         std::weak_ptr<const int> retained_payload=descriptor_payload;
         snapshot.owners.push_back(descriptor_payload);descriptor_payload.reset();
-        const auto descriptor_bytes=ninfer::exl3::bounded_shared_allocation_bytes<
-            ninfer::exl3::Exl3HostResidentSet::Snapshot::DescriptorBacking>()+
+        const auto descriptor_bytes=voidinfer::exl3::bounded_shared_allocation_bytes<
+            voidinfer::exl3::Exl3HostResidentSet::Snapshot::DescriptorBacking>()+
             snapshot.owners.capacity()*sizeof(std::shared_ptr<const void>)+
-            snapshot.regions.capacity()*sizeof(ninfer::exl3::Exl3HostResidentSet::Range);
+            snapshot.regions.capacity()*sizeof(voidinfer::exl3::Exl3HostResidentSet::Range);
         snapshot.retain_descriptors();
-        const auto domain=static_cast<unsigned>(ninfer::exl3::Exl3ResourceInventory::Domain::host_metadata);
+        const auto domain=static_cast<unsigned>(voidinfer::exl3::Exl3ResourceInventory::Domain::host_metadata);
         require(snapshot.resources.totals()[domain]==descriptor_bytes &&
             snapshot.descriptor_backing->regions.data()==range_backing && !retained_payload.expired(),
             "T024 descriptor backing charge lost vector allocation or payload ownership");
         auto retained_inventory=snapshot.resources;
-        using Snapshot=ninfer::exl3::Exl3HostResidentSet::Snapshot;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Snapshot=voidinfer::exl3::Exl3HostResidentSet::Snapshot;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         require(Snapshot::descriptor_requirement(snapshot.descriptor_backing->owners.capacity(),
             snapshot.descriptor_backing->regions.capacity()).units[domain]==descriptor_bytes,
             "T024 snapshot planned and retained descriptor accounting diverged");
@@ -169,8 +169,8 @@ void run_t84_serving_coordinator(
             "T024 root snapshot retained stale output or replaced backing on reuse");
     }
     {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto required=Registry::Snapshot::descriptor_requirement(1,0);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
@@ -184,17 +184,17 @@ void run_t84_serving_coordinator(
             auto owner=std::make_shared<const int>(11);private_payload=owner;
             result.owners.push_back(std::move(owner));return result;
         },[&]{assessed=true;},[&](auto){locked=true;});}
-        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && constructed && assessed && !locked && private_payload.expired(),
             "T024 missing rollback scratch credit reached locks or retained private owner");
         registry.close();
     }
     {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        using Ledger=ninfer::exl3::RetainedDescriptorLedger;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        using Ledger=voidinfer::exl3::RetainedDescriptorLedger;
         {
-            using PayloadLedger=ninfer::exl3::RetainedHostAllocationLedger;
+            using PayloadLedger=voidinfer::exl3::RetainedHostAllocationLedger;
             struct Payload {
                 PayloadLedger::Ticket ticket;
                 alignas(4096) std::array<std::byte,4096> data{};
@@ -204,7 +204,7 @@ void run_t84_serving_coordinator(
             auto owner=std::make_shared<Payload>(payload_registry.reserve_host_payload_lifetime(4096));
             bool exhausted=false;
             try{(void)payload_registry.reserve_host_payload_lifetime(1);}
-            catch(const ninfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
+            catch(const voidinfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
             require(exhausted,"unbound host payload promise did not exhaust page budget");
             const auto matches=[](const std::shared_ptr<const void>& value,const PayloadLedger& ledger,
                 std::size_t plane,const void* address,std::size_t bytes) noexcept {
@@ -219,7 +219,7 @@ void run_t84_serving_coordinator(
                 owner.reset();
                 exhausted=false;
                 try{(void)payload_registry.reserve_host_payload_lifetime(1);}
-                catch(const ninfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
+                catch(const voidinfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
                 require(exhausted,"uncommitted transition lost retained payload credit");
             }
             {
@@ -229,7 +229,7 @@ void run_t84_serving_coordinator(
             payload_registry.close();
         }
         {
-            using Page=ninfer::exl3::Exl3ExactKVPage;
+            using Page=voidinfer::exl3::Exl3ExactKVPage;
             Registry registry(memory.ullTotalPhys-reserve,reserve);
             const auto metadata_domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
             auto page_limits=Inventory::unlimited();page_limits[metadata_domain]=Page::metadata_bytes();
@@ -239,10 +239,10 @@ void run_t84_serving_coordinator(
             const auto before=registry.revision();
             registry.admit_host_metadata_lifetime(shared,Page::metadata_bytes(),&Page::metadata_credit_belongs_to,&Page::attach_metadata_credit);
             require(registry.revision()==before,"shared page publication duplicated reservation");
-            const auto live=ninfer::exl3::bounded_shared_live_blocks_for_test<Page>();
+            const auto live=voidinfer::exl3::bounded_shared_live_blocks_for_test<Page>();
             bool refused=false;try{auto other=Page::create(reserve_page);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
-            require(refused && ninfer::exl3::bounded_shared_live_blocks_for_test<Page>()==live,
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            require(refused && voidinfer::exl3::bounded_shared_live_blocks_for_test<Page>()==live,
                 "page ceiling refusal allocated storage");
             std::weak_ptr<Page> weak=page;page.reset();
             require(!weak.expired() && registry.retained_resource_units()[metadata_domain]==Page::metadata_bytes(),
@@ -253,13 +253,13 @@ void run_t84_serving_coordinator(
             require(registry.tighten_metadata_headroom_for_test(0)==Page::metadata_bytes(),
                 "metadata ceiling tightening omitted weak-only page storage");
             refused=false;try{auto other=Page::create(reserve_page);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused,"tightened metadata ceiling admitted over weak-only page storage");
             weak.reset();auto retry=Page::create(reserve_page);retry.reset();
             require(registry.retained_resource_units()[metadata_domain]==0,"page ceiling retry leaked credit");
         }
         {
-            using History=ninfer::exl3::Exl3TokenHistory;
+            using History=voidinfer::exl3::Exl3TokenHistory;
             Registry registry(memory.ullTotalPhys-reserve,reserve);
             const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
             auto limits=Inventory::unlimited();limits[domain]=History::node_metadata_bytes();
@@ -277,7 +277,7 @@ void run_t84_serving_coordinator(
             require(registry.revision()==revision,"token control publication duplicated credit");
             const auto live=History::live_node_blocks_for_test();bool refused=false;
             try{auto child=history.append(token,reserve_control);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && History::live_node_blocks_for_test()==live && history.equals(token),
                 "token control ceiling refusal allocated node or changed parent");
             history=History{};
@@ -286,46 +286,46 @@ void run_t84_serving_coordinator(
             require(weak.expired() && registry.retained_resource_units()[domain]==History::node_metadata_bytes(),
                 "token final strong release dropped weak control charge");
             refused=false;try{auto child=History{}.append(token,reserve_control);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused,"token control ceiling ignored weak owner");
             weak.reset();auto retry=History{}.append(token,reserve_control);retry=History{};
             require(registry.retained_resource_units()[domain]==0,"token control retry leaked credit");
         }
-        ninfer::exl3::Exl3VeriCacheRequest::exercise_request_metadata_ceiling_for_test(
+        voidinfer::exl3::Exl3VeriCacheRequest::exercise_request_metadata_ceiling_for_test(
             [&]{return std::make_unique<Registry>(memory.ullTotalPhys-reserve,reserve);});
         // These component cases each own the process-wide resident authority.
         // Construct the following fixture only after their registries retire.
         Registry registry(memory.ullTotalPhys-reserve,reserve);
-        const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<int>();
+        const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<int>();
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
         auto limits=Inventory::unlimited();limits[domain]=bytes;registry.set_resource_limits(limits);
         {
             auto planned=registry.reserve_host_metadata_lifetime(bytes);
             bool refused=false;
             try{(void)registry.reserve_host_metadata_lifetime(1);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && planned.bytes()==bytes && registry.retained_resource_units()[domain]==bytes,
                 "preconstruction snapshot promise did not consume available metadata");
         }
         require(registry.retained_resource_units()[domain]==0,
             "abandoned snapshot construction promise retained metadata");
-        auto owner=ninfer::exl3::make_bounded_shared<int>(7);
+        auto owner=voidinfer::exl3::make_bounded_shared<int>(7);
         const auto matches=[](const std::shared_ptr<const void>& value,const Ledger& ledger) noexcept {
-            return ninfer::exl3::bounded_split_credit_belongs_to<int>(value,ledger);
+            return voidinfer::exl3::bounded_split_credit_belongs_to<int>(value,ledger);
         };
         unsigned attachments=0;
         const auto attach=[&](const std::shared_ptr<const void>& value,Ledger::Ticket credit) noexcept {
             ++attachments;
-            return ninfer::exl3::attach_bounded_split_retirement_credit<int>(value,std::move(credit),0);
+            return voidinfer::exl3::attach_bounded_split_retirement_credit<int>(value,std::move(credit),0);
         };
         registry.admit_host_metadata_lifetime(owner,bytes,matches,attach);
         const auto revision=registry.revision();
         registry.admit_host_metadata_lifetime(owner,bytes,matches,attach);
         require(attachments==1 && registry.revision()==revision && registry.retained_resource_units()[domain]==bytes,
             "owner lifetime re-admission duplicated charge or attachment");
-        auto other=ninfer::exl3::make_bounded_shared<int>(9);bool refused=false;
+        auto other=voidinfer::exl3::make_bounded_shared<int>(9);bool refused=false;
         try{registry.admit_host_metadata_lifetime(other,bytes,matches,attach);}
-        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && attachments==1,"owner lifetime exact cap reached refused attachment");
         registry.replace({});
         std::weak_ptr<int> weak=owner;owner.reset();
@@ -337,8 +337,8 @@ void run_t84_serving_coordinator(
         require(attachments==2,"released owner lifetime credit did not permit retry");
         other.reset();
         Ledger foreign_ledger;
-        auto foreign=ninfer::exl3::make_bounded_shared<int>(11);
-        require(ninfer::exl3::attach_bounded_split_retirement_credit<int>(foreign,foreign_ledger.acquire(bytes),0),
+        auto foreign=voidinfer::exl3::make_bounded_shared<int>(11);
+        require(voidinfer::exl3::attach_bounded_split_retirement_credit<int>(foreign,foreign_ledger.acquire(bytes),0),
             "foreign metadata fixture credit attachment");
         bool foreign_refused=false;
         try{registry.admit_host_metadata_lifetime(foreign,bytes,matches,attach);}
@@ -347,7 +347,7 @@ void run_t84_serving_coordinator(
         require(foreign_refused && foreign_ledger.bytes()==bytes &&
             registry.retained_resource_units()[domain]==0 && *foreign==11,
             "foreign registry admission duplicated or stole owner credit");
-        auto retry=ninfer::exl3::make_bounded_shared<int>(13);
+        auto retry=voidinfer::exl3::make_bounded_shared<int>(13);
         registry.admit_host_metadata_lifetime(retry,bytes,matches,attach);
         require(registry.retained_resource_units()[domain]==bytes,
             "foreign credit refusal left lifetime admission sealed");
@@ -358,8 +358,8 @@ void run_t84_serving_coordinator(
     }
     for(const bool fixed:{false,true})for(std::size_t range_capacity:{1U,8U})
         for(unsigned scratch_slots=0;scratch_slots<=2;++scratch_slots) {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto required=Registry::Snapshot::descriptor_requirement(1,range_capacity);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
@@ -397,7 +397,7 @@ void run_t84_serving_coordinator(
             require(moved_from_refused && !retained.expired() && registry.retained_resource_units()==charged,
                 "T213 moved-from commit consumed surviving assessment");
         }
-        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         // Incoming capacity is reused; only the added-range vector is extra.
         require((scratch_slots>=1?assessed:refused) && retained.expired() &&
             registry.retained_resource_units()==Inventory::Totals{},
@@ -405,8 +405,8 @@ void run_t84_serving_coordinator(
         registry.close();
     }
     {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
         auto limits=Inventory::unlimited();limits[domain]=1ULL<<20;
@@ -428,7 +428,7 @@ void run_t84_serving_coordinator(
         bool called=false,refused=false;
         try{registry.allocate_reserved(excess,[&](auto)->Inventory {
             called=true;throw std::runtime_error("prepared page credit reached allocator");
-        });}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        });}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && !called && !retained_payload.expired(),
             "T024 later allocation reused persistent page descriptor credit");
         registry.close();
@@ -437,8 +437,8 @@ void run_t84_serving_coordinator(
             "T024 close retained page descriptors or payload after unlock");
     }
     for(const bool commit_pressure:{false,true}) {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto required=Registry::Snapshot::descriptor_requirement(1,0);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
@@ -462,7 +462,7 @@ void run_t84_serving_coordinator(
         if(commit_pressure) {
             bool refused_commit=false;const auto revision=registry.revision();
             try{registry.commit(std::move(*first));}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused_commit=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused_commit=true;}
             require(refused_commit && registry.revision()==revision && owners[0].expired() &&
                 !owners[1].expired() && registry.retained_resource_units()[domain]==required.units[domain],
                 "T024 commit ignored later assessment pressure or damaged surviving plan");
@@ -479,8 +479,8 @@ void run_t84_serving_coordinator(
             "T024 consumed assessment wrapper retained payload after close");
     }
     for(unsigned invalidation=0;invalidation<4;++invalidation) {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         std::optional<Registry::Transition> survivor;
         std::weak_ptr<const int> payload;
         {
@@ -521,7 +521,7 @@ void run_t84_serving_coordinator(
         survivor.reset();require(payload.expired(),"T024 outliving plan retained payload after final destruction");
     }
     {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         const auto bytes=Coordinator::runtime_host_source_metadata_bytes();
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
         {
@@ -529,7 +529,7 @@ void run_t84_serving_coordinator(
             auto limits=Inventory::unlimited();limits[domain]=bytes-1;
             owner.bind_physical_resources({},limits);
             bool refused=false;try {owner.reserve_runtime_host_sources();}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&) {refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&) {refused=true;}
             require(refused && owner.runtime_host_source_storage_bytes()==0 &&
                 owner.runtime_host_source_owner_for_test().expired(),
                 "T024 host source table exceeded full backing reservation");
@@ -550,9 +550,9 @@ void run_t84_serving_coordinator(
         require(owner.stats().retained_resource_units==Inventory::Totals{},
             "T024 host source final weak release retained credit");
     }
-    if(env("NINFER_TEST_COORDINATOR_LATE_RELEASE")=="1") {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_COORDINATOR_LATE_RELEASE")=="1") {
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         std::weak_ptr<const void> produced;
         unsigned rollbacks=0,observations=0;bool callback_alive=false,observer_released=false;
         {
@@ -580,10 +580,10 @@ void run_t84_serving_coordinator(
         require(Registry::retirement_quarantined(),"late cleanup failure lost process seal");
         std::cout << "T84_LATE_RELEASE_COMPLETE full_serving_coverage=0" << std::endl;return;
     }
-    if(env("NINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="1" ||
-       env("NINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="startup") {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="1" ||
+       env("VOIDINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="startup") {
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         unsigned rollback_calls=0;
         std::weak_ptr<const void> produced;
         {
@@ -599,7 +599,7 @@ void run_t84_serving_coordinator(
                     ++rollback_calls;require(!produced.expired(),"T024 rollback lost produced owner before callback");
                     throw std::runtime_error("prepared rollback failure");
                 };
-                if(env("NINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="startup") {
+                if(env("VOIDINFER_TEST_COORDINATOR_ROLLBACK_QUARANTINE")=="startup") {
                     Inventory::Requirement required;required.configuration=23;
                     required.add(Inventory::Domain::host_metadata,1,64);
                     owner.allocate_startup_resources(required,[&](auto) {
@@ -627,22 +627,22 @@ void run_t84_serving_coordinator(
         std::cout << "T84_ROLLBACK_QUARANTINE_COMPLETE close_refused=2 full_serving_coverage=0" << std::endl;
         return;
     }
-    if(env("NINFER_TEST_RESIDENT_CLOSE_QUARANTINE")=="1") {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_RESIDENT_CLOSE_QUARANTINE")=="1") {
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         struct Backing {mutable unsigned attempts=0;};
-        const auto baseline=ninfer::exl3::bounded_shared_live_blocks_for_test<Backing>();
+        const auto baseline=voidinfer::exl3::bounded_shared_live_blocks_for_test<Backing>();
         std::weak_ptr<Backing> weak;
         {
             Registry registry(memory.ullTotalPhys-reserve,reserve);
-            const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<Backing>();
+            const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<Backing>();
             Inventory::Requirement required;required.configuration=21;
             required.add(Inventory::Domain::host_metadata,1,bytes);
             registry.allocate_reserved(required,[&](auto) {
-                auto owner=ninfer::exl3::make_bounded_shared<Backing>();weak=owner;
+                auto owner=voidinfer::exl3::make_bounded_shared<Backing>();weak=owner;
                 Inventory actual;actual.add({owner,0,Inventory::Domain::host_metadata,bytes,{},
                     +[](const std::shared_ptr<const void>& value,
-                        ninfer::exl3::RetainedDescriptorLedger::Ticket) noexcept {
+                        voidinfer::exl3::RetainedDescriptorLedger::Ticket) noexcept {
                         ++static_cast<const Backing*>(value.get())->attempts;return false;
                     }});return actual;
             });
@@ -655,7 +655,7 @@ void run_t84_serving_coordinator(
         }
         auto survivor=weak.lock();
         require(survivor && survivor->attempts==2 && Registry::failed_close_retained_for_test() &&
-            ninfer::exl3::bounded_shared_live_blocks_for_test<Backing>()==baseline+1,
+            voidinfer::exl3::bounded_shared_live_blocks_for_test<Backing>()==baseline+1,
             "T024 destructor hook refusal released allocation or replayed fallback callback");
         survivor.reset();
         bool sealed=false;try {Registry replacement(memory.ullTotalPhys-reserve,reserve);}
@@ -667,9 +667,9 @@ void run_t84_serving_coordinator(
                   << " full_serving_coverage=0" << std::endl;
         return;
     }
-    if(env("NINFER_TEST_RESIDENT_POISON_METADATA")=="1") {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+    if(env("VOIDINFER_TEST_RESIDENT_POISON_METADATA")=="1") {
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         std::array<std::weak_ptr<const void>,2> owners;
         {
             Registry registry(memory.ullTotalPhys-reserve,reserve);
@@ -720,8 +720,8 @@ void run_t84_serving_coordinator(
         return;
     }
     {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         registry.set_resource_limits(Inventory::unlimited());
         Inventory::Requirement requirement;requirement.configuration=0x484f535452455449ULL;
@@ -754,28 +754,28 @@ void run_t84_serving_coordinator(
         registry.close();
     }
     {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         using Backing=std::array<std::byte,64>;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
-        const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<Backing>();
+        const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<Backing>();
         auto limits=Inventory::unlimited();limits[domain]=bytes;registry.set_resource_limits(limits);
         Inventory::Requirement required;required.configuration=0x5745414b5441494cULL;
         required.add(Inventory::Domain::host_metadata,1,bytes);
         Inventory::Allocation allocation;std::weak_ptr<const void> weak;
         registry.allocate_reserved(required,[&](auto) {
-            auto owner=ninfer::exl3::make_bounded_shared<Backing>();weak=owner;
+            auto owner=voidinfer::exl3::make_bounded_shared<Backing>();weak=owner;
             allocation={owner,0,Inventory::Domain::host_metadata,bytes};
             Inventory actual;actual.add(allocation);return actual;
         });
         require(!registry.retire_reserved_host_to_lifetime(allocation,
-            [](ninfer::exl3::RetainedDescriptorLedger::Ticket) noexcept {return false;}) &&
+            [](voidinfer::exl3::RetainedDescriptorLedger::Ticket) noexcept {return false;}) &&
             registry.retained_resource_units()[domain]==bytes && !weak.expired(),
             "T024 refused lifetime transfer changed inventory or duplicated credit");
         require(registry.retire_reserved_host_to_lifetime(allocation,
-            [&](ninfer::exl3::RetainedDescriptorLedger::Ticket credit) noexcept {
-                return ninfer::exl3::attach_bounded_retirement_credit<Backing>(allocation.owner,std::move(credit));
+            [&](voidinfer::exl3::RetainedDescriptorLedger::Ticket credit) noexcept {
+                return voidinfer::exl3::attach_bounded_retirement_credit<Backing>(allocation.owner,std::move(credit));
             }) && registry.retained_resource_units()[domain]==bytes,
             "T024 lifetime transfer lost or duplicated metadata charge");
         allocation.owner.reset();
@@ -785,7 +785,7 @@ void run_t84_serving_coordinator(
         bool called=false,refused=false;
         try{registry.allocate_reserved(excess,[&](auto)->Inventory {
             called=true;throw std::runtime_error("prepared weak tail credit reached allocator");
-        });}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        });}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && !called,"T024 weak-only control tail credit was reused");
         registry.close();
         require(registry.retained_resource_units()[domain]==bytes,"T024 close discarded live weak-tail charge");
@@ -794,20 +794,20 @@ void run_t84_serving_coordinator(
             "T024 final weak retirement retained lifetime credit");
     }
     {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         using Backing=std::array<std::byte,64>;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
-        const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<Backing>();
+        const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<Backing>();
         auto limits=Inventory::unlimited();limits[domain]=bytes;registry.set_resource_limits(limits);
         Inventory::Requirement required;required.configuration=19;required.add(Inventory::Domain::host_metadata,1,bytes);
         std::shared_ptr<Backing> survivor;std::weak_ptr<Backing> weak;
         registry.allocate_reserved(required,[&](auto) {
-            survivor=ninfer::exl3::make_bounded_shared<Backing>();weak=survivor;
+            survivor=voidinfer::exl3::make_bounded_shared<Backing>();weak=survivor;
             Inventory actual;actual.add({survivor,0,Inventory::Domain::host_metadata,bytes,{},
-                +[](const std::shared_ptr<const void>& owner,ninfer::exl3::RetainedDescriptorLedger::Ticket credit) noexcept {
-                    return ninfer::exl3::attach_bounded_retirement_credit<Backing>(owner,std::move(credit));
+                +[](const std::shared_ptr<const void>& owner,voidinfer::exl3::RetainedDescriptorLedger::Ticket credit) noexcept {
+                    return voidinfer::exl3::attach_bounded_retirement_credit<Backing>(owner,std::move(credit));
                 }});return actual;
         });
         registry.close();
@@ -820,50 +820,50 @@ void run_t84_serving_coordinator(
             "T024 close-transferred credit survived final allocation retirement");
     }
     {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         struct Backing {std::array<std::byte,64> payload;};
-        const auto baseline=ninfer::exl3::bounded_shared_live_blocks_for_test<Backing>();
-        const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<Backing>();
+        const auto baseline=voidinfer::exl3::bounded_shared_live_blocks_for_test<Backing>();
+        const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<Backing>();
         std::shared_ptr<Backing> survivor;std::weak_ptr<Backing> weak;
         {
-            ninfer::exl3::Exl3HostResidentSet registry(memory.ullTotalPhys-reserve,reserve);
+            voidinfer::exl3::Exl3HostResidentSet registry(memory.ullTotalPhys-reserve,reserve);
             Inventory::Requirement required;required.configuration=20;
             required.add(Inventory::Domain::host_metadata,1,bytes);
             registry.allocate_reserved(required,[&](auto) {
-                survivor=ninfer::exl3::make_bounded_shared<Backing>();weak=survivor;
+                survivor=voidinfer::exl3::make_bounded_shared<Backing>();weak=survivor;
                 Inventory actual;actual.add({survivor,0,Inventory::Domain::host_metadata,bytes,{},
-                    &ninfer::exl3::attach_bounded_retirement_credit<Backing,const void>});return actual;
+                    &voidinfer::exl3::attach_bounded_retirement_credit<Backing,const void>});return actual;
             });
-            require(!ninfer::exl3::bounded_retirement_credit_bytes_for_test<Backing>(survivor),
+            require(!voidinfer::exl3::bounded_retirement_credit_bytes_for_test<Backing>(survivor),
                 "T024 inventory owner acquired retirement credit before teardown");
             // Intentionally omit explicit close: the healthy destructor must transfer.
         }
-        require(ninfer::exl3::bounded_retirement_credit_bytes_for_test<Backing>(survivor)==bytes,
+        require(voidinfer::exl3::bounded_retirement_credit_bytes_for_test<Backing>(survivor)==bytes,
             "T024 implicit registry close lost surviving allocation credit");
         survivor.reset();
-        require(weak.expired() && ninfer::exl3::bounded_shared_live_blocks_for_test<Backing>()==baseline+1,
+        require(weak.expired() && voidinfer::exl3::bounded_shared_live_blocks_for_test<Backing>()==baseline+1,
             "T024 implicit close released backing before final weak retirement");
         weak.reset();
-        require(ninfer::exl3::bounded_shared_live_blocks_for_test<Backing>()==baseline,
+        require(voidinfer::exl3::bounded_shared_live_blocks_for_test<Backing>()==baseline,
             "T024 implicit close leaked bounded allocation");
     }
     {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         struct Backing {mutable unsigned calls=0;mutable bool refuse=false;};
         Coordinator owner(cache,Coordinator::Policy{3,2,memory.ullTotalPhys-reserve,reserve});
         owner.bind_physical_resources({},Inventory::unlimited());
-        const auto bytes=ninfer::exl3::bounded_shared_allocation_bytes<Backing>();
+        const auto bytes=voidinfer::exl3::bounded_shared_allocation_bytes<Backing>();
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
         std::array<std::shared_ptr<Backing>,2> survivors;
         std::array<std::weak_ptr<Backing>,2> weak;
         std::array<std::optional<Coordinator::LogicalHostLease>,2> leases;
         for(unsigned i=0;i<2;++i)leases[i].emplace(owner.allocate_logical_host(bytes,[&] {
-            survivors[i]=ninfer::exl3::make_bounded_shared<Backing>();survivors[i]->refuse=i==1;weak[i]=survivors[i];
+            survivors[i]=voidinfer::exl3::make_bounded_shared<Backing>();survivors[i]->refuse=i==1;weak[i]=survivors[i];
             return Inventory::Allocation{survivors[i],0,Inventory::Domain::host_metadata,bytes,{},
-                +[](const std::shared_ptr<const void>& value,ninfer::exl3::RetainedDescriptorLedger::Ticket credit) noexcept {
+                +[](const std::shared_ptr<const void>& value,voidinfer::exl3::RetainedDescriptorLedger::Ticket credit) noexcept {
                     const auto backing=std::static_pointer_cast<const Backing>(value);++backing->calls;
                     if(backing->refuse)return false;
-                    return ninfer::exl3::attach_bounded_retirement_credit<Backing>(value,std::move(credit));
+                    return voidinfer::exl3::attach_bounded_retirement_credit<Backing>(value,std::move(credit));
                 }};
         },[]{}));
         bool refused=false;try{owner.close();}catch(const std::logic_error& error){refused=std::string_view(error.what())==
@@ -886,8 +886,8 @@ void run_t84_serving_coordinator(
             "T024 final weak retirement retained close-retry charges");
     }
     for(const bool enough_credit:{false,true}) {
-        using Registry=ninfer::exl3::Exl3HostResidentSet;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Registry=voidinfer::exl3::Exl3HostResidentSet;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Registry registry(memory.ullTotalPhys-reserve,reserve);
         const auto required=Registry::Snapshot::descriptor_requirement(1,0);
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
@@ -905,7 +905,7 @@ void run_t84_serving_coordinator(
         if(!enough_credit) {
             const auto revision=registry.revision();bool refused=false;
             try{registry.replace_reserved_snapshot(required,factory,[&]{++before_commit;});}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && factories==0 && before_commit==0 && registry.revision()==revision,
                 "T024 insufficient snapshot credit reached factory or changed authority");
         } else {
@@ -960,7 +960,7 @@ void run_t84_serving_coordinator(
         require(retained.expired(),"T024 snapshot close retained descriptor payload");
     }
     {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Coordinator capped(cache,Coordinator::Policy{3,2,memory.ullTotalPhys-reserve,reserve});
         auto limits=Inventory::unlimited();
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
@@ -969,7 +969,7 @@ void run_t84_serving_coordinator(
         for(int attempt=0;attempt<2;++attempt) {
             bool refused=false;
             try{capped.reserve_metadata_startup(4);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && capped.metadata_owner_for_test().expired() &&
                 capped.queue_capacity_for_test()==0 && capped.stats().resident_updates==0,
                 "T024 missing credit entered allocator or published metadata");
@@ -980,7 +980,7 @@ void run_t84_serving_coordinator(
     // only the requests that happened to be queued during allocation.
     for(const bool batch:{false,true}) {
         Coordinator owner(cache,Coordinator::Policy{3,2,memory.ullTotalPhys-reserve,reserve});
-        owner.bind_physical_resources({},ninfer::exl3::Exl3ResourceInventory::unlimited());
+        owner.bind_physical_resources({},voidinfer::exl3::Exl3ResourceInventory::unlimited());
         const auto metadata_blocks=Coordinator::metadata_owner_blocks_for_test();
         for(unsigned fault=1;fault<=3;++fault) {
             bool refused=false;
@@ -996,7 +996,7 @@ void run_t84_serving_coordinator(
                 "T024 failed startup published metadata owner or capacity");
         }
         owner.reserve_metadata_startup();
-        const auto metadata_domain=static_cast<unsigned>(ninfer::exl3::Exl3ResourceInventory::Domain::host_metadata);
+        const auto metadata_domain=static_cast<unsigned>(voidinfer::exl3::Exl3ResourceInventory::Domain::host_metadata);
         const auto metadata_bytes=owner.metadata_requirement().units[metadata_domain];
         auto metadata=owner.metadata_owner_for_test();
         require(!metadata.expired() && owner.queue_capacity_for_test()==3 &&
@@ -1072,11 +1072,11 @@ void run_t84_serving_coordinator(
             "T024 metadata weak diagnostic lost its startup retirement credit");
         metadata.reset();
         require(Coordinator::metadata_owner_blocks_for_test()==metadata_blocks &&
-            *owner.stats().retained_resource_units==ninfer::exl3::Exl3ResourceInventory::Totals{},
+            *owner.stats().retained_resource_units==voidinfer::exl3::Exl3ResourceInventory::Totals{},
             "T024 last weak metadata diagnostic retained bounded owner allocation");
     }
     {
-        using Index=ninfer::exl3::Exl3VeriCachePrefixIndex;
+        using Index=voidinfer::exl3::Exl3VeriCachePrefixIndex;
         Cache retention_cache(Cache::Policy{2,64,cache_budget,reserve},identity);
         require(retention_cache.admit_input_authority(initial[0],prompts[0],available()).admitted,
             "T230 coordinator retention fixture admission");
@@ -1152,7 +1152,7 @@ void run_t84_serving_coordinator(
     {
         // Real coordinator admission/ledger policy with host-backed stand-ins
         // for represented data; this fixture issues no page CUDA operations.
-        using namespace ninfer::exl3;
+        using namespace voidinfer::exl3;
         using Fill=Exl3DevicePageFill;using Inventory=Exl3ResourceInventory;
         const auto domain=static_cast<unsigned>(Inventory::Domain::host_metadata);
         Coordinator owner(cache,Coordinator::Policy{3,2,memory.ullTotalPhys-reserve,reserve});
@@ -1203,7 +1203,7 @@ void run_t84_serving_coordinator(
         // T012 close must join an in-flight runtime admission before it can
         // clear the physical inventory. The admitted owner is held by both the
         // returned lease and the resident authority until that serialized close.
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Coordinator owner(cache,Coordinator::Policy{3,2,memory.ullTotalPhys-reserve,reserve});
         owner.bind_physical_resources({},Inventory::unlimited());
         std::atomic_bool factory_entered=false,release_factory=false;
@@ -1240,11 +1240,11 @@ void run_t84_serving_coordinator(
     }
     Coordinator coordinator(cache, Coordinator::Policy{
         8, 2, memory.ullTotalPhys - reserve, reserve});
-    const bool runtime_credit_fixture=env("NINFER_TEST_KV_RUNTIME_CREDIT")=="1";
+    const bool runtime_credit_fixture=env("VOIDINFER_TEST_KV_RUNTIME_CREDIT")=="1";
     if(runtime_credit_fixture) {
-        ninfer::exl3::Exl3ResourceInventory::Totals limits{};limits.fill(1ULL<<30);
+        voidinfer::exl3::Exl3ResourceInventory::Totals limits{};limits.fill(1ULL<<30);
         coordinator.bind_physical_resources({},limits);
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Inventory::Requirement preparation;
         preparation.add(Inventory::Domain::cuda_registered_host,1,8);
         preparation.add(Inventory::Domain::host_metadata,1,8);
@@ -1292,10 +1292,10 @@ void run_t84_serving_coordinator(
                 "preparation reservation required or manufactured a model-state lease");
         }
     }
-    const bool reserved_metadata=env("NINFER_TEST_COORDINATOR_METADATA_RESERVED")=="1";
+    const bool reserved_metadata=env("VOIDINFER_TEST_COORDINATOR_METADATA_RESERVED")=="1";
     if(reserved_metadata) {
         if(!runtime_credit_fixture)
-            coordinator.bind_physical_resources({},ninfer::exl3::Exl3ResourceInventory::unlimited());
+            coordinator.bind_physical_resources({},voidinfer::exl3::Exl3ResourceInventory::unlimited());
         coordinator.reserve_metadata_startup();
     }
     for(auto fault:{Coordinator::ResidencyFault::before_commit,Coordinator::ResidencyFault::after_first_lock}) {
@@ -1348,7 +1348,7 @@ void run_t84_serving_coordinator(
             "T84 FIFO physical admission");
     std::array<Coordinator::Lease,2> leases{*first, *second};
     if(runtime_credit_fixture) {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         {
             const auto outside_refused=[&] {
                 bool refused=false;
@@ -1372,7 +1372,7 @@ void run_t84_serving_coordinator(
                     for(const auto amounts:{std::pair<std::uint64_t,std::uint64_t>{129,64},{128,65}}) {
                         bool refused=false;
                         try{(void)coordinator.reserve_registration_constructor_credits(amounts.first,amounts.second);}
-                        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+                        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
                         require(refused,"runtime constructor exceeded one declared domain");
                     }
                     bool wrong_scope=false;
@@ -1386,7 +1386,7 @@ void run_t84_serving_coordinator(
                     }
                     bool replay=false;
                     try{(void)coordinator.reserve_registration_constructor_credits(1,1);}
-                    catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){replay=true;}
+                    catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){replay=true;}
                     require(replay,"released runtime tickets restored already-consumed grant allowance");
                     throw std::runtime_error("prepared registration constructor scope failure");
                 });}
@@ -1415,13 +1415,13 @@ void run_t84_serving_coordinator(
                     require(foreign_refused,"foreign thread consumed runtime device grant");
                     bool device_limit=false;
                     try{(void)coordinator.reserve_runtime_constructor_credits(129,1);}
-                    catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){device_limit=true;}
+                    catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){device_limit=true;}
                     require(device_limit,"runtime device grant exceeded physical declaration");
                     {
                         auto registration=coordinator.reserve_registration_constructor_credits(64,32);
                         bool metadata_limit=false;
                         try{(void)coordinator.reserve_runtime_constructor_credits(128,65);}
-                        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){metadata_limit=true;}
+                        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){metadata_limit=true;}
                         require(metadata_limit,"runtime grants reused registration metadata allowance");
                         auto device=coordinator.reserve_runtime_constructor_credits(128,64);
                         require(device.device.bytes()==128 && device.metadata.bytes()==64 &&
@@ -1430,7 +1430,7 @@ void run_t84_serving_coordinator(
                     }
                     bool replay=false;
                     try{(void)coordinator.reserve_runtime_constructor_credits(1,1);}
-                    catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){replay=true;}
+                    catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){replay=true;}
                     require(replay,"released device tickets restored consumed runtime allowance");
                     throw std::runtime_error("prepared mixed constructor failure");
                 });}catch(const std::runtime_error& error){original=std::string_view(error.what())=="prepared mixed constructor failure";}
@@ -1575,7 +1575,7 @@ void run_t84_serving_coordinator(
     bool stale_rejected = false;
     for (int ordinal = 0; ordinal < kOutputs; ++ordinal) {
         std::array<std::shared_ptr<const Request>,2> updated;
-        std::array<ninfer::exl3::Exl3OuterReferenceResult,2> verified;
+        std::array<voidinfer::exl3::Exl3OuterReferenceResult,2> verified;
         std::array<std::exception_ptr,2> errors;
         std::atomic<int> ready{0};
         std::atomic<bool> go{false};
@@ -1787,25 +1787,25 @@ void run_t84_serving_coordinator(
         initial[i]->visit_revision_owners([&](const auto& revision) {
             if(std::find(retained_revisions.begin(),retained_revisions.end(),revision)==retained_revisions.end()) {
                 retained_revisions.push_back(revision);
-                retained_snapshot_metadata+=ninfer::exl3::bounded_shared_allocation_bytes<int>();
+                retained_snapshot_metadata+=voidinfer::exl3::bounded_shared_allocation_bytes<int>();
             }
         });
         bool seen=false;
         for(std::size_t j=0;j<i;++j)seen|=initial[j]->state()==initial[i]->state();
         if(!seen)retained_snapshot_metadata+=initial[i]->state()->snapshot_metadata_bytes();
         initial[i]->state()->visit_page_metadata_owners([&](const auto& page){
-            retain_metadata(page,ninfer::exl3::Exl3ExactKVPage::metadata_bytes());
+            retain_metadata(page,voidinfer::exl3::Exl3ExactKVPage::metadata_bytes());
         });
         initial[i]->visit_tap_block_owners([&](const auto& block){
-            retain_metadata(block,ninfer::exl3::Exl3VeriCacheRequest::tap_block_metadata_bytes());
+            retain_metadata(block,voidinfer::exl3::Exl3VeriCacheRequest::tap_block_metadata_bytes());
         });
         initial[i]->visit_token_control_owners([&](const auto& node){
-            retain_metadata(node,ninfer::exl3::Exl3TokenHistory::node_metadata_bytes());
+            retain_metadata(node,voidinfer::exl3::Exl3TokenHistory::node_metadata_bytes());
         });
         if(const auto& ring=initial[i]->projected_metadata_owner()) {
             retain_metadata(ring,ring->metadata_bytes());
             ring->visit_page_metadata_owners([&](const auto& page){
-                retain_metadata(page,ninfer::exl3::Exl3DraftHostRing::page_metadata_bytes());
+                retain_metadata(page,voidinfer::exl3::Exl3DraftHostRing::page_metadata_bytes());
             });
         }
         if(const auto& identity=initial[i]->prepared_metadata_owner())retain_metadata(identity,identity->metadata_bytes());
@@ -1813,7 +1813,7 @@ void run_t84_serving_coordinator(
     require(coordinator.owner_lifetime_metadata_bytes_for_test()>=retained_snapshot_metadata &&
         coordinator.stats().retained_resource_units &&
         (*coordinator.stats().retained_resource_units)[static_cast<unsigned>(
-            ninfer::exl3::Exl3ResourceInventory::Domain::host_metadata)]>=retained_snapshot_metadata,
+            voidinfer::exl3::Exl3ResourceInventory::Domain::host_metadata)]>=retained_snapshot_metadata,
         "coordinator close dropped request or nested metadata owned by retained real roots");
     write_lifecycle("closed", true);
     publications.flush(); lifecycle.flush(); memory_out.flush();

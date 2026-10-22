@@ -9,7 +9,7 @@
 #include <optional>
 #include <cmath>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Bounded token-history proposal index. These tokens are never authority.
 // Index the final token into 256 buckets, then compare the full four-token key;
 // capped chain visits bound even adversarial repeated-token histories.
@@ -134,4 +134,4 @@ private:
     std::int64_t end_=0;
     std::int64_t at(std::int64_t p) const noexcept {return history_[p%capacity];}
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

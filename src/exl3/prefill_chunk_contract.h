@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 inline void exl3_require_prefill_width(int width) {
     if(width!=8 && width!=16 && width!=32 && width!=128 && width!=1024)
         throw std::invalid_argument("request prefill width must be8/16/32/128/1024");
@@ -41,4 +41,4 @@ inline Exl3PrefillPartitionRelation exl3_prefill_partition_relation(
     }
     return Exl3PrefillPartitionRelation::identical;
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

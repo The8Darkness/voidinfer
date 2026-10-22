@@ -21,8 +21,8 @@
 
 namespace {
 
-using ninfer::exl3::Exl3FullAttentionQKVHost;
-using ninfer::exl3::Exl3TextModel;
+using voidinfer::exl3::Exl3FullAttentionQKVHost;
+using voidinfer::exl3::Exl3TextModel;
 constexpr int kQHeads = 24;
 constexpr int kKVHeads = 4;
 constexpr int kHeadDim = 256;
@@ -141,11 +141,11 @@ CaseResult evaluate(const std::vector<float>& q, const std::vector<float>& k,
             k_rot[static_cast<std::size_t>(token) * kKVHeads + head] = rotate_row(k_source, rk.data(), false);
             v_rot[static_cast<std::size_t>(token) * kKVHeads + head] = rotate_row(v_source, rv.data(), false);
             std::array<float, kHeadDim> decoded{};
-            const auto ek = ninfer::ops::oscar_int2_g128_encode(k_rot[static_cast<std::size_t>(token) * kKVHeads + head].data(), kHeadDim, 0.96F);
-            ninfer::ops::oscar_int2_g128_decode(ek, decoded.data(), kHeadDim);
+            const auto ek = voidinfer::ops::oscar_int2_g128_encode(k_rot[static_cast<std::size_t>(token) * kKVHeads + head].data(), kHeadDim, 0.96F);
+            voidinfer::ops::oscar_int2_g128_decode(ek, decoded.data(), kHeadDim);
             k_dec[static_cast<std::size_t>(token) * kKVHeads + head].assign(decoded.begin(), decoded.end());
-            const auto ev = ninfer::ops::oscar_int2_g128_encode(v_rot[static_cast<std::size_t>(token) * kKVHeads + head].data(), kHeadDim, 0.92F);
-            ninfer::ops::oscar_int2_g128_decode(ev, decoded.data(), kHeadDim);
+            const auto ev = voidinfer::ops::oscar_int2_g128_encode(v_rot[static_cast<std::size_t>(token) * kKVHeads + head].data(), kHeadDim, 0.92F);
+            voidinfer::ops::oscar_int2_g128_decode(ev, decoded.data(), kHeadDim);
             v_dec[static_cast<std::size_t>(token) * kKVHeads + head].assign(decoded.begin(), decoded.end());
         }
     }
@@ -202,11 +202,11 @@ CaseResult evaluate(const std::vector<float>& q, const std::vector<float>& k,
 }
 
 int run() {
-    const std::string target = env("NINFER_EXL3_TARGET_PATH");
-    const std::string rotation_dir = env("NINFER_OSCAR_ROTATION_ASSET_DIR");
-    const std::string output_dir = env("NINFER_EXL3_OSCAR_COMPAT_DIR");
+    const std::string target = env("VOIDINFER_EXL3_TARGET_PATH");
+    const std::string rotation_dir = env("VOIDINFER_OSCAR_ROTATION_ASSET_DIR");
+    const std::string output_dir = env("VOIDINFER_EXL3_OSCAR_COMPAT_DIR");
     if (target.empty() || rotation_dir.empty() || output_dir.empty()) {
-        std::cout << "E4C1 skipped: set NINFER_EXL3_TARGET_PATH, NINFER_OSCAR_ROTATION_ASSET_DIR, and NINFER_EXL3_OSCAR_COMPAT_DIR\n";
+        std::cout << "E4C1 skipped: set VOIDINFER_EXL3_TARGET_PATH, VOIDINFER_OSCAR_ROTATION_ASSET_DIR, and VOIDINFER_EXL3_OSCAR_COMPAT_DIR\n";
         return 77;
     }
     const auto model = Exl3TextModel::load(target, 256);

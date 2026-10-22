@@ -2,7 +2,7 @@
 #include "exl3/exact_kv_extent.h"
 #include <optional>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Only ordinary FP16 sequential-text pages are admitted. Strong published page
 // identity is the immutable content revision: a changed image must have a new
 // COW owner. Pointer/size snapshots additionally reject changed backing geometry.

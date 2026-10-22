@@ -1,0 +1,44 @@
+On-policy check, 2026-10-13: the BF16 checkpoint (transformers) scores each engine's served greedy answers
+(bench/engine-compare/quality/onpolicy_bf16.py; this summary: onpolicy_report.py RECORDS --by-suite).
+ours = VoidInfer EXL3 6 bpw, L0 OSCAR + exact VeriCache (ours.prev: the build before the Oct 13 fixes);
+gw.fp8 / nv.fp8 = NInfer a0cf1c17 groupwise / NVFP4 with FP8 KV. agree = answer token equals the BF16 argmax;
+clear = the same excluding near-ties (BF16 top-1/top-2 gap <= 0.5 nats); off>1/k = tokens per 1000 BF16 rejects by > 1 nat.
+
+
+== all suites (190 items)
+engine       tokens   agree   clear   regret  off>1/k     nll
+ours          93804  99.15%  99.71%   0.0141     3.29  0.1060
+gw.fp8        96579  95.88%  97.96%   0.0375    11.98  0.1330
+nv.fp8        95694  95.96%  97.96%   0.0368    12.14  0.1296
+ours.prev     93938  99.15%  99.71%   0.0141     3.29  0.1073
+  paired 95% CI (agree, engine - ours): gw.fp8 [-0.0375, -0.0272], nv.fp8 [-0.0375, -0.0267], ours.prev [-0.0003, +0.0004]
+  paired 95% CI (regret, engine - ours): gw.fp8 [+0.0125, +0.0305], nv.fp8 [+0.0125, +0.0303], ours.prev [-0.0002, +0.0001]
+  paired 95% CI (off1_per_k, engine - ours): gw.fp8 [+5.8535, +10.7398], nv.fp8 [+6.0860, +11.2134], ours.prev [-0.0379, +0.0217]
+
+== gsm8k (50 items)
+engine       tokens   agree   clear   regret  off>1/k     nll
+ours          20779  99.70% 100.00%   0.0002     0.00  0.0508
+gw.fp8        23618  97.13%  98.51%   0.0217     7.79  0.0850
+nv.fp8        22075  97.20%  98.62%   0.0197     6.93  0.0775
+ours.prev     20762  99.70% 100.00%   0.0002     0.00  0.0508
+
+== humaneval (40 items)
+engine       tokens   agree   clear   regret  off>1/k     nll
+ours           9396  99.85% 100.00%   0.0001     0.00  0.0211
+gw.fp8        10341  98.43%  99.20%   0.0126     4.93  0.0476
+nv.fp8         9781  98.62%  99.29%   0.0105     3.48  0.0387
+ours.prev      9411  99.85% 100.00%   0.0001     0.00  0.0210
+
+== ifeval (50 items)
+engine       tokens   agree   clear   regret  off>1/k     nll
+ours          14214  95.94%  97.88%   0.0924    21.74  0.4196
+gw.fp8        12518  87.27%  93.13%   0.1469    42.10  0.4765
+nv.fp8        13424  87.83%  93.34%   0.1377    40.15  0.4555
+ours.prev     14344  95.97%  97.89%   0.0915    21.54  0.4234
+
+== math500 (50 items)
+engine       tokens   agree   clear   regret  off>1/k     nll
+ours          49415  99.70% 100.00%   0.0002     0.00  0.0552
+gw.fp8        50102  96.91%  98.50%   0.0228     7.88  0.0875
+nv.fp8        50414  97.06%  98.50%   0.0225     8.65  0.0834
+ours.prev     49421  99.71% 100.00%   0.0001     0.00  0.0557

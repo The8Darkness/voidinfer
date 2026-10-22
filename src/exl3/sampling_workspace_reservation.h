@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3SamplingWorkspacePlan {
     bool sampled=false,occurrence_counts=false;
@@ -126,4 +126,4 @@ private:
     std::uint64_t request_generation_=0,root_revision_=0,acquisition_=0;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

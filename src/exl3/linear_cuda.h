@@ -12,8 +12,9 @@
 #include <atomic>
 #include <optional>
 #include <limits>
+#include <mutex>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // E2B intentionally exposes only device views. The packed EXL3 representation remains
 // the source of truth; callers own the immutable model allocations and the output buffer.
@@ -89,14 +90,6 @@ enum class Exl3CudaLinearAdmission {
     target_continuation_o,
     target_continuation_z,
     target_wide_prefill,
-    // Explicit native Qwen3.8 MTP owner.  This is intentionally separate
-    // from target_wide_prefill so ordinary/default callers cannot select the
-    // K4 wide route merely by changing workspace flags.
-    native_mtp_wide_prefill,
-    // One-row native MTP bridge.  This is a separate admission so the
-    // qualified wide-row bound above remains intact while the first real
-    // DFlash2 -> MTP step can use the same production K4 operator.
-    native_mtp_one_step,
     target_initial16,
     draft_prefill_fc,
     target_continuation_qkv,
@@ -133,6 +126,22 @@ struct Exl3CudaTransformView {
 struct Exl3CudaAccumulationView {
     float* data = nullptr;
     std::size_t bytes = 0;
+};
+
+// Small (verifier/decode-row) tier of a context whose prompt-scale views are
+// shared by every concurrent Engine lane. Each borrowed large view maps to the
+// small view of the same role; `scratch` replaces the shared layer scratch.
+struct Exl3SmallTierViews {
+    int rows = 0;
+    Exl3CudaAccumulationView accumulation, paired_up_accumulation;
+    Exl3CudaTransformView transformed, paired_up_transformed;
+    const float* large_paired_up_accumulation = nullptr;
+    const std::uint16_t* large_paired_up_transformed = nullptr;
+    Exl3CudaLayerScratchView scratch;
+    // Eight-lane contexts: the model's shared wider views (rows > this tier's)
+    // that a batched round's owner selects for its 33..64-row forwards
+    // (Exl3TextContext batch tier scope); null keeps one private tier.
+    const Exl3SmallTierViews* batch = nullptr;
 };
 
 struct Exl3ReconstructedExactStats {
@@ -284,6 +293,19 @@ public:
     // owns the stream ordering and closes the scope before the next layer.
     void begin_layer_reuse(std::size_t max_cached_bytes, bool allow_k5 = false);
     void end_layer_reuse() noexcept;
+    // The reuse slots stay allocated between prompts. Concurrent Engine lanes
+    // reclaim them for L0 codes under memory pressure: release_layer_reuse
+    // frees slots (largest first) down to keep_bytes and caps later scopes at
+    // that size until set_layer_reuse_limit raises it again. Any thread; it
+    // frees nothing (returns 0) while a layer scope is open.
+    std::size_t release_layer_reuse(std::size_t keep_bytes);
+    void set_layer_reuse_limit(std::size_t bytes) noexcept;
+    // Held while a prompt block sizes its cache (free memory, reservations,
+    // set_layer_reuse_limit), so a release either precedes the sizing or caps
+    // its result. Not while a layer scope is open on this thread.
+    std::unique_lock<std::mutex> lock_layer_reuse_budget();
+    // Current slot bytes, readable from any thread.
+    std::size_t layer_reuse_bytes() const noexcept;
     // Model layer of the active layer-major reuse scope (-1 outside one); the
     // NVFP4 mode 3 policy keeps layers >= 56 on MXFP8.
     void set_prefill_layer(int layer) noexcept;
@@ -302,7 +324,15 @@ public:
 
     std::size_t workspace_bytes() const noexcept;
     static std::size_t workspace_bytes_required(int in_features,int out_features,int rows,
-        bool accept_transpose_shape);
+        bool accept_transpose_shape,bool accept_all_model_shapes=false);
+    // FP16 reconstruction plane elements: every model projection fits
+    // 17408 x 5120, so the all-model-shapes workspace is not in x out.
+    static std::size_t reconstruction_plane_elements(int in_features,int out_features,
+        bool accept_all_model_shapes) noexcept {
+        const auto full=static_cast<std::size_t>(in_features)*static_cast<std::size_t>(out_features);
+        constexpr std::size_t largest_projection=17408ull*5120ull;
+        return accept_all_model_shapes && full>largest_projection?largest_projection:full;
+    }
     Exl3ReconstructGemmStats stats() const noexcept;
     bool supports(const Exl3CudaLinearMetadata& metadata,
                   int rows) const noexcept;
@@ -356,10 +386,17 @@ struct Exl3GdnControlSide {
 };
 
 // Side-stream L2 prefetch of a weight range after the work queued on
-// `stream` (NINFER_EXL3_L2_PREFETCH, default 1); join before capture ends.
+// `stream` (VOIDINFER_EXL3_L2_PREFETCH, default 1); join before capture ends.
 bool exl3_l2_prefetch_enabled();
 void exl3_l2_prefetch_fork(cudaStream_t stream,const void* data,std::size_t bytes);
 void exl3_l2_prefetch_join(cudaStream_t stream);
+
+// Batched multi-agent decode rounds (the leader's eager forward or graph
+// capture) may run their 33..64-row M64 projections with FP16 MMA
+// accumulation; every other call (exact VeriCache verify and line passes,
+// prefill) keeps FP32 accumulation. Thread-local scope flag.
+void exl3_set_batched_round_numerics(bool batched) noexcept;
+bool exl3_batched_round_numerics() noexcept;
 
 class Exl3CudaLinearWorkspace {
 public:
@@ -658,23 +695,6 @@ public:
         const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
         std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
 
-    // Test-only native-MTP prefill discriminator. K4 remains globally
-    // unadmitted for wide production callers; this reuses each decoded tile
-    // across sixteen rows while preserving generic_tile's per-output FP32
-    // accumulation order and the existing input/output transforms.
-    void forward_k4_prefill_for_test(
-        const Exl3CudaLinearWeights& weights,
-        const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-        std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
-
-    // Test-only draft-model discriminator for K4 wide prefill. This path is
-    // unreachable from production admissions: its represented dequantization,
-    // determinism, numerical error and economics must be qualified first.
-    void forward_k4_prefill_mma_for_test(
-        const Exl3CudaLinearWeights& weights,
-        const Exl3CudaLinearMetadata& metadata,const std::uint16_t* input,
-        std::uint16_t* output,int rows,cudaStream_t stream=nullptr);
-
     // Test-only wide-prefill discriminator. It retains the rejected row-pair
     // ownership but decodes each staged K6 B fragment once per CTA.
     void forward_k6_rowpair_shared_decode_for_test(
@@ -690,6 +710,10 @@ public:
     void set_native_continuation16(bool enabled) noexcept {
         native_continuation_rows_ = enabled ? 16 : 8;
     }
+    // Batched multi-agent drafting: 9..32 rows of the draft projection shapes
+    // run on the coherent packed producer (row-concatenated agents).
+    void enable_draft_batched() noexcept { draft_batched_enabled_ = true; }
+    void set_draft_batched(bool enabled) noexcept { draft_batched_enabled_ = enabled; }
 
     void set_reconstructed_exact(Exl3ReconstructedExactView view) noexcept {
         reconstructed_exact_ = view;
@@ -754,6 +778,16 @@ public:
     // (rows*heads extra CTAs, the control_fused_staged_kernel arithmetic) and
     // a BF16 copy of the first output in the GDN convolution-input layout
     // ([feature*rows+row]) ride on the same launches.
+    // 17..32-row (3-4 agent) pair of same-input projections in one M32
+    // producer launch (shared K split filling the resident slots).
+    bool forward_merged_pair_m32(Exl3CudaLinearWorkspace& second_workspace,
+                                 const Exl3CudaLinearWeights& first_weights,
+                                 const Exl3CudaLinearMetadata& first_metadata,
+                                 std::uint16_t* first_output,
+                                 const Exl3CudaLinearWeights& second_weights,
+                                 const Exl3CudaLinearMetadata& second_metadata,
+                                 std::uint16_t* second_output,const std::uint16_t* input,
+                                 int rows,cudaStream_t stream);
     bool forward_merged_pair(Exl3CudaLinearWorkspace& second_workspace,
                              const Exl3CudaLinearWeights& first_weights,
                              const Exl3CudaLinearMetadata& first_metadata,
@@ -914,6 +948,11 @@ public:
     bool target_k5_small_m_batch_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
+    // Any coherent packed producer (wide, down, O, K/V split) admits these
+    // 2..32 continuation rows as one launch, for every admitted bit width.
+    bool coherent_continuation_candidate(
+        const Exl3CudaLinearMetadata& metadata, int rows,
+        Exl3CudaLinearAdmission admission) const noexcept;
     bool target_k6_m1_simt_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
@@ -931,6 +970,11 @@ public:
         int rows,Exl3CudaLinearAdmission admission) const noexcept;
     int coherent_wide_k6_split_count(int rows) const noexcept;
     int coherent_split_override(const char* name, int rows) const;
+    int coherent_m32_split(int rows) const noexcept;
+    // Coherent packed producer for 9..32-row calls: draft-batched workspaces,
+    // and (VOIDINFER_EXL3_TARGET_COHERENT_M32, default on) target calls of one context
+    // (VeriCache verify passes) whose shape it covers (K 4..7, 128-column).
+    bool coherent_batched_rows(const Exl3CudaLinearMetadata& metadata, int rows) const noexcept;
     bool coherent_down_k6_candidate(const Exl3CudaLinearMetadata& metadata,
         int rows,Exl3CudaLinearAdmission admission) const noexcept;
     bool coherent_down_k7_candidate(const Exl3CudaLinearMetadata& metadata,
@@ -1052,14 +1096,67 @@ public:
     bool fast_wide_prefill_gemm_candidate(
         const Exl3CudaLinearMetadata& metadata, int rows,
         Exl3CudaLinearAdmission admission) const noexcept;
-    bool native_mtp_wide_prefill_candidate(
-        const Exl3CudaLinearMetadata& metadata, int rows,
-        Exl3CudaLinearAdmission admission) const noexcept;
-    bool native_mtp_one_step_candidate(
-        const Exl3CudaLinearMetadata& metadata, int rows,
-        Exl3CudaLinearAdmission admission) const noexcept;
 
     const std::uint16_t* transformed_device() const noexcept { return transformed_; }
+    // Two-tier storage for concurrent Engine lanes: the accumulation/transform
+    // views given at construction serve prompt-scale rows (and may be shared by
+    // every lane's context); this small private tier serves verifier and decode
+    // rows. The owning layer selects the tier around each forward.
+    // Maps each borrowed (large) view to its small counterpart; owned views
+    // stay as they are. Call while the large tier is active.
+    void attach_small_tier(const Exl3SmallTierViews& views) noexcept {
+        if (!accum_owned_ && accum_) {
+            const auto& view = views.large_paired_up_accumulation &&
+                accum_ == views.large_paired_up_accumulation ?
+                views.paired_up_accumulation : views.accumulation;
+            small_accum_ = view.data; small_accum_bytes_ = view.bytes;
+        }
+        if (!transformed_owned_ && transformed_) {
+            const auto& view = views.large_paired_up_transformed &&
+                transformed_ == views.large_paired_up_transformed ?
+                views.paired_up_transformed : views.transformed;
+            small_transformed_ = view.data; small_transformed_bytes_ = view.bytes;
+        }
+    }
+    // A wider batch tier (one model-level 64-row view set for eight-lane
+    // batched rounds, see Exl3SmallTierViews::batch): mapped like the small
+    // tier, exchanged with the active small views by swap_batch_tier.
+    void attach_batch_tier(const Exl3SmallTierViews& views) noexcept {
+        if (!accum_owned_ && accum_) {
+            const auto& view = views.large_paired_up_accumulation &&
+                accum_ == views.large_paired_up_accumulation ?
+                views.paired_up_accumulation : views.accumulation;
+            batch_accum_ = view.data; batch_accum_bytes_ = view.bytes;
+        }
+        if (!transformed_owned_ && transformed_) {
+            const auto& view = views.large_paired_up_transformed &&
+                transformed_ == views.large_paired_up_transformed ?
+                views.paired_up_transformed : views.transformed;
+            batch_transformed_ = view.data; batch_transformed_bytes_ = view.bytes;
+        }
+    }
+    // Call while the small tier is active (calls come in pairs).
+    void swap_batch_tier() noexcept {
+        if (batch_accum_) {
+            std::swap(accum_, batch_accum_);
+            std::swap(accumulation_capacity_bytes_, batch_accum_bytes_);
+        }
+        if (batch_transformed_) {
+            std::swap(transformed_, batch_transformed_);
+            std::swap(transformed_capacity_bytes_, batch_transformed_bytes_);
+        }
+    }
+    // Exchanges the active views with the other tier (calls come in pairs).
+    void swap_tier() noexcept {
+        if (small_accum_) {
+            std::swap(accum_, small_accum_);
+            std::swap(accumulation_capacity_bytes_, small_accum_bytes_);
+        }
+        if (small_transformed_) {
+            std::swap(transformed_, small_transformed_);
+            std::swap(transformed_capacity_bytes_, small_transformed_bytes_);
+        }
+    }
 
     bool draft_small_m_candidate_for_test(
         const Exl3CudaLinearMetadata& metadata,int rows) const noexcept {
@@ -1300,6 +1397,7 @@ private:
     bool h6_small_m_enabled_ = true;
     int active_output_features_ = 0;
     bool draft_small_m_enabled_ = false;
+    bool draft_batched_enabled_ = false;
     bool target_gateup_small_m_enabled_ = false;
     bool target_gateup_k6_async_a_enabled_ = false;
     bool target_gateup_k6_n16_enabled_ = false;
@@ -1445,8 +1543,8 @@ private:
         Exl3CudaLinearAdmission admission = Exl3CudaLinearAdmission::ordinary;
     };
     bool prefill_projection_graph_enabled_ = false;
-    ninfer::DecodeGraphDefinition prefill_projection_graph_definition_{};
-    ninfer::DecodeGraphExecutable prefill_projection_graph_executable_{};
+    voidinfer::DecodeGraphDefinition prefill_projection_graph_definition_{};
+    voidinfer::DecodeGraphExecutable prefill_projection_graph_executable_{};
     std::optional<PrefillProjectionGraphBinding> prefill_projection_graph_binding_;
     std::uint64_t prefill_projection_graph_captures_ = 0;
     std::uint64_t prefill_projection_graph_replays_ = 0;
@@ -1460,6 +1558,12 @@ private:
     bool draft_prefill_fc_enabled_ = false;
     std::uint16_t* transformed_ = nullptr;
     float* accum_ = nullptr;
+    float* small_accum_ = nullptr;
+    std::uint16_t* small_transformed_ = nullptr;
+    std::size_t small_accum_bytes_ = 0, small_transformed_bytes_ = 0;
+    float* batch_accum_ = nullptr;
+    std::uint16_t* batch_transformed_ = nullptr;
+    std::size_t batch_accum_bytes_ = 0, batch_transformed_bytes_ = 0;
     const std::uint16_t* pending_residual_left_ = nullptr;
     std::uint16_t* pending_residual_out_ = nullptr;
     const std::uint16_t* pending_norm_weight_ = nullptr;
@@ -1489,4 +1593,4 @@ struct Exl3MlpGateUpConcurrencyView {
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -2,7 +2,7 @@
 #include "exl3/attention_stage.h"
 #include "exl3/attention_stage_storage.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3AttentionStageBinding {
     Exl3AttentionStage::Ticket ticket;
     std::uint16_t* destination=nullptr;

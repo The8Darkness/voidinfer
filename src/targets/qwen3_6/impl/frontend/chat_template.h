@@ -1,7 +1,7 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
-#include <ninfer/types.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/types.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace voidinfer::targets::qwen3_6::frontend_internal {
 
 struct ToolCall {
     std::string id;
@@ -124,4 +124,4 @@ private:
     ChatTemplateSemantics semantics_;
 };
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace voidinfer::targets::qwen3_6::frontend_internal

@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // C2 transport-only rendezvous. Target reductions remain independent; this
 // owner gathers two completed, explicitly sized decision ranges and performs
@@ -106,8 +106,8 @@ class Exl3EngineGreedyPacketBatch {
                 second->source.consumer_recorded->store(true,std::memory_order_release);
             }
             const std::size_t rows=first.source.rows+(second?second->source.rows:0);
-            check(cudaMemcpyAsync(storage_->host,storage_->device,
-                rows*sizeof(Exl3GreedyRow),cudaMemcpyDeviceToHost,storage_->stream));
+            check(exl3_d2h_async(storage_->host,storage_->device,
+                rows*sizeof(Exl3GreedyRow),storage_->stream));
             check(cudaEventRecord(storage_->ready,storage_->stream));
             check(cudaEventSynchronize(storage_->ready));
             const auto invalid=std::exchange(invalid_row_for_test_,0u);
@@ -205,6 +205,11 @@ public:
                 is_cancelled(offer) || failed_;});
             if(!offer.done && !offer.claimed) {
                 if(waiting_==&offer)waiting_=nullptr;
+                // Another offer may hold the shared transport (a single that
+                // arrived while this one waited): never run two transports
+                // over the one device/host packet buffer.
+                while(busy_ && !failed_)changed_.wait(lock);
+                if(failed_)std::rethrow_exception(first_failure_);
                 const bool was_cancelled=is_cancelled(offer);
                 busy_=true;
                 lock.unlock();const bool completed=single(offer);lock.lock();offer.done=true;
@@ -253,4 +258,4 @@ public:
     }
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

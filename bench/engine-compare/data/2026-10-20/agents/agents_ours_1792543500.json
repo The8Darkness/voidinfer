@@ -1,0 +1,116 @@
+{
+ "agents": 8,
+ "chars": 400000,
+ "tokens": 256,
+ "turns": [
+  {
+   "turn": 0,
+   "wall_s": 272.73003816604614,
+   "ok": 5,
+   "errors": [
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests"
+   ],
+   "prompt_tokens": 537734,
+   "completion_tokens": 1280,
+   "per_request_s": [
+    188.1,
+    72.7,
+    272.7,
+    243.7,
+    109.4,
+    218.9,
+    42.4,
+    146.1
+   ],
+   "peak_gpu_mib": 31011,
+   "texts": [
+    "This is a complex, high-performance C++/CUDA codebase for an inference engine (likely `ninfer`), specifically focusing on EXL3 quantization, attention mechanisms, and a speculative decoding draft model (`DFlash2`).\n\nBelow is a detailed function-by-function review, categorized by module. I will highlight **correctness**, **performance**, **safety**, and **maintainability** issues.\n\n### 1. Core Utilities & Quantization Decoding\n\n#### `mul_const_u32`\n*   **Review:** Uses inline assembly to force integer multiply-accumulate (MAD) on sm_86 (RTX 3090).\n*   **Issue:** The comment states this workaround has inverted in CUDA 13.2, where plain multiply is faster. However, the code still uses the asm path if `__CUDA_ARCH__ == 860`.\n*   **Recommendation:** If targeting modern drivers/toolkits, consider removing the asm or gating it behind a specific driver version check, as the compiler likely optimizes `x * w` better now.\n\n#### `decode_mul1_product_2`, `decode_mcg_product_2`, `decode_3inst`\n*   **Review",
+    "This is a complex, high-performance C++ codebase for speculative decoding (specifically DFlash2) using CUDA. It involves intricate memory management, resource tracking, and GPU kernel orchestation.\n\nBelow is a detailed function-by-function review of the provided source code.\n\n### 1. `Exl3Dflash2DraftModel` Implementation Details\n\n#### `commit_target_block_internal`\n**Purpose:** Ingests new target tap rows into the draft model's KV ring buffer. This is the core mechanism for updating the draft model's context with verified tokens from the target model.\n\n**Review:**\n*   **Logic:** The function correctly handles the \"sliding window\" logic. If the ring is empty and the incoming batch is larger than the keep capacity (`kRingKeep`), it skips the oldest rows to maintain the invariant that only the newest `kRingKeep` rows are stored.\n*   **Kernel Launches:** It uses a per-row loop for processing. While this ensures correctness in position handling (RoPE depends on absolute position), it results in many small kernel launches (`dflash_tap_concat_kernel`, `forward`, `rms_norm`, etc.) inside the loop. For large batches, this could be a performance bottleneck due to",
+    "",
+    "",
+    "This is a highly complex, performance-critical CUDA inference engine for a specific model architecture (likely Qwen3.5 or similar, given the GDN/Gated Delta Net references and specific dimensions like `kHidden=5120`). The code implements two main layer types: `Exl3FullAttentionLayer` (standard Transformer attention) and `Exl3GdnLayer` (Gated Delta Net linear attention).\n\nBelow is a detailed review of the provided source code, broken down by major functional blocks and classes.\n\n### 1. General Observations & Architecture\n\n*   **Complexity:** The code exhibits extreme complexity with deep nesting of conditional logic (`if/else if` chains) to select between dozens of specialized CUDA kernel variants based on runtime conditions (row count, capture state, environment variables, feature flags).\n*   **Performance Focus:** There is heavy optimization for specific \"shapes\" (e.g., `rows == 1`, `rows <= 8`, `rows == 16`, `wide_prefill`). This suggests the system is tuned for specific batch sizes common in LLM inference (decode vs. prefill).\n*   **State Management:** Significant effort is put into managing device memory lifetimes, checkpointing",
+    "",
+    "This is a highly complex, performance-critical CUDA codebase for quantized matrix multiplication (GEMM) using the EXL3 format. The code implements multiple specialized kernels and dispatch logic to handle various model shapes, quantization bits (K5-K8), and execution contexts (prefill vs. decode/M1).\n\nBelow is a detailed function-by-function review.\n\n### 1. Core GEMM Kernels (Small M / Decode Path)\n\n#### `exl3_gemm_m1_generic_mma_body`\n**Purpose:** The central template body for small-M (M=1..8) GEMMs. It handles input transformation (Hadamard), weight decoding, MMA accumulation, and output reduction.\n**Review:**\n*   **Strengths:**\n    *   Highly templated to specialize for different bit-widths (`Bits`), pipeline depths (`DeepStages`), and fusion strategies (`FusedInput`).\n    *   Uses `cp.async` for asynchronous global-to-shared memory transfers, overlapping memory latency with computation.\n    *   Implements a multi-stage pipeline (`fragment_stages = 3`) to hide latency in the main loop.\n    *   Correctly handles swizzling for shared memory access to",
+    "This is a complex, high-performance CUDA C++ codebase for executing EXL3 quantized linear layers (GEMM/GEMV) on NVIDIA GPUs. The code implements a sophisticated dispatch system that selects from dozens of specialized kernel variants based on matrix dimensions (`in_features`, `out_features`), quantization bits (`K`), batch size (`rows`), and specific architectural features (e.g., \"coherent\" memory access patterns, \"persistent\" kernels, \"native MTP\" support).\n\nBelow is a detailed function-by-function review.\n\n### 1. Candidate Selection Functions\nThese functions determine *if* a specific optimized kernel path can be used for a given set of parameters. They are pure logic checks involving dimension matching, capacity limits, and feature flags.\n\n#### `fast_fp16_m2_8_down_candidate`\n*   **Purpose:** Checks if the \"Fast FP16 M2-8 Down\" projection can be used. This targets small batch sizes (2-8 rows) for the down-projection layer (17408 -> 5120) with K=6.\n*   **Logic:**\n    *   Requires `fast_fp16_m2_8_down_enabled_`"
+   ]
+  },
+  {
+   "turn": 1,
+   "wall_s": 307.6330215930939,
+   "ok": 0,
+   "errors": [
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests"
+   ],
+   "prompt_tokens": 0,
+   "completion_tokens": 0,
+   "per_request_s": [
+    218.2,
+    183.9,
+    31.9,
+    75.0,
+    153.1,
+    115.9,
+    259.1,
+    307.6
+   ],
+   "peak_gpu_mib": 31993,
+   "texts": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+   ]
+  },
+  {
+   "turn": 2,
+   "wall_s": 314.18599677085876,
+   "ok": 0,
+   "errors": [
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests",
+    "HTTP Error 429: Too Many Requests"
+   ],
+   "prompt_tokens": 0,
+   "completion_tokens": 0,
+   "per_request_s": [
+    50.7,
+    86.6,
+    121.4,
+    162.4,
+    239.4,
+    202.4,
+    314.2,
+    276.8
+   ],
+   "peak_gpu_mib": 31984,
+   "texts": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+   ]
+  }
+ ]
+}

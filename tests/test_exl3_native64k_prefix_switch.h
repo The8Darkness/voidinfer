@@ -7,7 +7,7 @@
 // state being attached is complete and that sibling suffixes remain private.
 void run_native64k_prefix_switch_qualification(
     Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==65536 && !source.empty(),
         "native64K prefix switch fixture/model extent");
     for(const auto token:source)

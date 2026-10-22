@@ -6,7 +6,7 @@
 #include <atomic>
 #include <memory>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3KVRegistrationProvider {
     cudaError_t (*acquire)(void*,std::size_t) noexcept=[](void* pointer,std::size_t bytes) noexcept {
         return cudaHostRegister(pointer,bytes,cudaHostRegisterDefault);

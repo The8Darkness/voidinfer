@@ -6,10 +6,10 @@
 struct PackedKVOCapture {
     const char* operation="k";
     int bits=7,layer=-1;
-    ninfer::exl3::Exl3CudaLinearWeights weights{};
-    ninfer::exl3::Exl3CudaLinearMetadata metadata{};
+    voidinfer::exl3::Exl3CudaLinearWeights weights{};
+    voidinfer::exl3::Exl3CudaLinearMetadata metadata{};
     std::shared_ptr<DeviceBuffer> input;
-    static void observe(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void observe(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         auto& self=*static_cast<PackedKVOCapture*>(user);
         if(self.input || x.rows!=8 || x.metadata.K!=self.bits ||
            std::string(x.operation)!=self.operation || (self.layer>=0 && self.layer!=x.layer))return;
@@ -22,7 +22,7 @@ struct PackedKVOCapture {
 };
 
 inline void run_packed_kvo_projection(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     require(source.size()>=1040,"held KVO requires two request inputs");
     for(const char* operation:{"k","v","o"})for(int variant=0;variant<2;++variant) {
         const bool output=std::string(operation)=="o";

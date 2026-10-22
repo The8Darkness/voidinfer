@@ -1,5 +1,5 @@
 #pragma once
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Each verifier row has its own chronological endpoint. A future tiled reader
 // may share represented history loads, but must not share this row's mask.
 struct Exl3AttentionCausalRows {

@@ -5,7 +5,7 @@ void run_t74_real_c2(
     const std::filesystem::path& draft_path,
     const std::vector<std::int64_t>& source,
     const std::filesystem::path& output) {
-    const std::string arm_order = env("NINFER_T74_ARM_ORDER");
+    const std::string arm_order = env("VOIDINFER_T74_ARM_ORDER");
     require(arm_order == "C1C2" || arm_order == "C2C1",
             "T74 arm order must be C1C2 or C2C1");
     require(target.max_context() >= 4352 && source.size() >= 4113,

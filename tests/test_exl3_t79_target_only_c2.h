@@ -208,7 +208,7 @@ void run_t79_target_only_c2(
         std::vector<std::int64_t>(code.begin(), code.begin() + kPrompt),
         std::vector<std::int64_t>(prose.begin(), prose.begin() + kPrompt)};
 
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "0");
     T79TargetOnlyLane lane_a(target, prompts[0]);
     T79TargetOnlyLane lane_b(target, prompts[1]);
     std::ofstream arms(output / "arms.csv");

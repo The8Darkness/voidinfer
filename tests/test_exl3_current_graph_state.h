@@ -15,7 +15,7 @@ struct GraphCurrentDiagnostics {
     std::string graph_status;
     std::uint64_t routed_oscar = 0;
     std::uint64_t routed_ordinary = 0;
-    ninfer::exl3::Exl3OscarTelemetry telemetry{};
+    voidinfer::exl3::Exl3OscarTelemetry telemetry{};
 };
 
 struct GraphCurrentSnapshot {
@@ -481,19 +481,19 @@ void graph_current_enable_oscar(Exl3TextContext& context) {
 
 void graph_current_require_environment(int max_context) {
     require(max_context == 1024, "graphcurrentstate requires maxctx1024");
-    require(env("NINFER_OSCAR_EXL3") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1",
             "graphcurrentstate requires canonical OSCAR");
-    require(env("NINFER_EXL3_PREFILL_ROWPAIR_K6") == "0",
+    require(env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6") == "0",
             "graphcurrentstate requires rowpair0");
-    require(env("NINFER_EXL3_WIDE_PREFILL") == "1" &&
-                env("NINFER_EXL3_PREFILL_WIDE64") == "1" &&
-                env("NINFER_EXL3_PREFILL_WIDE128") == "1" &&
-                (env("NINFER_EXL3_SHARED_LAYER_SCRATCH").empty() ||
-                 env("NINFER_EXL3_SHARED_LAYER_SCRATCH") == "1"),
+    require(env("VOIDINFER_EXL3_WIDE_PREFILL") == "1" &&
+                env("VOIDINFER_EXL3_PREFILL_WIDE64") == "1" &&
+                env("VOIDINFER_EXL3_PREFILL_WIDE128") == "1" &&
+                (env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH").empty() ||
+                 env("VOIDINFER_EXL3_SHARED_LAYER_SCRATCH") == "1"),
             "graphcurrentstate requires the P17 wide128 overlay");
-    require(env("NINFER_EXL3_PREFILL_WIDE256") != "1" &&
-                env("NINFER_EXL3_PREFILL_WIDE512") != "1" &&
-                env("NINFER_EXL3_PREFILL_WIDE1024") != "1",
+    require(env("VOIDINFER_EXL3_PREFILL_WIDE256") != "1" &&
+                env("VOIDINFER_EXL3_PREFILL_WIDE512") != "1" &&
+                env("VOIDINFER_EXL3_PREFILL_WIDE1024") != "1",
             "graphcurrentstate requires final prefill capacity128");
 }
 

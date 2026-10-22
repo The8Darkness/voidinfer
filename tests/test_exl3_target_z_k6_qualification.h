@@ -2,7 +2,7 @@
 #include "test_exl3_target_z_k6_oracle.h"
 
 struct TargetZK6Qualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_continuation_z;
     static constexpr int output = 6144;
     static constexpr std::size_t guard = 128, extent = 8u * output;
@@ -19,23 +19,23 @@ struct TargetZK6Qualification {
         f.write(reinterpret_cast<const char*>(data.data()),data.size()*sizeof(T));
         require(f.good(),"z raw evidence write");
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<TargetZK6Qualification*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         require(x.rows==8 && x.metadata.K==6 && x.metadata.in_features==kHidden && x.metadata.out_features==output && std::string(x.operation)=="z","z capture extent");
         require(std::find(layers.begin(),layers.end(),x.layer)==layers.end(),"duplicate z capture");
         layers.push_back(x.layer);
         cuda_check(cudaStreamSynchronize(x.stream),"z input ready");
         std::vector<std::uint16_t> input(8u*kHidden);
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),"z input copy");
-        _putenv_s("NINFER_EXL3_TARGET_Z_K6_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M","0");
         Exl3CudaLinearWorkspace baseline(kHidden,output,8,false,false,false,false,true);
-        _putenv_s("NINFER_EXL3_TARGET_Z_K6_SMALL_M","1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M","1");
         Exl3CudaLinearWorkspace candidate(kHidden,output,8,false,false,false,false,true);
         Exl3CudaLinearWorkspace unowned(kHidden,output,8);
         Exl3CudaLinearWorkspace short_owner(kHidden,output,4,false,false,false,false,true);
-        _putenv_s("NINFER_EXL3_TARGET_Z_K6_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M","0");
         require(candidate.target_z_k6_small_m_candidate(x.metadata,8,admit) && !baseline.target_z_k6_small_m_candidate(x.metadata,8,admit),"z latched enable");
         require(!unowned.target_z_k6_small_m_candidate(x.metadata,8,admit) && !candidate.target_z_k6_small_m_candidate(x.metadata,8,Admission::ordinary) && !short_owner.target_z_k6_small_m_candidate(x.metadata,8,admit),"z ownership/capacity");
         for(int m=0;m<=17;++m)require(candidate.target_z_k6_small_m_candidate(x.metadata,m,admit)==(m>=2 && m<=8),"z width admission");
@@ -46,11 +46,11 @@ struct TargetZK6Qualification {
             require(!candidate.target_z_k6_small_m_candidate(md,8,admit),"z metadata admission");
         }
         if(layers.size()==1)for(const char* disabled:{"","0","2","true","01"}) {
-            _putenv_s("NINFER_EXL3_TARGET_Z_K6_SMALL_M",disabled);
+            _putenv_s("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M",disabled);
             Exl3CudaLinearWorkspace off(kHidden,output,8,false,false,false,false,true);
             require(!off.target_z_k6_small_m_candidate(x.metadata,8,admit),"z exact flag1 required");
         }
-        _putenv_s("NINFER_EXL3_TARGET_Z_K6_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M","0");
         require(std::string(candidate.dispatch_name(x.metadata,8,admit))=="target_z_k6_small_m_mma_split" && std::string(candidate.dispatch_name(x.metadata,1,admit))=="generic_mma_split","z dispatch");
         DeviceBuffer a((extent+2*guard)*2),b((extent+2*guard)*2);
         auto* pa=static_cast<std::uint16_t*>(a.get())+guard;
@@ -97,12 +97,12 @@ struct TargetZK6Qualification {
 };
 
 void run_target_z_k6_qualification(Exl3TextModel& target) {
-    require(env("NINFER_EXL3_TARGET_Z_K6_SMALL_M")=="0","z capture requires flag0");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=24,"z teacher extent");
+    require(env("VOIDINFER_EXL3_TARGET_Z_K6_SMALL_M")=="0","z capture requires flag0");
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=24,"z teacher extent");
     auto ctx=target.create_context(true);require(ctx->try_enable_oscar_from_environment(),"z OSCAR required");
     ctx->prefill(std::span<const std::int64_t>(ids.data(),16));
-    TargetZK6Qualification check(env("NINFER_E5A4_OUT"));
-    ctx->set_target_projection_observer_for_test(TargetZK6Qualification::callback,&check,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::z_k6);
+    TargetZK6Qualification check(env("VOIDINFER_E5A4_OUT"));
+    ctx->set_target_projection_observer_for_test(TargetZK6Qualification::callback,&check,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::z_k6);
     ctx->append_prefill(std::span<const std::int64_t>(ids.data()+16,8));
     cuda_check(cudaDeviceSynchronize(),"z sweep ready");ctx->set_target_projection_observer_for_test(nullptr,nullptr);
     require(check.layers.size()==47 && ctx->position()==24,"z full layer coverage");

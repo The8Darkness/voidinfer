@@ -58,8 +58,8 @@ struct PreparedKVUploadProvider {
 };
 struct RefusingKVRegistrationAuthority {
     struct RegistrationCredits {
-        ninfer::exl3::RetainedCudaRegistrationLedger::Ticket registration;
-        ninfer::exl3::RetainedDescriptorLedger::Ticket metadata;
+        voidinfer::exl3::RetainedCudaRegistrationLedger::Ticket registration;
+        voidinfer::exl3::RetainedDescriptorLedger::Ticket metadata;
     };
     RegistrationCredits reserve_startup_registration_constructor_credits(std::uint64_t,std::uint64_t) {
         throw std::logic_error("refusing authority cannot grant constructor credits");
@@ -67,13 +67,13 @@ struct RefusingKVRegistrationAuthority {
     bool requested=false;
     void seal_failed_startup_retirement() noexcept {}
     template<class Factory,class Rollback,class Observe> void allocate_startup_resources(
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,Rollback&& rollback,Observe&& observe) {
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,Rollback&& rollback,Observe&& observe) {
         try{allocate_startup_resources(required,std::forward<Factory>(factory));}
         catch(...){rollback();observe();throw;}
     }
     template<class Factory> void allocate_startup_resources(
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&&) {
-        using Domain=ninfer::exl3::Exl3ResourceInventory::Domain;
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&&) {
+        using Domain=voidinfer::exl3::Exl3ResourceInventory::Domain;
         if(required.units[static_cast<unsigned>(Domain::cuda_registered_host)]!=64ULL*1024*2 ||
            !required.units[static_cast<unsigned>(Domain::host_metadata)])
             throw std::logic_error("registration preflight omitted backing/metadata");
@@ -94,7 +94,7 @@ struct PreparedKVRegistrationAuthority {
     void reserve_runtime_host_sources(){host_sources_reserved=true;}
     bool fail_host_source_binding=false;
     void bind_runtime_host_source(const Lease& lease,const std::shared_ptr<const void>& lifetime,
-        const ninfer::exl3::Exl3DevicePageKey& key) {
+        const voidinfer::exl3::Exl3DevicePageKey& key) {
         if(!host_sources_reserved || lease!=7 || !lifetime || !key.current())throw std::invalid_argument("fixture host source binding");
         if(fail_host_source_binding)throw std::runtime_error("injected host source binding failure");
         ++host_source_bindings;
@@ -105,17 +105,17 @@ struct PreparedKVRegistrationAuthority {
     unsigned malformed_constructor_credit=0;
     unsigned malformed_constructor_credit_on_call=0,constructor_credit_calls=0;
     bool sealed=false,constructor_scope=false,runtime_scope=false;
-    ninfer::exl3::Exl3ResourceInventory::Totals constructor_ceiling{},constructor_issued{};
-    ninfer::exl3::RetainedDeviceLedger constructor_device;
-    ninfer::exl3::RetainedDescriptorLedger constructor_metadata;
-    ninfer::exl3::RetainedCudaRegistrationLedger constructor_registration;
+    voidinfer::exl3::Exl3ResourceInventory::Totals constructor_ceiling{},constructor_issued{};
+    voidinfer::exl3::RetainedDeviceLedger constructor_device;
+    voidinfer::exl3::RetainedDescriptorLedger constructor_metadata;
+    voidinfer::exl3::RetainedCudaRegistrationLedger constructor_registration;
     using RegistrationCredits=RefusingKVRegistrationAuthority::RegistrationCredits;
     RegistrationCredits issue_registration_credits(std::uint64_t registration,std::uint64_t metadata) {
-        using Domain=ninfer::exl3::Exl3ResourceInventory::Domain;
+        using Domain=voidinfer::exl3::Exl3ResourceInventory::Domain;
         if(!constructor_scope || !registration || !metadata)throw std::logic_error("fixture registration constructor scope");
         const auto r=static_cast<unsigned>(Domain::cuda_registered_host),m=static_cast<unsigned>(Domain::host_metadata);
         if(registration>constructor_ceiling[r]-constructor_issued[r] || metadata>constructor_ceiling[m]-constructor_issued[m])
-            throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+            throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
         const auto registration_grant=malformed_constructor_credit==1?registration-1:malformed_constructor_credit==2?registration+1:registration;
         const auto metadata_grant=malformed_constructor_credit==3?metadata-1:malformed_constructor_credit==4?metadata+1:metadata;
         auto a=constructor_registration.acquire(registration_grant);auto b=constructor_metadata.acquire(metadata_grant);
@@ -130,8 +130,8 @@ struct PreparedKVRegistrationAuthority {
         return issue_registration_credits(registration,metadata);
     }
     struct ConstructorCredits {
-        ninfer::exl3::RetainedDeviceLedger::Ticket device;
-        ninfer::exl3::RetainedDescriptorLedger::Ticket metadata;
+        voidinfer::exl3::RetainedDeviceLedger::Ticket device;
+        voidinfer::exl3::RetainedDescriptorLedger::Ticket metadata;
     };
     ConstructorCredits reserve_runtime_constructor_credits(std::uint64_t device,std::uint64_t metadata) {
         if(!runtime_scope)throw std::logic_error("fixture runtime constructor scope");
@@ -142,11 +142,11 @@ struct PreparedKVRegistrationAuthority {
         return issue_constructor_credits(device,metadata);
     }
     ConstructorCredits issue_constructor_credits(std::uint64_t device,std::uint64_t metadata) {
-        using Domain=ninfer::exl3::Exl3ResourceInventory::Domain;
+        using Domain=voidinfer::exl3::Exl3ResourceInventory::Domain;
         if(!constructor_scope || !device || !metadata)throw std::logic_error("fixture constructor scope");
         const auto d=static_cast<unsigned>(Domain::device),m=static_cast<unsigned>(Domain::host_metadata);
         if(device>constructor_ceiling[d]-constructor_issued[d] || metadata>constructor_ceiling[m]-constructor_issued[m])
-            throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+            throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
         ++constructor_credit_calls;
         const auto malformed=(!malformed_constructor_credit_on_call ||
             constructor_credit_calls==malformed_constructor_credit_on_call)?malformed_constructor_credit:0;
@@ -157,61 +157,61 @@ struct PreparedKVRegistrationAuthority {
     }
     void seal_failed_startup_retirement() noexcept {sealed=true;}
     std::function<void()> before_factory;
-    ninfer::exl3::Exl3ResourceInventory retained;
-    ninfer::exl3::RetainedDescriptorLedger retired_metadata;
+    voidinfer::exl3::Exl3ResourceInventory retained;
+    voidinfer::exl3::RetainedDescriptorLedger retired_metadata;
     std::uint64_t registered_limit=std::numeric_limits<std::uint64_t>::max();
     bool compute_leases_current(std::span<const Lease> leases) const {
         ++lease_checks;
         return (!expire_after_checks || lease_checks<=expire_after_checks) && leases.size()==1 && leases[0]==7;
     }
     template<class Retire> bool retire_runtime_resource(const Lease& lease,
-        const ninfer::exl3::Exl3ResourceInventory::Allocation& allocation,Retire&& retire) {
+        const voidinfer::exl3::Exl3ResourceInventory::Allocation& allocation,Retire&& retire) {
         if(lease!=7)throw std::invalid_argument("fixture retirement lease stale");
         auto next=retained.without_allocation(allocation);
         if(!retire(allocation))return false;
         retained=std::move(next);return true;
     }
     void transfer_retired_metadata(const Lease& lease,
-        const ninfer::exl3::Exl3ResourceInventory::Allocation& old,
-        const ninfer::exl3::Exl3ResourceInventory::Allocation& tracking) {
+        const voidinfer::exl3::Exl3ResourceInventory::Allocation& old,
+        const voidinfer::exl3::Exl3ResourceInventory::Allocation& tracking) {
         if(lease!=7)throw std::invalid_argument("fixture metadata lease stale");
         retained=retained.transfer_metadata(old,tracking);
     }
     bool collect_retired_metadata(const Lease& lease,
-        const ninfer::exl3::Exl3ResourceInventory::Allocation& tracking,const std::weak_ptr<const void>& old) {
+        const voidinfer::exl3::Exl3ResourceInventory::Allocation& tracking,const std::weak_ptr<const void>& old) {
         if(lease!=7)throw std::invalid_argument("fixture metadata collection lease stale");
         if(!retained.metadata_owner_expired(tracking,old))return false;
         auto next=retained.without_allocation(tracking);
         retained=std::move(next);return true;
     }
     template<class Factory> void allocate_runtime_resources(const Lease& lease,
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory) {
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory) {
         if(lease!=7)throw std::invalid_argument("fixture runtime lease stale");
         runtime_scope=true;
         struct RuntimeScope {bool& active;~RuntimeScope(){active=false;}} scope{runtime_scope};
         ++runtime_requests;allocate_startup_resources(required,std::forward<Factory>(factory));
     }
     template<class Factory,class Rollback,class Observe> void allocate_runtime_resources(const Lease& lease,
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,
         Rollback&& rollback,Observe&& observe) {
         try{allocate_runtime_resources(lease,required,std::forward<Factory>(factory));}
         catch(...){std::forward<Rollback>(rollback)();std::forward<Observe>(observe)();throw;}
     }
     bool retire_runtime_metadata_to_lifetime(const Lease& lease,
-        const ninfer::exl3::Exl3ResourceInventory::Allocation& allocation) {
+        const voidinfer::exl3::Exl3ResourceInventory::Allocation& allocation) {
         if(lease!=7 || !allocation.lifetime_retire)throw std::invalid_argument("fixture metadata lifetime retirement");
         auto next=retained.without_allocation(allocation);
         if(!allocation.lifetime_retire(allocation.owner,retired_metadata.acquire(allocation.units)))return false;
         retained=std::move(next);return true;
     }
     template<class Factory> void allocate_startup_resources(
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory) {
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory) {
         if(sealed)throw std::runtime_error("fixture authority sealed after cleanup failure");
-        if(exhaust)throw ninfer::exl3::Exl3ResourceReservationExhausted{};
-        const auto domain=static_cast<unsigned>(ninfer::exl3::Exl3ResourceInventory::Domain::cuda_registered_host);
+        if(exhaust)throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
+        const auto domain=static_cast<unsigned>(voidinfer::exl3::Exl3ResourceInventory::Domain::cuda_registered_host);
         const auto current=retained.totals()[domain];
         if(current>registered_limit || required.units[domain]>registered_limit-current)
-            throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+            throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
         if(fail_factory)throw std::runtime_error("prepared unrelated allocation failure");
         if(before_factory)before_factory();
         auto actual=[&] {
@@ -224,12 +224,12 @@ struct PreparedKVRegistrationAuthority {
         retained.append(actual);
     }
     template<class Factory,class Rollback> void allocate_startup_resources(
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,Rollback&& rollback) {
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,Rollback&& rollback) {
         try{allocate_startup_resources(required,std::forward<Factory>(factory));}
         catch(...){std::forward<Rollback>(rollback)();throw;}
     }
     template<class Factory,class Rollback,class Observe> void allocate_startup_resources(
-        const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,Rollback&& rollback,Observe&& observe) {
+        const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory,Rollback&& rollback,Observe&& observe) {
         try{allocate_startup_resources(required,std::forward<Factory>(factory));}
         catch(...){rollback();observe();throw;}
     }
@@ -239,21 +239,21 @@ struct PreparedAttentionStageBudget : PreparedKVRegistrationAuthority {
     void (*after_rollback)(std::size_t)=nullptr;
     std::size_t rollback_expected_blocks=0;
     template<class Factory>
-    void allocate_startup_resources(const ninfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory) {
-        using Domain=ninfer::exl3::Exl3ResourceInventory::Domain;
+    void allocate_startup_resources(const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,Factory&& factory) {
+        using Domain=voidinfer::exl3::Exl3ResourceInventory::Domain;
         if(required.units[static_cast<unsigned>(Domain::device)]>device_limit ||
             required.units[static_cast<unsigned>(Domain::host_metadata)]>metadata_limit)
-            throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+            throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
         PreparedKVRegistrationAuthority::allocate_startup_resources(required,std::forward<Factory>(factory));
     }
     template<class Factory,class Rollback>
-    void allocate_startup_resources(const ninfer::exl3::Exl3ResourceInventory::Requirement& required,
+    void allocate_startup_resources(const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,
         Factory&& factory,Rollback&& rollback) {
         try{allocate_startup_resources(required,std::forward<Factory>(factory));}
         catch(...){std::forward<Rollback>(rollback)();if(after_rollback)after_rollback(rollback_expected_blocks);throw;}
     }
     template<class Factory,class Rollback,class Observe>
-    void allocate_startup_resources(const ninfer::exl3::Exl3ResourceInventory::Requirement& required,
+    void allocate_startup_resources(const voidinfer::exl3::Exl3ResourceInventory::Requirement& required,
         Factory&& factory,Rollback&& rollback,Observe&& observe) {
         try{allocate_startup_resources(required,std::forward<Factory>(factory));}
         catch(...){
@@ -265,7 +265,7 @@ struct PreparedAttentionStageBudget : PreparedKVRegistrationAuthority {
     }
 };
 inline void prepared_kv_registration_preflight() {
-    using namespace ninfer::exl3;
+    using namespace voidinfer::exl3;
     {
         using Cache=Exl3KVRegistrationCache;
         const auto before=bounded_shared_live_blocks_for_test<Cache>();
@@ -359,13 +359,13 @@ inline void prepared_kv_registration_preflight() {
         if(Owner::attach_registration_credit(owner,ledger.acquire(bytes)))
             throw std::runtime_error("retired registration accepted new byte ticket");
     }
-    if(const auto* mode=std::getenv("NINFER_TEST_REGISTRATION_COMMIT_CLEANUP");mode && *mode) {
+    if(const auto* mode=std::getenv("VOIDINFER_TEST_REGISTRATION_COMMIT_CLEANUP");mode && *mode) {
         using Owner=Exl3RegisteredKVBacking;using Provider=PreparedKVRegistrationProvider;
         const std::string_view selected(mode);
         if(selected!="release" && selected!="retain")throw std::invalid_argument("registration commit cleanup selector");
         const bool retain=selected=="retain";
-        const bool startup=std::getenv("NINFER_TEST_REGISTRATION_COMMIT_STARTUP") &&
-            std::string_view(std::getenv("NINFER_TEST_REGISTRATION_COMMIT_STARTUP"))=="1";
+        const bool startup=std::getenv("VOIDINFER_TEST_REGISTRATION_COMMIT_STARTUP") &&
+            std::string_view(std::getenv("VOIDINFER_TEST_REGISTRATION_COMMIT_STARTUP"))=="1";
         auto page=std::make_shared<Exl3ExactKVPage>();page->rows=64;page->k[0].resize(64*1024);
         const auto extent=Exl3ExactKVExtent::view(page,0,Exl3ExactKVExtent::Plane::key,64);
         PreparedKVRegistrationAuthority authority;authority.fail_commit=true;
@@ -593,7 +593,7 @@ inline void prepared_kv_registration_preflight() {
             bounded_shared_live_blocks_for_test<Exl3DevicePageAttention>()!=attention)
             throw std::runtime_error("page reader aggregate clean retirement leak");
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_DEVICE_PAGE_COPY_FAILURE");selected && *selected) {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_DEVICE_PAGE_COPY_FAILURE");selected && *selected) {
         using Copy=Exl3DevicePageCopy;using IO=PreparedKVUploadProvider;
         using Fill=Exl3DevicePageFill;
         const std::string_view mode(selected);
@@ -650,7 +650,7 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("page copy final weak release discarded quarantined State charge");
         return; // Intentional quarantine; each stage needs a separate authorized process.
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_ATTENTION_STORAGE_CONSTRUCTOR_FAILURE");selected && *selected) {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_ATTENTION_STORAGE_CONSTRUCTOR_FAILURE");selected && *selected) {
         using Owner=Exl3AttentionStageStorage;using Events=PreparedAttentionStageEvents;
         using Storage=PreparedDevicePageStorageProvider;
         const std::string_view mode(selected);
@@ -676,13 +676,13 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("C2 failed construction lost earlier lane retirement credits");
         return; // Intentional quarantine, one mode per separately authorized process.
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_DEVICE_PAGE_CONSTRUCTOR_FAILURE");selected && *selected) {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_DEVICE_PAGE_CONSTRUCTOR_FAILURE");selected && *selected) {
         using Storage=Exl3DevicePageStorage;using Provider=PreparedDevicePageStorageProvider;
         const std::string_view mode(selected);
         if(mode!="retain" && mode!="release")throw std::invalid_argument("page constructor failure mode retain/release");
         const bool retain=mode=="retain";
         unsigned fault=1;
-        if(const auto* stage=std::getenv("NINFER_TEST_DEVICE_PAGE_CONSTRUCTOR_STAGE")) {
+        if(const auto* stage=std::getenv("VOIDINFER_TEST_DEVICE_PAGE_CONSTRUCTOR_STAGE")) {
             const std::string_view value(stage);
             if(value.size()!=1 || value[0]<'1' || value[0]>'4')throw std::invalid_argument("page constructor stage1..4");
             fault=value[0]-'0';
@@ -1124,7 +1124,7 @@ inline void prepared_kv_registration_preflight() {
         using Events=PreparedAttentionStageEvents;
         using Storage=PreparedDevicePageStorageProvider;
         Exl3AttentionStageStorageProvider provider{Storage::allocate,Storage::release,Events::create,Events::destroy};
-        if(const auto* mode=std::getenv("NINFER_TEST_C2_ATTENTION_GRANT_CLEANUP");mode && *mode) {
+        if(const auto* mode=std::getenv("VOIDINFER_TEST_C2_ATTENTION_GRANT_CLEANUP");mode && *mode) {
             const std::string_view selected(mode);
             if(selected!="event" && selected!="destination")throw std::invalid_argument("C2 grant cleanup selector");
             PreparedKVRegistrationAuthority transaction;
@@ -1496,7 +1496,7 @@ inline void prepared_kv_registration_preflight() {
         if(!pages[0].expired() || !pages[1].expired())
             throw std::runtime_error("completed history stage retained source pages");
     }
-    if(const auto* mode=std::getenv("NINFER_TEST_ATTENTION_HISTORY_FAILURE");mode && *mode) {
+    if(const auto* mode=std::getenv("VOIDINFER_TEST_ATTENTION_HISTORY_FAILURE");mode && *mode) {
         using Copy=PreparedKVUploadProvider;using Command=Exl3AttentionStageCommand;
         using Events=PreparedAttentionStageEvents;using Storage=PreparedDevicePageStorageProvider;
         const std::string_view selected(mode);
@@ -1551,7 +1551,7 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("partial history quarantine lost registration guard");
         return; // Isolated future process; Engine reload refusal follows in caller.
     }
-    if(const auto* mode=std::getenv("NINFER_TEST_ATTENTION_STORAGE_FAILURE");mode && *mode) {
+    if(const auto* mode=std::getenv("VOIDINFER_TEST_ATTENTION_STORAGE_FAILURE");mode && *mode) {
         const bool event=std::string_view(mode)=="event";
         if(!event && std::string_view(mode)!="release")throw std::invalid_argument("attention storage failure mode");
         using Events=PreparedAttentionStageEvents;using Storage=PreparedDevicePageStorageProvider;
@@ -1587,7 +1587,7 @@ inline void prepared_kv_registration_preflight() {
     {
         // A direct attention consumer reads both staged planes through final use.
         // Completing K must not retire the common allocation still read by V.
-        const auto* mode=std::getenv("NINFER_TEST_ATTENTION_STAGE_SECOND_PLANE_FAILURE");
+        const auto* mode=std::getenv("VOIDINFER_TEST_ATTENTION_STAGE_SECOND_PLANE_FAILURE");
         const bool fail_second=mode && std::string_view(mode)=="1";
         using Events=PreparedAttentionStageEvents;using Storage=PreparedDevicePageStorageProvider;
         using Copy=PreparedKVUploadProvider;using Command=Exl3AttentionStageCommand;
@@ -1680,7 +1680,7 @@ inline void prepared_kv_registration_preflight() {
             return; // Deliberate quarantine; separate future process.
         }
     }
-    if(const auto* mode=std::getenv("NINFER_TEST_ATTENTION_STAGE_FAILURE");mode && *mode) {
+    if(const auto* mode=std::getenv("VOIDINFER_TEST_ATTENTION_STAGE_FAILURE");mode && *mode) {
         const bool producer=std::string_view(mode)=="producer";
         if(!producer && std::string_view(mode)!="consumer")
             throw std::invalid_argument("attention stage failure must be producer or consumer");
@@ -2548,7 +2548,7 @@ inline void prepared_kv_registration_preflight() {
         if(prepared.fill->retained_readers()!=0 || !prepared.fill->seal_for_retirement())
             throw std::runtime_error("noninitial attention did not retire reader");
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_DEVICE_PAGE_FILL_FAILURE");selected && std::string(selected)=="1") {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_DEVICE_PAGE_FILL_FAILURE");selected && std::string(selected)=="1") {
         const auto quarantined=Exl3DevicePageFill::quarantined_records();
         const auto released=PreparedDevicePageStorageProvider::releases;
         std::weak_ptr<int> event_owner;
@@ -2588,7 +2588,7 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("page quarantine dropped registration cache ownership");
         return; // Terminal fixture: the intentionally uncertain owner remains quarantined.
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_DEVICE_PAGE_ATTENTION_FAILURE");selected && *selected) {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_DEVICE_PAGE_ATTENTION_FAILURE");selected && *selected) {
         using Attention=Exl3DevicePageAttention;using IO=PreparedKVUploadProvider;
         const std::string mode(selected);
         if(mode!="record" && mode!="wait")throw std::invalid_argument("attention failure requires record/wait");
@@ -2655,7 +2655,7 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("attention final weak release discarded quarantined state credit");
         return; // deliberate quarantine: one stage per future process
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_DEVICE_PAGE_FREE_FAILURE");selected && std::string(selected)=="1") {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_DEVICE_PAGE_FREE_FAILURE");selected && std::string(selected)=="1") {
         using Storage=Exl3DevicePageStorage;using IO=PreparedDevicePageStorageProvider;
         const auto before=Storage::quarantined_bytes(),calls=std::uint64_t(IO::releases);
         {
@@ -2691,7 +2691,7 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("failed committed free lost exact state/device survivor tickets");
         return; // deliberate retained allocation: separate future process
     }
-    if(const auto* selected=std::getenv("NINFER_TEST_KV_UPLOAD_FAILURE");selected && *selected) {
+    if(const auto* selected=std::getenv("VOIDINFER_TEST_KV_UPLOAD_FAILURE");selected && *selected) {
         using Upload=Exl3RegisteredKVUpload;using IO=PreparedKVUploadProvider;
         const std::string mode(selected);
         if(mode=="overlap_wait") {
@@ -2806,7 +2806,7 @@ inline void prepared_kv_registration_preflight() {
             throw std::runtime_error("quarantined transfer lost registration reader pin");
         return; // deliberate quarantine: one failure stage per future process
     }
-    if(const auto* fail=std::getenv("NINFER_TEST_KV_REGISTRATION_TEARDOWN_FAILURE");fail &&
+    if(const auto* fail=std::getenv("VOIDINFER_TEST_KV_REGISTRATION_TEARDOWN_FAILURE");fail &&
         (std::string(fail)=="1" || std::string(fail)=="sealed")) {
         const auto before=Exl3RegisteredKVBacking::quarantined_bytes();
         std::weak_ptr<const Exl3ExactKVPage> survivor;

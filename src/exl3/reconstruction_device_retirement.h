@@ -1,6 +1,6 @@
 #pragma once
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 struct Exl3ReconstructionDrainResult {
     int error=0;
     int restore_error=0;
@@ -27,4 +27,4 @@ Exl3ReconstructionDrainResult exl3_retire_reconstruction_device(
     if(change)result.restore_error=select(previous);
     return result;
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -1,10 +1,10 @@
 #pragma once
 struct WidePrefillOperators {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit=Admission::target_wide_prefill;
     static constexpr std::size_t guard=128;
     static constexpr int sample_widths[]={1,2,15,16,17,31,32,33,127,128,129,255,256,257,511,512,513,767,768,769,1023,1024};
-    const int width = env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
+    const int width = env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
     std::filesystem::path directory;
     std::ofstream csv;
     std::vector<std::string> seen;
@@ -16,10 +16,10 @@ struct WidePrefillOperators {
     template<class T> void save(const std::string& name,const std::vector<T>& data) {
         std::ofstream f(directory/name,std::ios::binary);f.write(reinterpret_cast<const char*>(data.data()),data.size()*sizeof(T));require(f.good(),"wide raw evidence write");
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<WidePrefillOperators*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         require(x.rows==width,"wide capture needs configured rows");
         const auto tag=std::to_string(x.layer)+"-"+x.operation;
         require(std::find(seen.begin(),seen.end(),tag)==seen.end(),"duplicate wide projection");seen.push_back(tag);
@@ -27,9 +27,9 @@ struct WidePrefillOperators {
         cuda_check(cudaStreamSynchronize(x.stream),"wide input ready");
         std::vector<std::uint16_t> input(static_cast<std::size_t>(width)*ni);
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),"wide input copy");
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
         Exl3CudaLinearWorkspace baseline(ni,no,width,false,false,false,false,false,true);
-        _putenv_s("NINFER_EXL3_WIDE_PREFILL","1");
+        _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","1");
         Exl3CudaLinearWorkspace candidate(ni,no,width,false,false,false,false,false,true);
         Exl3CudaLinearWorkspace unowned(ni,no,width);
         Exl3CudaLinearWorkspace small(ni,no,8,false,false,false,false,false,true);
@@ -42,7 +42,7 @@ struct WidePrefillOperators {
         }
         if(seen.size()==1 && width>=512) {
             for(int limit:{512,1024}) if(width>=limit) {
-                const auto key="NINFER_EXL3_PREFILL_WIDE"+std::to_string(limit);
+                const auto key="VOIDINFER_EXL3_PREFILL_WIDE"+std::to_string(limit);
                 for(const char* flag:{"","0","2","true","01"}) {
                     _putenv_s(key.c_str(),flag);
                     Exl3CudaLinearWorkspace off(ni,no,width,false,false,false,false,false,true);
@@ -54,38 +54,38 @@ struct WidePrefillOperators {
         }
         if(seen.size()==1 && width>=256) {
             for(const char* flag:{"","0","2","true","01"}) {
-                _putenv_s("NINFER_EXL3_PREFILL_WIDE256",flag);
+                _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE256",flag);
                 Exl3CudaLinearWorkspace off(ni,no,width,false,false,false,false,false,true);
                 require(off.target_wide_prefill_candidate(x.metadata,128,admit) &&
                     !off.target_wide_prefill_candidate(x.metadata,129,admit),"wide256 exact flag1 required");
             }
-            _putenv_s("NINFER_EXL3_PREFILL_WIDE256","1");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE256","1");
         }
         if(seen.size()==1 && width>=128) {
             for(const char* flag:{"","0","2","true","01"}) {
-                _putenv_s("NINFER_EXL3_PREFILL_WIDE128",flag);
+                _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE128",flag);
                 Exl3CudaLinearWorkspace off(ni,no,width,false,false,false,false,false,true);
                 require(off.target_wide_prefill_candidate(x.metadata,64,admit) &&
                     !off.target_wide_prefill_candidate(x.metadata,65,admit),"wide128 exact flag1 required");
             }
-            _putenv_s("NINFER_EXL3_PREFILL_WIDE128","1");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE128","1");
         }
         if(seen.size()==1 && width==64) {
             for(const char* flag:{"","0","2","true","01"}) {
-                _putenv_s("NINFER_EXL3_PREFILL_WIDE64",flag);
+                _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE64",flag);
                 Exl3CudaLinearWorkspace off(ni,no,width,false,false,false,false,false,true);
                 require(off.target_wide_prefill_candidate(x.metadata,32,admit) &&
                     !off.target_wide_prefill_candidate(x.metadata,33,admit),"wide64 exact flag1 required");
             }
-            _putenv_s("NINFER_EXL3_PREFILL_WIDE64","1");
+            _putenv_s("VOIDINFER_EXL3_PREFILL_WIDE64","1");
         }
         if(seen.size()==1) {
             for(const char* flag:{"","0","2","true","01"}) {
-                _putenv_s("NINFER_EXL3_WIDE_PREFILL",flag);
+                _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL",flag);
                 Exl3CudaLinearWorkspace off(ni,no,width,false,false,false,false,false,true);
                 require(!off.target_wide_prefill_candidate(x.metadata,width,admit),"wide exact flag1 required");
             }
-            _putenv_s("NINFER_EXL3_WIDE_PREFILL","1");
+            _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","1");
         }
         const std::size_t extent=static_cast<std::size_t>(width)*no;
         std::vector<std::uint16_t> initial(extent+2*guard,0x3555),ref(initial),got(initial),repeat(initial);
@@ -121,13 +121,13 @@ struct WidePrefillOperators {
 };
 
 void run_wide_prefill_operators(Exl3TextModel& target) {
-    require(env("NINFER_EXL3_WIDE_PREFILL")=="1","wide operator mode requires flag1");
-    const int width=env("NINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("NINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=static_cast<std::size_t>(16+width),"wide teacher extent");
+    require(env("VOIDINFER_EXL3_WIDE_PREFILL")=="1","wide operator mode requires flag1");
+    const int width=env("VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE64")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE128")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE256")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE512")=="1" ? (env("VOIDINFER_EXL3_PREFILL_WIDE1024")=="1" ? 1024 : 512) : 256) : 128) : 64) : 32) : 16;
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=static_cast<std::size_t>(16+width),"wide teacher extent");
     auto ctx=target.create_context(true);require(ctx->try_enable_oscar_from_environment(),"wide OSCAR");
     ctx->prefill(std::span<const std::int64_t>(ids.data(),16));
-    WidePrefillOperators check(env("NINFER_E5A4_OUT"));
-    ctx->set_target_projection_observer_for_test(WidePrefillOperators::callback,&check,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+    WidePrefillOperators check(env("VOIDINFER_E5A4_OUT"));
+    ctx->set_target_projection_observer_for_test(WidePrefillOperators::callback,&check,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->append_prefill_wide(std::span<const std::int64_t>(ids.data()+16,width));
     cuda_check(cudaDeviceSynchronize(),"wide operator sweep ready");ctx->set_target_projection_observer_for_test(nullptr,nullptr);
     require(check.seen.size()==400 && ctx->position()==16+width,"wide all400 projection coverage");
@@ -139,14 +139,14 @@ void run_wide_prefill_operators(Exl3TextModel& target) {
 // context stays eager; one observed 1024-row projection is replayed through an
 // independently owned graph workspace so capture cannot hide caller work.
 struct PrefillProjectionGraphOperator {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit=Admission::target_wide_prefill;
     static constexpr std::size_t guard=128;
     bool checked=false;
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<PrefillProjectionGraphOperator*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if(checked || x.rows!=1024 || x.metadata.K<5 || x.metadata.K>8)return;
         checked=true;
         const int ni=x.metadata.in_features,no=x.metadata.out_features;
@@ -161,10 +161,10 @@ struct PrefillProjectionGraphOperator {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(x.rows)*ni),after(input.size());
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),
                    "projection graph input snapshot");
-        const auto saved=env("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
+        const auto saved=env("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
         Exl3CudaLinearWorkspace eager(ni,no,1024,false,false,false,false,false,true);
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","1");
         Exl3CudaLinearWorkspace graph(ni,no,1024,false,false,false,false,false,true);
         cuda_check(cudaMemcpy(a.get(),initial.data(),initial.size()*2,cudaMemcpyHostToDevice),
                    "projection graph eager poison");
@@ -195,41 +195,41 @@ struct PrefillProjectionGraphOperator {
         cuda_check(cudaMemcpy(after.data(),x.input,after.size()*2,cudaMemcpyDeviceToHost),
                    "projection graph input after");
         require(after==input,"projection graph input mutation");
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
     }
 };
 
 void run_prefill_projection_graph_operator(Exl3TextModel& target) {
-    for(const char* key:{"NINFER_EXL3_WIDE_PREFILL","NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-            "NINFER_EXL3_PREFILL_WIDE1024","NINFER_EXL3_PREFILL_DIRECT_PARTIALS"})
+    for(const char* key:{"VOIDINFER_EXL3_WIDE_PREFILL","VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+            "VOIDINFER_EXL3_PREFILL_WIDE1024","VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS"})
         require(env(key)=="1","projection graph operator requires retained wide-prefill flags");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=1040,"projection graph operator teacher extent");
-    const auto saved=env("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
-    _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
+    const auto saved=env("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
     auto ctx=target.create_context(true);
     require(ctx->try_enable_oscar_from_environment(),"projection graph operator OSCAR");
     ctx->prefill(std::span<const std::int64_t>(ids.data(),16));
     PrefillProjectionGraphOperator check;
     ctx->set_target_projection_observer_for_test(
         PrefillProjectionGraphOperator::callback,&check,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->append_prefill_wide(std::span<const std::int64_t>(ids.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"projection graph operator complete");
     ctx->set_target_projection_observer_for_test(nullptr,nullptr);
-    _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
     require(check.checked && ctx->position()==1040,
             "projection graph real-caller coverage");
     std::cout<<"PREFILL_PROJECTION_GRAPH PASS captures=1 replays=2 fallbacks=1 exact=1\n";
 }
 
 struct PrefillProjectionChainGraphOperator {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     bool checked=false;
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         static_cast<PrefillProjectionChainGraphOperator*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         if(checked || x.rows!=1024 || x.metadata.K!=6 ||
            x.metadata.out_features>6144 || x.metadata.in_features==17408)return;
         checked=true;
@@ -250,10 +250,10 @@ struct PrefillProjectionChainGraphOperator {
         for(auto* buffer:{ea.get(),eb.get(),ga.get(),gb.get()})
             cuda_check(cudaMemcpy(buffer,poison.data(),poison.size()*2,cudaMemcpyHostToDevice),
                        "projection chain output poison");
-        const auto saved=env("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
-        const auto saved_chain=env("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS","1");
+        const auto saved=env("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
+        const auto saved_chain=env("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS","1");
         Exl3CudaLinearWorkspace eager_first(ni,no,1024,false,false,false,false,false,true),
             eager_second(ni,no,1024,false,false,false,false,false,true),
             graph_first(ni,no,1024,false,false,false,false,false,true),
@@ -275,28 +275,28 @@ struct PrefillProjectionChainGraphOperator {
         auto context_owner=std::make_shared<int>(1);
         auto model_owner=std::make_shared<int>(2);
         auto scratch_owner=std::make_shared<int>(3);
-        const std::array<ninfer::exl3::Exl3GraphBufferIdentity,5> buffers{{
+        const std::array<voidinfer::exl3::Exl3GraphBufferIdentity,5> buffers{{
             {changing_input.get(),input_extent*2},
             {ga.get(),poison.size()*2},{gb.get(),poison.size()*2},
             {x.weights.trellis,2},{x.weights.suh,static_cast<std::size_t>(ni)*2}}};
-        ninfer::exl3::Exl3GraphCompatibilityFingerprint fingerprint;
+        voidinfer::exl3::Exl3GraphCompatibilityFingerprint fingerprint;
         fingerprint.bind(context_owner,model_owner,scratch_owner,buffers,1024,1024,
             1024,static_cast<unsigned>(ni),5,0x51564b36u,
-            ninfer::exl3::Exl3GraphPrecision::oscar_int2_fp16,
-            ninfer::exl3::Exl3GraphPositionPolicy::oscar_split_class,1,x.stream);
-        const std::array<ninfer::exl3::Exl3GraphBoundResource,5> resources{{
+            voidinfer::exl3::Exl3GraphPrecision::oscar_int2_fp16,
+            voidinfer::exl3::Exl3GraphPositionPolicy::oscar_split_class,1,x.stream);
+        const std::array<voidinfer::exl3::Exl3GraphBoundResource,5> resources{{
             {scratch_owner,changing_input.get(),buffers[0].bytes,1},
             {scratch_owner,ga.get(),buffers[1].bytes,2},
             {scratch_owner,gb.get(),buffers[2].bytes,3},
             {model_owner,x.weights.trellis,buffers[3].bytes,4},
             {model_owner,x.weights.suh,buffers[4].bytes,5}}};
-        ninfer::exl3::Exl3GraphCaptureExtent extent_record;
+        voidinfer::exl3::Exl3GraphCaptureExtent extent_record;
         extent_record.known=true;
         extent_record.retained[static_cast<unsigned>(
-            ninfer::exl3::Exl3ResourceInventory::Domain::graph_count)]=2;
-        ninfer::exl3::Exl3PrefillProjectionChainGraph chain;
-        ninfer::exl3::Exl3PrefillProjectionChainGraph::Request request{
-            fingerprint,std::span<const ninfer::exl3::Exl3GraphBoundResource>(resources),
+            voidinfer::exl3::Exl3ResourceInventory::Domain::graph_count)]=2;
+        voidinfer::exl3::Exl3PrefillProjectionChainGraph chain;
+        voidinfer::exl3::Exl3PrefillProjectionChainGraph::Request request{
+            fingerprint,std::span<const voidinfer::exl3::Exl3GraphBoundResource>(resources),
             extent_record,1,0x51564b360001ull,x.stream,true};
         const auto graph_body=[&](cudaStream_t stream) {
             submit(graph_first,graph_second,
@@ -350,8 +350,8 @@ struct PrefillProjectionChainGraphOperator {
         auto mismatch=request;mismatch.generation=2;
         mismatch.fingerprint.bind(context_owner,model_owner,scratch_owner,buffers,
             1024,1024,1024,static_cast<unsigned>(ni),5,0x51564b36u,
-            ninfer::exl3::Exl3GraphPrecision::oscar_int2_fp16,
-            ninfer::exl3::Exl3GraphPositionPolicy::oscar_split_class,2,x.stream);
+            voidinfer::exl3::Exl3GraphPrecision::oscar_int2_fp16,
+            voidinfer::exl3::Exl3GraphPositionPolicy::oscar_split_class,2,x.stream);
         require(!chain.execute(mismatch,graph_body),"projection chain mismatch fallback");
         cuda_check(cudaStreamSynchronize(x.stream),"projection chain fallback ready");
         for(const auto& item:{std::pair{ea.get(),&eager_a},std::pair{eb.get(),&eager_b},
@@ -367,41 +367,41 @@ struct PrefillProjectionChainGraphOperator {
                 "projection chain route counters");
         require(chain.retire_after_drain("test complete"),
                 "projection chain retirement");
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
-        _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS",saved_chain.c_str());
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
+        _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_CHAIN_GRAPHS",saved_chain.c_str());
     }
 };
 
 void run_prefill_projection_chain_graph_operator(Exl3TextModel& target) {
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
     require(ids.size()>=1040,"projection chain teacher extent");
-    const auto saved=env("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
-    _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
+    const auto saved=env("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS","0");
     auto ctx=target.create_context(true);
     require(ctx->try_enable_oscar_from_environment(),"projection chain OSCAR");
     ctx->prefill(std::span<const std::int64_t>(ids.data(),16));
     PrefillProjectionChainGraphOperator check;
     ctx->set_target_projection_observer_for_test(
         PrefillProjectionChainGraphOperator::callback,&check,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->append_prefill_wide(std::span<const std::int64_t>(ids.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"projection chain caller complete");
     ctx->set_target_projection_observer_for_test(nullptr,nullptr);
-    _putenv_s("NINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
+    _putenv_s("VOIDINFER_EXL3_PREFILL_PROJECTION_GRAPHS",saved.c_str());
     require(check.checked,"projection chain real projection coverage");
     std::cout<<"PREFILL_PROJECTION_CHAIN_GRAPH PASS captures=1 replays=2 mismatch_fallback=1 exact=1\n";
 }
 
 // Focused P16 leaf oracle: original wide/direct-async versus row-pair, same real inputs.
 struct RowpairPrefillOperators {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit=Admission::target_wide_prefill;
     static constexpr int widths[]={1,16,31,32,33,47,48,63,64,65,1008,1023,1024};
     static constexpr std::size_t guard=128;
     struct Flag {
-        std::string saved=env("NINFER_EXL3_PREFILL_ROWPAIR_K6");
-        explicit Flag(const char* value){_putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6",value);}
-        ~Flag(){_putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6",saved.c_str());}
+        std::string saved=env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6");
+        explicit Flag(const char* value){_putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6",value);}
+        ~Flag(){_putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6",saved.c_str());}
     };
     std::filesystem::path directory;
     std::ofstream csv;
@@ -412,8 +412,8 @@ struct RowpairPrefillOperators {
         std::filesystem::create_directories(p);csv.open(p/"operators.csv");
         csv<<"layer,operation,K,input,output,rows,elements,exact,repeat,canaries,input_immutable,dispatch,output_fnv64\n";
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user){static_cast<RowpairPrefillOperators*>(user)->check(x);}
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user){static_cast<RowpairPrefillOperators*>(user)->check(x);}
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         const int ni=x.metadata.in_features,no=x.metadata.out_features;
         if(x.metadata.K!=6 || (ni==17408 && no==5120))return;
         require(x.rows==1024,"rowpair real capture width");
@@ -425,10 +425,10 @@ struct RowpairPrefillOperators {
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),"rowpair input snapshot");
         const std::size_t extent=1024u*no,partial_bytes=extent*5*sizeof(float);
         DeviceBuffer wa(partial_bytes),wb(partial_bytes);
-        const ninfer::exl3::Exl3CudaAccumulationView va{static_cast<float*>(wa.get()),partial_bytes},vb{static_cast<float*>(wb.get()),partial_bytes};
+        const voidinfer::exl3::Exl3CudaAccumulationView va{static_cast<float*>(wa.get()),partial_bytes},vb{static_cast<float*>(wb.get()),partial_bytes};
         Flag scope("0");
         Exl3CudaLinearWorkspace baseline(ni,no,1024,false,false,false,false,false,true,false,va);
-        _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6","1");
         Exl3CudaLinearWorkspace candidate(ni,no,1024,false,false,false,false,false,true,false,vb);
         require(!baseline.target_rowpair_k6_candidate(x.metadata,1024,admit),"rowpair off latch");
         require(!candidate.target_rowpair_k6_candidate(x.metadata,1024,Admission::ordinary),"rowpair ordinary guard");
@@ -484,12 +484,12 @@ struct RowpairPrefillOperators {
 };
 
 void run_rowpair_prefill_operators(Exl3TextModel& target){
-    for(const char* key:{"NINFER_EXL3_WIDE_PREFILL","NINFER_EXL3_PREFILL_STAGED_REDUCTION","NINFER_EXL3_PREFILL_WIDE1024","NINFER_EXL3_PREFILL_DIRECT_PARTIALS","NINFER_EXL3_PREFILL_DIRECT_ASYNC_A","NINFER_EXL3_PREFILL_ROWPAIR_K6"})require(env(key)=="1","rowpair qualified wide flags");
-    require(env("NINFER_EXL3_GENERIC_SPLITS").empty() || env("NINFER_EXL3_GENERIC_SPLITS")=="5","rowpair operator fixes five splits");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=1040,"rowpair teacher extent");
+    for(const char* key:{"VOIDINFER_EXL3_WIDE_PREFILL","VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION","VOIDINFER_EXL3_PREFILL_WIDE1024","VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS","VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A","VOIDINFER_EXL3_PREFILL_ROWPAIR_K6"})require(env(key)=="1","rowpair qualified wide flags");
+    require(env("VOIDINFER_EXL3_GENERIC_SPLITS").empty() || env("VOIDINFER_EXL3_GENERIC_SPLITS")=="5","rowpair operator fixes five splits");
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=1040,"rowpair teacher extent");
     auto ctx=target.create_context(true);require(ctx->try_enable_oscar_from_environment(),"rowpair OSCAR");ctx->prefill(std::span<const std::int64_t>(ids.data(),16));
-    RowpairPrefillOperators check(env("NINFER_E5A4_OUT"));
-    ctx->set_target_projection_observer_for_test(RowpairPrefillOperators::callback,&check,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+    RowpairPrefillOperators check(env("VOIDINFER_E5A4_OUT"));
+    ctx->set_target_projection_observer_for_test(RowpairPrefillOperators::callback,&check,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->append_prefill_wide(std::span<const std::int64_t>(ids.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"rowpair operators done");ctx->set_target_projection_observer_for_test(nullptr,nullptr);
     require(check.sites==229 && check.seen.size()==229 && check.cases==229*13,"rowpair exact site/case coverage");
@@ -500,14 +500,14 @@ void run_rowpair_prefill_operators(Exl3TextModel& target){
 // K7 extension of the preserved row-pair schedule.  This is intentionally a
 // separate oracle so the rejected/default-off K6 experiment remains untouched.
 struct RowpairPrefillK7Operators {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit=Admission::target_wide_prefill;
     static constexpr int widths[]={31,32,33,63,64,1008,1023,1024};
     static constexpr std::size_t guard=128;
     struct Flag {
-        std::string saved=env("NINFER_EXL3_PREFILL_ROWPAIR_K7");
-        explicit Flag(const char* value){_putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7",value);}
-        ~Flag(){_putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7",saved.c_str());}
+        std::string saved=env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7");
+        explicit Flag(const char* value){_putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7",value);}
+        ~Flag(){_putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7",saved.c_str());}
     };
     std::filesystem::path directory;
     std::ofstream csv,timing;
@@ -517,17 +517,17 @@ struct RowpairPrefillK7Operators {
         require(!p.empty() && !std::filesystem::exists(p),"K7 rowpair output must be new");
         std::filesystem::create_directories(p);csv.open(p/"operators.csv");
         csv<<"layer,operation,K,input,output,rows,elements,exact,repeat,canaries,input_immutable,dispatch,output_fnv64\n";
-        const auto timing_path=env("NINFER_E5A4_PREFILL_ROWPAIR_K7_TIMING_OUT");
+        const auto timing_path=env("VOIDINFER_E5A4_PREFILL_ROWPAIR_K7_TIMING_OUT");
         if(!timing_path.empty()){
             timing.open(timing_path,std::ios::trunc);
             require(timing.good(),"K7 rowpair timing output creation");
             timing<<"site,layer,operation,order,repetitions,control_us,candidate_us,gain_pct\n";
         }
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user){
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user){
         static_cast<RowpairPrefillK7Operators*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
         ++observed;
         const int ni=x.metadata.in_features,no=x.metadata.out_features;
         if(x.metadata.K!=7 || (ni==17408 && no==5120))return;
@@ -541,10 +541,10 @@ struct RowpairPrefillK7Operators {
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),"K7 rowpair input snapshot");
         const std::size_t extent=1024u*no,partial_bytes=extent*5*sizeof(float);
         DeviceBuffer wa(partial_bytes),wb(partial_bytes);
-        const ninfer::exl3::Exl3CudaAccumulationView va{static_cast<float*>(wa.get()),partial_bytes},vb{static_cast<float*>(wb.get()),partial_bytes};
+        const voidinfer::exl3::Exl3CudaAccumulationView va{static_cast<float*>(wa.get()),partial_bytes},vb{static_cast<float*>(wb.get()),partial_bytes};
         Flag scope("0");
         Exl3CudaLinearWorkspace baseline(ni,no,1024,false,false,false,false,false,true,false,va);
-        _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7","1");
         Exl3CudaLinearWorkspace candidate(ni,no,1024,false,false,false,false,false,true,false,vb);
         require(!baseline.target_rowpair_k7_candidate(x.metadata,1024,admit),"K7 rowpair off latch");
         require(!candidate.target_rowpair_k7_candidate(x.metadata,1024,Admission::ordinary),"K7 rowpair ordinary guard");
@@ -636,18 +636,18 @@ struct RowpairPrefillK7Operators {
 };
 
 void run_rowpair_k7_prefill_operators(Exl3TextModel& target){
-    for(const char* key:{"NINFER_EXL3_WIDE_PREFILL","NINFER_EXL3_PREFILL_STAGED_REDUCTION",
-        "NINFER_EXL3_PREFILL_WIDE1024","NINFER_EXL3_PREFILL_DIRECT_PARTIALS",
-        "NINFER_EXL3_PREFILL_DIRECT_ASYNC_A","NINFER_EXL3_PREFILL_ROWPAIR_K7"})
+    for(const char* key:{"VOIDINFER_EXL3_WIDE_PREFILL","VOIDINFER_EXL3_PREFILL_STAGED_REDUCTION",
+        "VOIDINFER_EXL3_PREFILL_WIDE1024","VOIDINFER_EXL3_PREFILL_DIRECT_PARTIALS",
+        "VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A","VOIDINFER_EXL3_PREFILL_ROWPAIR_K7"})
         require(env(key)=="1","K7 rowpair qualified wide flags");
-    require(env("NINFER_EXL3_PREFILL_ROWPAIR_K6")=="0","K7 rowpair keeps rejected K6 route off");
-    require(env("NINFER_EXL3_GENERIC_SPLITS").empty() || env("NINFER_EXL3_GENERIC_SPLITS")=="5","K7 rowpair operator fixes five splits");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=1040,"K7 rowpair teacher extent");
+    require(env("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6")=="0","K7 rowpair keeps rejected K6 route off");
+    require(env("VOIDINFER_EXL3_GENERIC_SPLITS").empty() || env("VOIDINFER_EXL3_GENERIC_SPLITS")=="5","K7 rowpair operator fixes five splits");
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=1040,"K7 rowpair teacher extent");
     auto ctx=target.create_context(true);require(ctx->try_enable_oscar_from_environment(),"K7 rowpair OSCAR");
     ctx->prefill(std::span<const std::int64_t>(ids.data(),16));
-    RowpairPrefillK7Operators check(env("NINFER_E5A4_OUT"));
+    RowpairPrefillK7Operators check(env("VOIDINFER_E5A4_OUT"));
     ctx->set_target_projection_observer_for_test(RowpairPrefillK7Operators::callback,&check,nullptr,
-        ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+        voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->append_prefill_wide(std::span<const std::int64_t>(ids.data()+16,1024));
     cuda_check(cudaDeviceSynchronize(),"K7 rowpair operators done");
     ctx->set_target_projection_observer_for_test(nullptr,nullptr);
@@ -667,33 +667,33 @@ void run_rowpair_k7_prefill_operators(Exl3TextModel& target){
 
 void run_rowpair_k7_prefill_state(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose){
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     constexpr int prefix=4096;
     require(target.max_context()==4352,"K7 rowpair state context extent");
     require(code.size()>=prefix&&prose.size()>=prefix,"K7 rowpair state fixture extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
-    _putenv_s("NINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
-    _putenv_s("NINFER_EXL3_PREFILL_DIRECT_ASYNC_A","1");
-    _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K6","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_ATTENTION_PARALLEL","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_DIRECT_ASYNC_A","1");
+    _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K6","0");
     const auto greedy=[](Exl3TextContext& context){
         const auto logits=context.logits_host();
         require(!logits.empty()&&std::none_of(logits.begin(),logits.end(),
             [](float value){return !std::isfinite(value);}),"K7 rowpair state finite logits");
         return static_cast<std::int64_t>(std::max_element(logits.begin(),logits.end())-logits.begin());
     };
-    std::ofstream out(env("NINFER_E5A4_OUT"),std::ios::trunc);
+    std::ofstream out(env("VOIDINFER_E5A4_OUT"),std::ios::trunc);
     require(out.good(),"K7 rowpair state output creation");
     out<<"fixture,control_prefill_ms,candidate_prefill_ms,wall_reduction_pct,tokens_exact,state_exact\n";
     for(const auto& fixture:std::array<std::pair<const char*,const std::vector<std::int64_t>*>,2>{
         std::pair{"code",&code},std::pair{"prose",&prose}}){
         const std::vector<std::int64_t> input(fixture.second->begin(),fixture.second->begin()+prefix);
-        _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7","0");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7","0");
         auto control=target.create_context(true);control->prepare_continuation(8);
-        _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7","1");
+        _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7","1");
         auto candidate=target.create_context(true);candidate->prepare_continuation(8);
         struct Result{double prefill_ms=0;std::vector<std::int64_t> tokens;
-            std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;};
+            std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;};
         const auto run=[&](Exl3TextContext& context){
             const auto started=std::chrono::steady_clock::now();
             const auto request=Request::initialize(context,input,1024);
@@ -715,19 +715,19 @@ void run_rowpair_k7_prefill_state(Exl3TextModel& target,
                  <<" candidate_prefill_ms="<<changed.prefill_ms<<" exact=1\n";
     }
     out.flush();require(out.good(),"K7 rowpair state output write");
-    const auto lifecycle_path=env("NINFER_E5A4_PREFILL_ROWPAIR_K7_LIFECYCLE_OUT");
+    const auto lifecycle_path=env("VOIDINFER_E5A4_PREFILL_ROWPAIR_K7_LIFECYCLE_OUT");
     if(!lifecycle_path.empty()){
         std::ofstream lifecycle(lifecycle_path,std::ios::trunc);
         require(lifecycle.good(),"K7 rowpair lifecycle output creation");
         lifecycle<<"pair,launch,arm,free_before,free_live,free_after,live_used_bytes,endpoint_loss_bytes,position,token,exact,gate\n";
         const std::vector<std::int64_t> input(code.begin(),code.begin()+1024);
         struct Life{std::size_t before=0,live=0,after=0;int position=0;
-            std::int64_t token=0;std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> state;};
+            std::int64_t token=0;std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> state;};
         auto run_life=[&](bool candidate){
             Life result;std::size_t total_before=0,total_live=0,total_after=0;
             cuda_check(cudaMemGetInfo(&result.before,&total_before),"K7 rowpair lifecycle before");
             {
-                _putenv_s("NINFER_EXL3_PREFILL_ROWPAIR_K7",candidate?"1":"0");
+                _putenv_s("VOIDINFER_EXL3_PREFILL_ROWPAIR_K7",candidate?"1":"0");
                 auto context=target.create_context(true);context->prepare_continuation(8);
                 const auto request=Request::initialize(*context,input,1024);
                 result.token=greedy(*context);context->decode(result.token);

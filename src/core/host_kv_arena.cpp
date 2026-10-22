@@ -10,7 +10,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer {
+namespace voidinfer {
 namespace {
 
 constexpr std::size_t kHostKVAlignment = 256;
@@ -863,4 +863,4 @@ void HostKVArena::bump_revision() noexcept {
     if (revision_ == 0) { ++revision_; }
 }
 
-} // namespace ninfer
+} // namespace voidinfer

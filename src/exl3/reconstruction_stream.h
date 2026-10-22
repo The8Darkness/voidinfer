@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // One context slab can be overwritten by many projection workspaces, but only
 // on its first admitted ordered stream. No reset API: a host return is not a
@@ -64,4 +64,4 @@ private:
     std::atomic<bool> used_{false};
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

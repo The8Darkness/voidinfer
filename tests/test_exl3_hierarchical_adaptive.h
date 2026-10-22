@@ -1,9 +1,9 @@
 #pragma once
 
 void run_hierarchical_adaptive_logic() {
-    using ninfer::exl3::Exl3AdaptiveHierarchyPolicy;
-    using ninfer::exl3::Exl3AdaptiveSample;
-    using ninfer::exl3::Exl3HierarchyMode;
+    using voidinfer::exl3::Exl3AdaptiveHierarchyPolicy;
+    using voidinfer::exl3::Exl3AdaptiveSample;
+    using voidinfer::exl3::Exl3HierarchyMode;
     Exl3AdaptiveHierarchyPolicy policy;
     require(policy.mode()==Exl3HierarchyMode::window_exact &&
         !policy.select(false,true,8,0),"adaptive conservative cold start");
@@ -42,21 +42,21 @@ void run_hierarchical_adaptive_logic() {
 
 void run_hierarchical_adaptive_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using ninfer::exl3::Exl3AdaptiveHierarchyPolicy;
-    using ninfer::exl3::Exl3AdaptiveSample;
-    using ninfer::exl3::Exl3HierarchyFrontiers;
-    using ninfer::exl3::Exl3HierarchyMode;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using voidinfer::exl3::Exl3AdaptiveHierarchyPolicy;
+    using voidinfer::exl3::Exl3AdaptiveSample;
+    using voidinfer::exl3::Exl3HierarchyFrontiers;
+    using voidinfer::exl3::Exl3HierarchyMode;
     constexpr int prefix=4096,budget=32,block=4;
     require(target.max_context()==4352 && code.size()>=prefix && prose.size()>=prefix,
         "adaptive T2 fixture/context extent");
     run_hierarchical_adaptive_logic();
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
-    _putenv_s("NINFER_EXL3_WIDE_PREFILL","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_WIDE_PREFILL","0");
     auto l0=target.create_context(true);
     require(l0->try_enable_oscar_from_environment(),"adaptive W OSCAR context");
     const auto greedy=[](Exl3TextContext& context) {
@@ -99,7 +99,7 @@ void run_hierarchical_adaptive_qualification(Exl3TextModel& target,
             for(int row=0;row<rows;++row) {const auto token=greedy(*l0);candidates.push_back(token);l0->decode(token);}
             frontiers.complete_l1(l0_completion,rows,false);
             const auto l2_completion=frontiers.begin_l2();
-            auto verified=ninfer::exl3::verify_exl3_outer_batched_reference(
+            auto verified=voidinfer::exl3::verify_exl3_outer_batched_reference(
                 *exact,*current,candidates,false,{},nullptr,true);
             frontiers.complete_l2(l2_completion,static_cast<int>(verified.committed_tokens.size()));
             const auto publication=frontiers.publish_authorized();

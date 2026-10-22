@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 enum class Exl3ScenarioOperation : std::uint8_t {
     acquire,
@@ -126,4 +126,4 @@ inline constexpr std::array<Exl3StateMachineScenario,5> exl3_state_machine_scena
     }
 }};
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

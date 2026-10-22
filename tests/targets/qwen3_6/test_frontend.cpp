@@ -1,5 +1,5 @@
-#include <ninfer/targets/qwen3_6/frontend.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/frontend_resources.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/media_cache.h"
@@ -32,12 +32,12 @@
 
 namespace {
 
-using Frontend          = ninfer::targets::qwen3_6::Frontend;
-using FrontendFactory   = ninfer::targets::qwen3_6::FrontendTestAccess;
-using FrontendTestAccess = ninfer::targets::qwen3_6::FrontendTestAccess;
-using FrontendResources = ninfer::targets::qwen3_6::FrontendResources;
-using PublishedOutput   = ninfer::targets::qwen3_6::PublishedOutput;
-namespace fi            = ninfer::targets::qwen3_6::frontend_internal;
+using Frontend          = voidinfer::targets::qwen3_6::Frontend;
+using FrontendFactory   = voidinfer::targets::qwen3_6::FrontendTestAccess;
+using FrontendTestAccess = voidinfer::targets::qwen3_6::FrontendTestAccess;
+using FrontendResources = voidinfer::targets::qwen3_6::FrontendResources;
+using PublishedOutput   = voidinfer::targets::qwen3_6::PublishedOutput;
+namespace fi            = voidinfer::targets::qwen3_6::frontend_internal;
 
 constexpr std::string_view kThinkingControlGuidance =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
@@ -79,13 +79,13 @@ std::string read_template_fixture(const char* path) {
 
 const std::string& thinking_toggle_template_source() {
     static const std::string source = read_template_fixture(
-        NINFER_SOURCE_DIR "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
+        VOIDINFER_SOURCE_DIR "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
     return source;
 }
 
 const std::string& reasoning_effort_template_source() {
     static const std::string source = read_template_fixture(
-        NINFER_SOURCE_DIR "/tests/fixtures/frontend/reasoning_effort_chat_template.jinja");
+        VOIDINFER_SOURCE_DIR "/tests/fixtures/frontend/reasoning_effort_chat_template.jinja");
     return source;
 }
 
@@ -102,7 +102,7 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
 }
 
 std::string official_model_file(const char* name) {
-    if (const char* root = std::getenv("NINFER_QWEN36_TEST_MODEL_DIR"); root != nullptr && *root) {
+    if (const char* root = std::getenv("VOIDINFER_QWEN36_TEST_MODEL_DIR"); root != nullptr && *root) {
         return std::string(root) + '/' + name;
     }
     return std::string("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/") + name;
@@ -167,7 +167,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
         const bool visible=(byte>=33&&byte<=126)||(byte>=161&&byte<=172)||
             (byte>=174&&byte<=255);
         const auto codepoint=visible?static_cast<std::uint32_t>(byte):next_byte_codepoint++;
-        byte_vocab[ninfer::text::unicode_internal::codepoint_to_utf8(
+        byte_vocab[voidinfer::text::unicode_internal::codepoint_to_utf8(
             static_cast<std::int32_t>(codepoint))]=1000+byte;
     }
     // Stable low IDs used by output-session fixtures.
@@ -245,38 +245,38 @@ std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {
     return ppm;
 }
 
-ninfer::PromptInput image_text_input(std::vector<std::uint8_t> bytes, std::string text,
+voidinfer::PromptInput image_text_input(std::vector<std::uint8_t> bytes, std::string text,
                                      std::string source_name) {
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+    voidinfer::MessagePart image;
+    image.kind              = voidinfer::MessagePartKind::Media;
+    image.media.kind        = voidinfer::MediaKind::Image;
     image.media.bytes       = std::move(bytes);
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = std::move(source_name);
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(std::move(image));
     if (!text.empty()) {
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        message.parts.push_back(voidinfer::MessagePart{
+            .kind = voidinfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
     }
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     return input;
 }
 
-ninfer::PromptInput image_input() {
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+voidinfer::PromptInput image_input() {
+    voidinfer::MessagePart image;
+    image.kind              = voidinfer::MessagePartKind::Media;
+    image.media.kind        = voidinfer::MediaKind::Image;
     image.media.bytes       = gradient_ppm();
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = "inline.ppm";
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(std::move(image));
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     return input;
 }
@@ -288,15 +288,15 @@ constexpr std::array<std::uint8_t, 32> kGradientDigest{
     0x4d, 0x21, 0xff, 0xc7, 0xe9, 0xa2, 0x2b, 0x34, 0xc0, 0xec, 0x99, 0x84, 0x6c, 0xa9, 0xa4, 0x8a,
 };
 
-std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
+std::string channel_text(const PublishedOutput& output, voidinfer::OutputChannel channel) {
     std::string result;
-    for (const ninfer::OutputDelta& delta : output) {
+    for (const voidinfer::OutputDelta& delta : output) {
         if (delta.channel == channel) { result += delta.text; }
     }
     return result;
 }
 
-fi::ChatMessage chat_message(ninfer::ChatRole role, std::string content) {
+fi::ChatMessage chat_message(voidinfer::ChatRole role, std::string content) {
     fi::ChatMessage message;
     message.role = role;
     message.parts.push_back(fi::ChatPart::text_part(std::move(content)));
@@ -335,8 +335,8 @@ template <class Callable>
 bool throws_context_length(Callable&& callable) {
     try {
         callable();
-    } catch (const ninfer::RequestError& error) {
-        return error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+    } catch (const voidinfer::RequestError& error) {
+        return error.kind() == voidinfer::RequestErrorKind::ContextLengthExceeded;
     }
     return false;
 }
@@ -461,12 +461,12 @@ bool same_encoded_chat(const fi::EncodedChat& a,const fi::EncodedChat& b) {
 
 int test_rendered_prompt_segment_stream() {
     fi::ChatRenderOptions options;
-    options.cache_markers.push_back(ninfer::PromptCacheMarker{
+    options.cache_markers.push_back(voidinfer::PromptCacheMarker{
         .after_message_count=1,
-        .kind=ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-        .location=ninfer::PromptCacheMarkerLocation::MessageBoundary});
+        .kind=voidinfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .location=voidinfer::PromptCacheMarkerLocation::MessageBoundary});
     const fi::RenderedChat rendered=render_chat(
-        {chat_message(ninfer::ChatRole::User,"x\xC3\xA4x")},options);
+        {chat_message(voidinfer::ChatRole::User,"x\xC3\xA4x")},options);
     const auto full=fi::encode_rendered_chat(test_tokenizer(),rendered);
     const auto utf8=rendered.text.find("\xC3\xA4");
     const auto control=rendered.text.find("<|im_start|>");
@@ -502,8 +502,8 @@ int test_rendered_prompt_segment_stream() {
         "rendered stream exceeded its segment capacity");
 
     std::atomic<unsigned> checkpoints{0};
-    ninfer::PreparationControl cancelled{
-        .cancellation=ninfer::CancellationView([&]{return ++checkpoints==2;})};
+    voidinfer::PreparationControl cancelled{
+        .cancellation=voidinfer::CancellationView([&]{return ++checkpoints==2;})};
     bool cancellation_refused=false;
     try{
         fi::RenderedPromptStream cancelled_stream(rendered,chunks.size());
@@ -511,8 +511,8 @@ int test_rendered_prompt_segment_stream() {
             std::string_view(rendered.text).substr(chunk.begin,chunk.count),cancelled);
         (void)cancelled_stream.finish(test_tokenizer(),cancelled);
     }
-    catch(const ninfer::RequestError& error) {
-        cancellation_refused=error.kind()==ninfer::RequestErrorKind::Cancelled;
+    catch(const voidinfer::RequestError& error) {
+        cancellation_refused=error.kind()==voidinfer::RequestErrorKind::Cancelled;
     }
     failures+=check(cancellation_refused && checkpoints==2,
         "rendered stream cancellation did not stop between owned segments");
@@ -578,23 +578,23 @@ int test_bounded_tokenizer_prefix() {
 }
 
 int test_context_capacity_guard() {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::PromptInput input;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
     input.messages.push_back(std::move(message));
 
     const Frontend counting         = FrontendFactory::create_component(resources(), false);
     const std::uint32_t exact_count = counting.count_tokens(input);
-    ninfer::targets::qwen3_6::FrontendOptions exact_options;
+    voidinfer::targets::qwen3_6::FrontendOptions exact_options;
     exact_options.vision_enabled = false;
     exact_options.max_context    = exact_count;
     const Frontend exact         = FrontendFactory::create_component(resources(), exact_options);
     int failures = check(exact.prepare(input).summary().prompt_tokens == exact_count,
                          "Frontend rejected a prompt exactly at max_context");
 
-    ninfer::targets::qwen3_6::FrontendOptions short_options = exact_options;
+    voidinfer::targets::qwen3_6::FrontendOptions short_options = exact_options;
     short_options.max_context                               = exact_count - 1U;
     const Frontend short_frontend = FrontendFactory::create_component(resources(), short_options);
     failures += check(short_frontend.count_tokens(input) == exact_count,
@@ -602,7 +602,7 @@ int test_context_capacity_guard() {
     failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }),
                       "Frontend accepted a text prompt at max_context + 1");
 
-    std::vector<ninfer::TokenId> exact_tokens(exact_count, 0);
+    std::vector<voidinfer::TokenId> exact_tokens(exact_count, 0);
     failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,
                       "prepare_tokens rejected an exact-capacity token vector");
     exact_tokens.push_back(0);
@@ -610,7 +610,7 @@ int test_context_capacity_guard() {
         check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); }),
               "prepare_tokens accepted a token vector at max_context + 1");
 
-    ninfer::targets::qwen3_6::FrontendOptions media_options = short_options;
+    voidinfer::targets::qwen3_6::FrontendOptions media_options = short_options;
     media_options.vision_enabled                            = true;
     const Frontend media_frontend = FrontendFactory::create_component(resources(), media_options);
     failures += check(throws_context_length([&] {
@@ -620,9 +620,9 @@ int test_context_capacity_guard() {
                       "over-capacity media prompt was not rejected before media decoding");
 
     std::atomic<int> control_checks{0};
-    ninfer::PreparationControl cancelled_during_tokenization{
+    voidinfer::PreparationControl cancelled_during_tokenization{
         .deadline     = {},
-        .cancellation = ninfer::CancellationView(
+        .cancellation = voidinfer::CancellationView(
             [&control_checks] { return control_checks.fetch_add(1) >= 2; }),
     };
     try {
@@ -630,9 +630,9 @@ int test_context_capacity_guard() {
             image_text_input({0}, std::string(64, 'x'), "cancel-before-oversize.bin"),
             cancelled_during_tokenization);
         failures += check(false, "cancelled over-capacity media prompt completed successfully");
-    } catch (const ninfer::RequestError& error) {
+    } catch (const voidinfer::RequestError& error) {
         failures +=
-            check(error.kind() == ninfer::RequestErrorKind::Cancelled && control_checks.load() == 3,
+            check(error.kind() == voidinfer::RequestErrorKind::Cancelled && control_checks.load() == 3,
                   "media over-capacity result took priority over tokenization cancellation");
     }
     return failures;
@@ -640,28 +640,28 @@ int test_context_capacity_guard() {
 
 int test_official_chat_template() {
     int failures = 0;
-    failures += check(render_chat_text({chat_message(ninfer::ChatRole::User, "hello")}) ==
+    failures += check(render_chat_text({chat_message(voidinfer::ChatRole::User, "hello")}) ==
                           "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n",
                       "ordinary user prompt differs from the official template");
 
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     failures +=
-        check(render_chat_text({chat_message(ninfer::ChatRole::System, "  be concise  "),
-                                chat_message(ninfer::ChatRole::User, "hello")},
+        check(render_chat_text({chat_message(voidinfer::ChatRole::System, "  be concise  "),
+                                chat_message(voidinfer::ChatRole::User, "hello")},
                                no_generation) == "<|im_start|>system\nbe concise<|im_end|>\n"
                                                  "<|im_start|>user\nhello<|im_end|>\n",
               "leading system prompt differs from the official template");
-    failures += check(render_chat_text({chat_message(ninfer::ChatRole::System, ""),
-                                        chat_message(ninfer::ChatRole::User, "hello")},
+    failures += check(render_chat_text({chat_message(voidinfer::ChatRole::System, ""),
+                                        chat_message(voidinfer::ChatRole::User, "hello")},
                                        no_generation) ==
                           "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n",
                       "empty leading system prompt differs from the official template");
 
-    fi::ChatMessage tool_assistant = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage tool_assistant = chat_message(voidinfer::ChatRole::Assistant, "");
     tool_assistant.tool_calls.push_back(
         {.id = "", .name = "f", .arguments_json = R"({"flag":true,"nested":{"x":[1,2]}})"});
-    failures += check(render_chat_text({chat_message(ninfer::ChatRole::User, "hi"), tool_assistant},
+    failures += check(render_chat_text({chat_message(voidinfer::ChatRole::User, "hi"), tool_assistant},
                                        no_generation) ==
                           "<|im_start|>user\nhi<|im_end|>\n"
                           "<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -673,24 +673,24 @@ int test_official_chat_template() {
     fi::ChatRenderOptions no_thinking;
     no_thinking.enable_thinking = false;
     failures +=
-        check(render_chat_text({chat_message(ninfer::ChatRole::User, "q1"),
-                                chat_message(ninfer::ChatRole::Assistant,
+        check(render_chat_text({chat_message(voidinfer::ChatRole::User, "q1"),
+                                chat_message(voidinfer::ChatRole::Assistant,
                                              "<think>\nold thought\n</think>\n\nold answer"),
-                                chat_message(ninfer::ChatRole::User, "q2")},
+                                chat_message(voidinfer::ChatRole::User, "q2")},
                                no_thinking) == "<|im_start|>user\nq1<|im_end|>\n"
                                                "<|im_start|>assistant\nold answer<|im_end|>\n"
                                                "<|im_start|>user\nq2<|im_end|>\n"
                                                "<|im_start|>assistant\n<think>\n\n</think>\n\n",
               "thinking history differs from the official template");
 
-    fi::ChatMessage lookup = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage lookup = chat_message(voidinfer::ChatRole::Assistant, "");
     lookup.tool_calls.push_back(
         {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
     failures +=
-        check(render_chat_text({chat_message(ninfer::ChatRole::User, "weather?"), lookup,
-                                chat_message(ninfer::ChatRole::Tool, "sunny"),
-                                chat_message(ninfer::ChatRole::Tool, "20C"),
-                                chat_message(ninfer::ChatRole::User, "thanks")},
+        check(render_chat_text({chat_message(voidinfer::ChatRole::User, "weather?"), lookup,
+                                chat_message(voidinfer::ChatRole::Tool, "sunny"),
+                                chat_message(voidinfer::ChatRole::Tool, "20C"),
+                                chat_message(voidinfer::ChatRole::User, "thanks")},
                                no_generation) ==
                   "<|im_start|>user\nweather?<|im_end|>\n"
                   "<|im_start|>assistant\n<tool_call>\n<function=lookup>\n"
@@ -704,8 +704,8 @@ int test_official_chat_template() {
     tools.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object","properties":{"flag":{"type":"boolean"}}}}})");
     const std::string tools_rendered =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "be exact"),
-                          chat_message(ninfer::ChatRole::User, "hi")},
+        render_chat_text({chat_message(voidinfer::ChatRole::System, "be exact"),
+                          chat_message(voidinfer::ChatRole::User, "hi")},
                          tools);
     failures += check(
         tools_rendered.find("\n{\"type\": \"function\", \"function\": {\"name\": \"f\", "
@@ -717,7 +717,7 @@ int test_official_chat_template() {
         "tools system block differs from official tojson rendering");
 
     failures += check(throws_invalid_argument([&] {
-                          (void)render_chat({chat_message(ninfer::ChatRole::System, "only")},
+                          (void)render_chat({chat_message(voidinfer::ChatRole::System, "only")},
                                             no_generation);
                       }),
                       "message history without a user query was accepted");
@@ -729,34 +729,34 @@ int test_ordered_instruction_turns() {
     no_generation.add_generation_prompt = false;
 
     const std::string leading_developer =
-        render_chat_text({chat_message(ninfer::ChatRole::Developer, "policy"),
-                          chat_message(ninfer::ChatRole::User, "hi")},
+        render_chat_text({chat_message(voidinfer::ChatRole::Developer, "policy"),
+                          chat_message(voidinfer::ChatRole::User, "hi")},
                          no_generation);
     int failures = check(leading_developer == "<|im_start|>system\npolicy<|im_end|>\n"
                                               "<|im_start|>user\nhi<|im_end|>\n",
                          "leading developer did not use the existing Qwen system path");
 
     const std::string late_system =
-        render_chat_text({chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::System, "  current diagnostics  ")},
+        render_chat_text({chat_message(voidinfer::ChatRole::User, "hi"),
+                          chat_message(voidinfer::ChatRole::System, "  current diagnostics  ")},
                          no_generation);
     failures += check(late_system == "<|im_start|>user\nhi<|im_end|>\n"
                                      "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
                       "late system turn was not rendered at its original position");
     failures += check(
-        render_chat_text({chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::Developer, "  current diagnostics  ")},
+        render_chat_text({chat_message(voidinfer::ChatRole::User, "hi"),
+                          chat_message(voidinfer::ChatRole::Developer, "  current diagnostics  ")},
                          no_generation) == late_system,
         "developer and system did not lower to the same in-place Qwen block");
 
     const std::string stable_history =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "stable policy"),
-                          chat_message(ninfer::ChatRole::User, "hi")},
+        render_chat_text({chat_message(voidinfer::ChatRole::System, "stable policy"),
+                          chat_message(voidinfer::ChatRole::User, "hi")},
                          no_generation);
     const std::string appended_diagnostics =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "stable policy"),
-                          chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::System, "current diagnostics")},
+        render_chat_text({chat_message(voidinfer::ChatRole::System, "stable policy"),
+                          chat_message(voidinfer::ChatRole::User, "hi"),
+                          chat_message(voidinfer::ChatRole::System, "current diagnostics")},
                          no_generation);
     failures += check(appended_diagnostics.starts_with(stable_history) &&
                           appended_diagnostics.substr(stable_history.size()) ==
@@ -775,9 +775,9 @@ int test_ordered_instruction_turns() {
     tools.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
     const std::string tools_with_late_system =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "stable policy"),
-                          chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::System, "current diagnostics")},
+        render_chat_text({chat_message(voidinfer::ChatRole::System, "stable policy"),
+                          chat_message(voidinfer::ChatRole::User, "hi"),
+                          chat_message(voidinfer::ChatRole::System, "current diagnostics")},
                          tools);
     const std::size_t tools_position  = tools_with_late_system.find("# Tools");
     const std::size_t policy_position = tools_with_late_system.find("stable policy");
@@ -793,39 +793,39 @@ int test_ordered_instruction_turns() {
               "late system duplicated or moved the leading tools/instruction block");
 
     const fi::RenderedChat generated =
-        render_chat({chat_message(ninfer::ChatRole::User, "hi"),
-                     chat_message(ninfer::ChatRole::System, "current diagnostics")});
+        render_chat({chat_message(voidinfer::ChatRole::User, "hi"),
+                     chat_message(voidinfer::ChatRole::System, "current diagnostics")});
     const std::string assistant_header = "<|im_start|>assistant\n";
     const std::size_t header           = generated.text.rfind(assistant_header);
     failures += check(header != std::string::npos && generated.rewrite_checkpoint &&
                           generated.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
                           generated.rewrite_checkpoint->offset == header &&
                           generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
                       "late system was not included before the generation rewrite boundary");
 
-    fi::ChatMessage invalid = chat_message(ninfer::ChatRole::System, "diagnostics");
+    fi::ChatMessage invalid = chat_message(voidinfer::ChatRole::System, "diagnostics");
     invalid.tool_calls.push_back({.id = "call", .name = "f", .arguments_json = "{}"});
     failures += check(throws_invalid_argument([&] {
-                          (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), invalid},
+                          (void)render_chat({chat_message(voidinfer::ChatRole::User, "hi"), invalid},
                                             no_generation);
                       }),
                       "system turn carrying assistant tool metadata was accepted");
 
-    fi::ChatMessage media_instruction = chat_message(ninfer::ChatRole::Developer, "diagnostics");
+    fi::ChatMessage media_instruction = chat_message(voidinfer::ChatRole::Developer, "diagnostics");
     media_instruction.parts.push_back(fi::ChatPart::image({}));
     failures +=
         check(throws_invalid_argument([&] {
-                  (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), media_instruction},
+                  (void)render_chat({chat_message(voidinfer::ChatRole::User, "hi"), media_instruction},
                                     no_generation);
               }),
               "developer turn carrying media was accepted");
 
-    fi::ChatMessage invalid_role = chat_message(ninfer::ChatRole::User, "bad");
-    invalid_role.role            = static_cast<ninfer::ChatRole>(255);
+    fi::ChatMessage invalid_role = chat_message(voidinfer::ChatRole::User, "bad");
+    invalid_role.role            = static_cast<voidinfer::ChatRole>(255);
     failures +=
         check(throws_invalid_argument([&] {
-                  (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), invalid_role},
+                  (void)render_chat({chat_message(voidinfer::ChatRole::User, "hi"), invalid_role},
                                     no_generation);
               }),
               "invalid typed chat role was accepted");
@@ -841,9 +841,9 @@ int test_reasoning_effort_chat_template() {
         "assumptions, consider plausible alternatives, and prioritize correctness, consistency, "
         "and clarity in the final answer.";
 
-    const ninfer::PromptCapabilities toggle_capabilities =
+    const voidinfer::PromptCapabilities toggle_capabilities =
         thinking_toggle_template().capabilities();
-    const ninfer::PromptCapabilities effort_capabilities =
+    const voidinfer::PromptCapabilities effort_capabilities =
         reasoning_effort_template().capabilities();
     int failures = check(toggle_capabilities.enable_thinking &&
                              !toggle_capabilities.reasoning_effort.default_effort &&
@@ -855,60 +855,60 @@ int test_reasoning_effort_chat_template() {
         effort_capabilities.enable_thinking && effort_capabilities.reasoning_effort.low &&
             effort_capabilities.reasoning_effort.medium &&
             effort_capabilities.reasoning_effort.xhigh &&
-            effort_capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
+            effort_capabilities.reasoning_effort.default_effort == voidinfer::ReasoningEffort::XHigh,
         "reasoning-effort template did not advertise its complete capability set");
 
-    const auto render_effort = [](ninfer::ReasoningEffort effort) {
+    const auto render_effort = [](voidinfer::ReasoningEffort effort) {
         fi::ChatRenderOptions options;
         options.reasoning_effort = effort;
         return reasoning_effort_template()
-            .render({chat_message(ninfer::ChatRole::User, "hello")}, options)
+            .render({chat_message(voidinfer::ChatRole::User, "hello")}, options)
             .text;
     };
     const std::string tail = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n";
     failures += check(
-        reasoning_effort_template().render({chat_message(ninfer::ChatRole::User, "hello")}).text ==
+        reasoning_effort_template().render({chat_message(voidinfer::ChatRole::User, "hello")}).text ==
             "<|im_start|>system\n" + std::string(xhigh_instructions) + "<|im_end|>\n" + tail,
         "reasoning-effort template did not apply its xhigh default");
     failures +=
-        check(render_effort(ninfer::ReasoningEffort::Low) ==
+        check(render_effort(voidinfer::ReasoningEffort::Low) ==
                   "<|im_start|>system\n" + std::string(low_instructions) + "<|im_end|>\n" + tail,
               "low reasoning effort did not render the official instruction");
-    failures += check(render_effort(ninfer::ReasoningEffort::Medium) == tail,
+    failures += check(render_effort(voidinfer::ReasoningEffort::Medium) == tail,
                       "medium reasoning effort injected an instruction");
 
     fi::ChatRenderOptions disabled;
     disabled.enable_thinking = false;
     failures += check(reasoning_effort_template()
-                              .render({chat_message(ninfer::ChatRole::System, ""),
-                                       chat_message(ninfer::ChatRole::User, "hello")},
+                              .render({chat_message(voidinfer::ChatRole::System, ""),
+                                       chat_message(voidinfer::ChatRole::User, "hello")},
                                       disabled)
                               .text == "<|im_start|>user\nhello<|im_end|>\n"
                                        "<|im_start|>assistant\n<think>\n\n</think>\n\n",
                       "disabled thinking did not suppress effort and an empty system turn");
-    disabled.reasoning_effort = ninfer::ReasoningEffort::Low;
+    disabled.reasoning_effort = voidinfer::ReasoningEffort::Low;
     failures += check(throws_invalid_argument([&] {
                           (void)reasoning_effort_template().render(
-                              {chat_message(ninfer::ChatRole::User, "hello")}, disabled);
+                              {chat_message(voidinfer::ChatRole::User, "hello")}, disabled);
                       }),
                       "reasoning effort and disabled thinking were accepted together");
 
     fi::ChatRenderOptions unsupported;
-    unsupported.reasoning_effort = ninfer::ReasoningEffort::Low;
+    unsupported.reasoning_effort = voidinfer::ReasoningEffort::Low;
     failures += check(throws_invalid_argument([&] {
                           (void)thinking_toggle_template().render(
-                              {chat_message(ninfer::ChatRole::User, "hello")}, unsupported);
+                              {chat_message(voidinfer::ChatRole::User, "hello")}, unsupported);
                       }),
                       "thinking-toggle template accepted reasoning effort");
 
-    fi::ChatMessage previous   = chat_message(ninfer::ChatRole::Assistant, "old answer");
+    fi::ChatMessage previous   = chat_message(voidinfer::ChatRole::Assistant, "old answer");
     previous.reasoning_content = "old thought";
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
-    no_generation.reasoning_effort      = ninfer::ReasoningEffort::Medium;
+    no_generation.reasoning_effort      = voidinfer::ReasoningEffort::Medium;
     const std::string preserved         = reasoning_effort_template()
-                                      .render({chat_message(ninfer::ChatRole::User, "q1"), previous,
-                                               chat_message(ninfer::ChatRole::User, "q2")},
+                                      .render({chat_message(voidinfer::ChatRole::User, "q1"), previous,
+                                               chat_message(voidinfer::ChatRole::User, "q2")},
                                               no_generation)
                                       .text;
     failures += check(
@@ -917,17 +917,17 @@ int test_reasoning_effort_chat_template() {
         "reasoning-effort template did not preserve prior thinking by default");
     no_generation.preserve_thinking = false;
     failures += check(reasoning_effort_template()
-                              .render({chat_message(ninfer::ChatRole::User, "q1"), previous,
-                                       chat_message(ninfer::ChatRole::User, "q2")},
+                              .render({chat_message(voidinfer::ChatRole::User, "q1"), previous,
+                                       chat_message(voidinfer::ChatRole::User, "q2")},
                                       no_generation)
                               .text.find("old thought") == std::string::npos,
                       "explicit preserve_thinking=false did not remove prior thinking");
 
-    fi::ChatMessage empty_arguments = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage empty_arguments = chat_message(voidinfer::ChatRole::Assistant, "");
     empty_arguments.tool_calls.push_back({.id = "", .name = "f", .arguments_json = ""});
     failures += check(
         reasoning_effort_template()
-            .render({chat_message(ninfer::ChatRole::User, "call"), empty_arguments}, no_generation)
+            .render({chat_message(voidinfer::ChatRole::User, "call"), empty_arguments}, no_generation)
             .text.ends_with("<tool_call>\n<function=f>\n</function>\n"
                             "</tool_call><|im_end|>\n"),
         "empty tool arguments did not follow the reasoning-effort template");
@@ -936,23 +936,23 @@ int test_reasoning_effort_chat_template() {
 
 int test_rewrite_checkpoint_trace() {
     const std::string assistant_header = "<|im_start|>assistant\n";
-    fi::ChatMessage first              = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage first              = chat_message(voidinfer::ChatRole::Assistant, "");
     first.reasoning_content            = "first thought";
     first.parts.front().text           = "first answer";
-    fi::ChatMessage second             = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage second             = chat_message(voidinfer::ChatRole::Assistant, "");
     second.reasoning_content           = "second thought";
     second.parts.front().text          = "second answer";
 
     const std::vector<fi::ChatMessage> tool_loop{
-        chat_message(ninfer::ChatRole::User, "question"), first,
-        chat_message(ninfer::ChatRole::Tool, "result one"), second,
-        chat_message(ninfer::ChatRole::Tool, "result two")};
+        chat_message(voidinfer::ChatRole::User, "question"), first,
+        chat_message(voidinfer::ChatRole::Tool, "result one"), second,
+        chat_message(voidinfer::ChatRole::Tool, "result two")};
     const fi::RenderedChat open    = render_chat(tool_loop);
     const std::size_t first_header = open.text.find(assistant_header);
     int failures =
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
                   open.rewrite_checkpoint->kind ==
-                      ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                      voidinfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
                   open.rewrite_checkpoint->offset == first_header,
               "tool loop did not retain the stable prefix before its first assistant turn");
 
@@ -962,7 +962,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t preserved_header = preserved.text.rfind(assistant_header);
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
                           preserved.rewrite_checkpoint->offset == preserved_header &&
                           preserved.text.ends_with("<think>\n"),
                       "preserve_thinking did not checkpoint before the generation prologue");
@@ -972,33 +972,33 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
     failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking.rewrite_checkpoint->offset == nonthinking_header &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
                       "non-thinking response replay did not checkpoint before its generation "
                       "prologue");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
-    next_turn.push_back(chat_message(ninfer::ChatRole::User, "next question"));
+    next_turn.push_back(chat_message(voidinfer::ChatRole::User, "next question"));
     const fi::RenderedChat next    = render_chat(next_turn);
     const std::size_t final_header = next.text.rfind(assistant_header);
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
                           next.rewrite_checkpoint->offset == final_header,
                       "new user turn did not move the rewrite boundary before its generation "
                       "opener");
 
     const fi::RenderedChat branch =
-        render_chat({chat_message(ninfer::ChatRole::User, "question"),
-                     chat_message(ninfer::ChatRole::User, "summarize the conversation")},
+        render_chat({chat_message(voidinfer::ChatRole::User, "question"),
+                     chat_message(voidinfer::ChatRole::User, "summarize the conversation")},
                     preserve);
     const fi::RenderedChat source =
-        render_chat({chat_message(ninfer::ChatRole::User, "question")}, preserve);
+        render_chat({chat_message(voidinfer::ChatRole::User, "question")}, preserve);
     failures += check(
         source.rewrite_checkpoint &&
             source.rewrite_checkpoint->kind ==
-                ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                voidinfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
             branch.text.starts_with(source.text.substr(0, source.rewrite_checkpoint->offset)) &&
             !branch.text.starts_with(
                 source.text.substr(0, source.rewrite_checkpoint->offset + assistant_header.size())),
@@ -1007,7 +1007,7 @@ int test_rewrite_checkpoint_trace() {
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     const fi::RenderedChat no_assistant =
-        render_chat({chat_message(ninfer::ChatRole::User, "question")}, no_generation);
+        render_chat({chat_message(voidinfer::ChatRole::User, "question")}, no_generation);
     failures += check(!no_assistant.rewrite_checkpoint,
                       "boundary-less prompt unexpectedly published a rewrite boundary");
 
@@ -1018,14 +1018,14 @@ int test_rewrite_checkpoint_trace() {
     no_generation.preserve_thinking = false;
 
     const fi::RenderedChat wrapped = render_chat(
-        {chat_message(ninfer::ChatRole::User, "question"), first,
-         chat_message(ninfer::ChatRole::User, "<tool_response>compat result</tool_response>"),
+        {chat_message(voidinfer::ChatRole::User, "question"), first,
+         chat_message(voidinfer::ChatRole::User, "<tool_response>compat result</tool_response>"),
          second},
         no_generation);
     const std::size_t wrapped_first = wrapped.text.find(assistant_header);
     failures += check(wrapped.rewrite_checkpoint &&
                           wrapped.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
                           wrapped.rewrite_checkpoint->offset == wrapped_first,
                       "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
@@ -1033,13 +1033,13 @@ int test_rewrite_checkpoint_trace() {
 
 int test_adjacent_tool_message_boundary() {
     if (!official_tokenizer_available()) { return 0; }
-    fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage assistant = chat_message(voidinfer::ChatRole::Assistant, "");
     assistant.tool_calls.push_back(
         {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
     const fi::RenderedChat rendered =
-        render_chat({chat_message(ninfer::ChatRole::User, "weather?"), std::move(assistant),
-                     chat_message(ninfer::ChatRole::Tool, "sunny"),
-                     chat_message(ninfer::ChatRole::Tool, "20C")});
+        render_chat({chat_message(voidinfer::ChatRole::User, "weather?"), std::move(assistant),
+                     chat_message(voidinfer::ChatRole::Tool, "sunny"),
+                     chat_message(voidinfer::ChatRole::Tool, "20C")});
     const fi::EncodedChat encoded = fi::encode_rendered_chat(test_tokenizer(), rendered);
     return check(rendered.message_boundaries.size() == 5 && rendered.message_boundaries[3] &&
                      encoded.message_boundaries.size() == 5 && encoded.message_boundaries[3] &&
@@ -1072,31 +1072,31 @@ int test_official_resource_guards() {
 
     const Frontend effort_frontend =
         FrontendFactory::create_component(resources(reasoning_effort_template_source()), false);
-    const ninfer::PromptCapabilities capabilities = effort_frontend.prompt_capabilities();
+    const voidinfer::PromptCapabilities capabilities = effort_frontend.prompt_capabilities();
     failures +=
         check(capabilities.reasoning_effort.low && capabilities.reasoning_effort.medium &&
                   capabilities.reasoning_effort.xhigh &&
-                  capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
+                  capabilities.reasoning_effort.default_effort == voidinfer::ReasoningEffort::XHigh,
               "Frontend did not expose capabilities from its loaded chat template");
 
     return failures;
 }
 
 int test_text_and_image_prepare(const Frontend& frontend) {
-    ninfer::ChatMessage text_message;
-    text_message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage text_message;
+    text_message.role = voidinfer::ChatRole::User;
     text_message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput text_input;
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    voidinfer::PromptInput text_input;
     text_input.messages.push_back(std::move(text_message));
     auto text             = frontend.prepare(std::move(text_input));
     const auto& text_data = FrontendFactory::inspect(text);
-    const std::vector<ninfer::TokenId> expected{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
+    const std::vector<voidinfer::TokenId> expected{248045, 30, 0, 248046, 32, 248045, 31, 248068, 32};
     int failures =
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
                           text_data.identity.rewrite_checkpoint->frontier == 5 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
                       "text frontend did not preserve prefix/thinking identity");
@@ -1105,29 +1105,29 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                   text_data.position_axis(2).back() == 8,
               "text frontend did not construct axis-major positions");
 
-    ninfer::ChatMessage preserved_message;
-    preserved_message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage preserved_message;
+    preserved_message.role = voidinfer::ChatRole::User;
     preserved_message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput preserved_input;
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    voidinfer::PromptInput preserved_input;
     preserved_input.messages.push_back(std::move(preserved_message));
     preserved_input.options.preserve_thinking = true;
     const auto preserved_prompt               = frontend.prepare(std::move(preserved_input));
     const auto& preserved_data                = FrontendFactory::inspect(preserved_prompt);
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
                           preserved_data.identity.rewrite_checkpoint->frontier == 5 &&
                           preserved_data.identity.rewrite_checkpoint->frontier <
                               preserved_data.token_ids.size(),
                       "preserve-thinking prompt did not publish a pre-generation response "
                       "checkpoint");
 
-    ninfer::ChatMessage nonthinking_message;
-    nonthinking_message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage nonthinking_message;
+    nonthinking_message.role = voidinfer::ChatRole::User;
     nonthinking_message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput nonthinking_input;
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    voidinfer::PromptInput nonthinking_input;
     nonthinking_input.messages.push_back(std::move(nonthinking_message));
     nonthinking_input.options.preserve_thinking = true;
     nonthinking_input.options.enable_thinking   = false;
@@ -1135,27 +1135,27 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const auto& nonthinking_data                = FrontendFactory::inspect(nonthinking_prompt);
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
+                              voidinfer::targets::qwen3_6::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier == 5 &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
                           !nonthinking_data.starts_in_reasoning,
                       "non-thinking prompt did not publish a pre-generation response checkpoint");
 
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+    voidinfer::MessagePart image;
+    image.kind              = voidinfer::MessagePartKind::Media;
+    image.media.kind        = voidinfer::MediaKind::Image;
     image.media.bytes       = gradient_ppm();
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = "inline.ppm";
-    ninfer::ChatMessage image_message;
-    image_message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage image_message;
+    image_message.role = voidinfer::ChatRole::User;
     image_message.parts.push_back(std::move(image));
-    ninfer::PromptInput image_input;
+    voidinfer::PromptInput image_input;
     image_input.messages.push_back(std::move(image_message));
-    image_input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+    image_input.context_cache.markers.push_back(voidinfer::PromptCacheMarker{
         .after_message_count = 1,
-        .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+        .kind                = voidinfer::PromptCacheMarkerKind::PrivateLongAnchor,
     });
     auto prepared             = frontend.prepare(std::move(image_input));
     const auto& prepared_data = FrontendFactory::inspect(prepared);
@@ -1189,7 +1189,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
             prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
-                ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
+                voidinfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&
@@ -1222,25 +1222,25 @@ int test_explicit_leading_instruction_cache_boundary() {
         read_file(official_model_file("generation_config.json").c_str());
     const Frontend frontend = FrontendFactory::create_component(official, false);
     constexpr std::string_view stable = "stable cache section.";
-    ninfer::ChatMessage system;
-    system.role = ninfer::ChatRole::System;
-    system.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = std::string(stable), .media = {}});
-    system.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "\ndynamic working directory", .media = {}});
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "question", .media = {}});
+    voidinfer::ChatMessage system;
+    system.role = voidinfer::ChatRole::System;
+    system.parts.push_back(voidinfer::MessagePart{
+        .kind = voidinfer::MessagePartKind::Text, .text = std::string(stable), .media = {}});
+    system.parts.push_back(voidinfer::MessagePart{
+        .kind = voidinfer::MessagePartKind::Text, .text = "\ndynamic working directory", .media = {}});
+    voidinfer::ChatMessage user;
+    user.role = voidinfer::ChatRole::User;
+    user.parts.push_back(voidinfer::MessagePart{
+        .kind = voidinfer::MessagePartKind::Text, .text = "question", .media = {}});
 
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(system));
     input.messages.push_back(std::move(user));
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
-    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-        .kind                      = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-        .location                  = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+    input.context_cache.markers.push_back(voidinfer::PromptCacheMarker{
+        .kind                      = voidinfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .location                  = voidinfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
         .leading_instruction_bytes = static_cast<std::uint32_t>(stable.size()),
     });
 
@@ -1248,7 +1248,7 @@ int test_explicit_leading_instruction_cache_boundary() {
     const auto& data    = FrontendFactory::inspect(prepared);
     return check(data.context_cache.opportunities.size() == 1 &&
                      data.context_cache.opportunities[0].kind ==
-                         ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                         voidinfer::PromptCacheMarkerKind::SharedStablePrefix &&
                      data.context_cache.opportunities[0].frontier != 0 &&
                      data.context_cache.opportunities[0].frontier < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
@@ -1258,18 +1258,18 @@ int test_explicit_leading_instruction_cache_boundary() {
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     for (std::size_t index = 0; index < kMediaItems; ++index) {
-        ninfer::OwnedMedia media;
-        media.kind        = ninfer::MediaKind::Image;
+        voidinfer::OwnedMedia media;
+        media.kind        = voidinfer::MediaKind::Image;
         media.bytes       = bytes;
         media.media_type  = "image/x-portable-pixmap";
         media.source_name = "aggregate-" + std::to_string(index) + ".ppm";
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Media, .text = {}, .media = std::move(media)});
+        message.parts.push_back(voidinfer::MessagePart{
+            .kind = voidinfer::MessagePartKind::Media, .text = {}, .media = std::move(media)});
     }
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     const auto prepared = frontend.prepare(std::move(input));
     const auto& data    = FrontendFactory::inspect(prepared);
@@ -1282,12 +1282,12 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
 
     fi::ProcessorOptions options;
     options.max_encoded_media_bytes = bytes.size() * 2 - 1;
-    auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
-                                                            ninfer::kDefaultMediaLiveBytes);
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(voidinfer::kDefaultMediaCacheBytes,
+                                                            voidinfer::kDefaultMediaLiveBytes);
     fi::Processor processor(test_tokenizer(), thinking_toggle_template(), options,
                             std::move(cache));
     fi::ChatMessage internal_message;
-    internal_message.role = ninfer::ChatRole::User;
+    internal_message.role = voidinfer::ChatRole::User;
     for (std::size_t index = 0; index < 2; ++index) {
         internal_message.parts.push_back(
             fi::ChatPart::image(fi::MediaData{.bytes       = bytes,
@@ -1303,10 +1303,10 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
 
 int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
     const std::string long_text(40'000, 'x');
-    const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
+    const voidinfer::MediaCacheSummary before_count = frontend.media_cache_summary();
     const std::uint32_t counted =
         frontend.count_tokens(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
-    const ninfer::MediaCacheSummary after_count = frontend.media_cache_summary();
+    const voidinfer::MediaCacheSummary after_count = frontend.media_cache_summary();
     const auto prepared =
         frontend.prepare(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
     const auto& data = FrontendFactory::inspect(prepared);
@@ -1338,21 +1338,21 @@ int test_attention_pairs_are_diagnostic(const Frontend& frontend) {
 }
 
 int test_video_prepare(const Frontend& frontend) {
-    ninfer::MessagePart video;
-    video.kind              = ninfer::MessagePartKind::Media;
-    video.media.kind        = ninfer::MediaKind::Video;
+    voidinfer::MessagePart video;
+    video.kind              = voidinfer::MessagePartKind::Media;
+    video.media.kind        = voidinfer::MediaKind::Video;
     video.media.bytes       = gradient_ppm();
     video.media.media_type  = "image/x-portable-pixmap";
     video.media.source_name = "single-frame.ppm";
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(std::move(video));
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
 
-    const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
+    const voidinfer::MediaCacheSummary before_count = frontend.media_cache_summary();
     const std::uint32_t counted                  = frontend.count_tokens(input);
-    const ninfer::MediaCacheSummary after_count  = frontend.media_cache_summary();
+    const voidinfer::MediaCacheSummary after_count  = frontend.media_cache_summary();
     auto prepared                                = frontend.prepare(std::move(input));
     const auto& prepared_data                    = FrontendFactory::inspect(prepared);
     int failures = check(prepared_data.vision_items.size() == 1 && prepared_data.has_media() &&
@@ -1366,7 +1366,7 @@ int test_video_prepare(const Frontend& frontend) {
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
         failures +=
-            check(item.modality == ninfer::targets::qwen3_6::PromptModality::Video &&
+            check(item.modality == voidinfer::targets::qwen3_6::PromptModality::Video &&
                       item.grid.temporal == 1 && item.grid.height == 4 && item.grid.width == 4 &&
                       item.patch_count == 16 && item.content_digest == kGradientDigest &&
                       item.timestamps.size() == 1 && item.timestamps.front() == 0.0 &&
@@ -1388,27 +1388,27 @@ int test_video_prepare(const Frontend& frontend) {
 
 int test_cross_round_stop(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy stop;
-    stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    voidinfer::StopPolicy stop;
+    stop.strings.push_back(voidinfer::StopString{.text = "STOP"});
     auto session = frontend.make_output_session(prompt, stop);
     session.preallocate_pending_storage();
     // Abandon a preview that uses stop scratch, then replay from committed state.
-    (void)session.preview_model(std::array<ninfer::TokenId,1>{1},2,ninfer::FinishReason::OutputLimit);
+    (void)session.preview_model(std::array<voidinfer::TokenId,1>{1},2,voidinfer::FinishReason::OutputLimit);
     session.discard_preview();
 
-    const auto first_decision = session.preview_model(std::array<ninfer::TokenId, 1>{1}, 2,
-                                                      ninfer::FinishReason::OutputLimit);
+    const auto first_decision = session.preview_model(std::array<voidinfer::TokenId, 1>{1}, 2,
+                                                      voidinfer::FinishReason::OutputLimit);
     int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "cross-round stop ended before the stop string was complete");
     auto first = session.commit_preview();
-    failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
+    failures += check(channel_text(first, voidinfer::OutputChannel::Content) == "hello",
                       "cross-round stop did not retain the ambiguous suffix");
     session.recycle_output(std::move(first));
 
-    const auto second_decision = session.preview_model(std::array<ninfer::TokenId, 1>{2}, 1,
-                                                       ninfer::FinishReason::OutputLimit);
+    const auto second_decision = session.preview_model(std::array<voidinfer::TokenId, 1>{2}, 1,
+                                                       voidinfer::FinishReason::OutputLimit);
     failures += check(second_decision.accepted_tokens == 1 &&
-                          second_decision.finish_reason == ninfer::FinishReason::StopString,
+                          second_decision.finish_reason == voidinfer::FinishReason::StopString,
                       "cross-round stop did not select the exact terminal token prefix");
     const auto second = session.commit_preview();
     failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
@@ -1417,30 +1417,30 @@ int test_cross_round_stop(const Frontend& frontend) {
 
 int test_same_token_stop_priority(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy stop;
+    voidinfer::StopPolicy stop;
     stop.strings = {
-        ninfer::StopString{.text = "tail", .include_in_output = true},
-        ninfer::StopString{.text = "OPtail"},
-        ninfer::StopString{.text = "OP", .include_in_output = true},
+        voidinfer::StopString{.text = "tail", .include_in_output = true},
+        voidinfer::StopString{.text = "OPtail"},
+        voidinfer::StopString{.text = "OP", .include_in_output = true},
     };
     auto session        = frontend.make_output_session(prompt, stop);
     session.preallocate_pending_storage();
-    const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{2}, 2,
-                                                ninfer::FinishReason::OutputLimit);
+    const auto decision = session.preview_model(std::array<voidinfer::TokenId, 1>{2}, 2,
+                                                voidinfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 1 &&
-                                    decision.finish_reason == ninfer::FinishReason::StopString,
+                                    decision.finish_reason == voidinfer::FinishReason::StopString,
                                 "same-token stop strings did not select a terminal prefix");
     const auto output   = session.commit_preview();
     failures += check(output.empty(),
                       "same-token stops did not prefer the earliest byte and declaration order");
-    ninfer::StopPolicy eos_and_text;
+    voidinfer::StopPolicy eos_and_text;
     eos_and_text.strings.push_back({.text="<eos>"});
     auto eos_prompt=frontend.prepare_tokens({0});
     auto eos_session=frontend.make_output_session(eos_prompt,eos_and_text);
     const auto eos_decision=eos_session.preview_model(
-        std::array<ninfer::TokenId,1>{6},2,ninfer::FinishReason::OutputLimit);
+        std::array<voidinfer::TokenId,1>{6},2,voidinfer::FinishReason::OutputLimit);
     failures+=check(eos_decision.accepted_tokens==1 &&
-            eos_decision.finish_reason==ninfer::FinishReason::StopString &&
+            eos_decision.finish_reason==voidinfer::FinishReason::StopString &&
             eos_session.commit_preview().empty(),
         "same-token text stop did not retain precedence over hidden EOS presentation");
     return failures;
@@ -1451,61 +1451,61 @@ int test_terminal_flush(const Frontend& frontend) {
         frontend.output_text_byte_bound(2)==2*(frontend.output_text_byte_bound(1)-3)+3,
         "output allowance bound lost terminal repair or linear token extent");
     auto prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy stop;
-    stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    voidinfer::StopPolicy stop;
+    stop.strings.push_back(voidinfer::StopString{.text = "STOP"});
     auto session = frontend.make_output_session(prompt, stop);
 
-    const auto first_decision = session.preview_model(std::array<ninfer::TokenId, 1>{1}, 2,
-                                                      ninfer::FinishReason::OutputLimit);
+    const auto first_decision = session.preview_model(std::array<voidinfer::TokenId, 1>{1}, 2,
+                                                      voidinfer::FinishReason::OutputLimit);
     int failures     = bound_failures+check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "terminal flush setup unexpectedly finished");
     const auto first = session.commit_preview();
-    failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
+    failures += check(channel_text(first, voidinfer::OutputChannel::Content) == "hello",
                       "terminal flush setup did not retain the possible stop suffix");
 
-    const auto terminal = session.preview_terminal(ninfer::FinishReason::Cancelled);
+    const auto terminal = session.preview_terminal(voidinfer::FinishReason::Cancelled);
     failures += check(terminal.accepted_tokens == 0 &&
-                          terminal.finish_reason == ninfer::FinishReason::Cancelled,
+                          terminal.finish_reason == voidinfer::FinishReason::Cancelled,
                       "between-round terminal preview returned the wrong decision");
     const auto flushed = session.commit_preview();
-    failures += check(channel_text(flushed, ninfer::OutputChannel::Content) == "ST",
+    failures += check(channel_text(flushed, voidinfer::OutputChannel::Content) == "ST",
                       "between-round terminal preview lost the pending stop suffix");
     return failures;
 }
 
 int test_reasoning_split(const Frontend& frontend) {
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.add_generation_prompt = true;
     input.options.enable_thinking       = true;
     auto prompt                         = frontend.prepare(std::move(input));
     auto session                        = frontend.make_output_session(prompt, {});
     session.preallocate_pending_storage();
-    const std::array<ninfer::TokenId, 2> tokens{3, 4};
-    const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
+    const std::array<voidinfer::TokenId, 2> tokens{3, 4};
+    const auto decision = session.preview_model(tokens, 2, voidinfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 2 &&
-                                    decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                    decision.finish_reason == voidinfer::FinishReason::OutputLimit,
                                 "reasoning output did not finish at the requested token limit");
     const auto output   = session.commit_preview();
-    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+    failures += check(channel_text(output, voidinfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+    failures += check(channel_text(output, voidinfer::OutputChannel::Content) == "answer",
                       "content channel did not strip the post-thinking separator");
     failures += check(session.reasoning_tokens() == 2,
                       "reasoning token usage did not count accepted reasoning tokens exactly");
     return failures;
 }
 
-ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& frontend) {
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+voidinfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& frontend) {
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.add_generation_prompt = true;
     input.options.enable_thinking       = true;
@@ -1514,33 +1514,33 @@ ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& fronten
 
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
-    ninfer::StopPolicy stop;
+    voidinfer::StopPolicy stop;
     stop.strings.push_back(
-        ninfer::StopString{.text = "limited", .channel = ninfer::OutputChannel::Reasoning});
+        voidinfer::StopString{.text = "limited", .channel = voidinfer::OutputChannel::Reasoning});
     auto session =
-        frontend.make_output_session(prompt, stop, {}, ninfer::ThinkingControlOptions{.budget = 2});
+        frontend.make_output_session(prompt, stop, {}, voidinfer::ThinkingControlOptions{.budget = 2});
     session.preallocate_pending_storage();
     int failures = check(session.model_token_budget_remaining(20) == 2,
                          "thinking budget did not clamp the model round license");
 
-    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    const std::array<voidinfer::TokenId, 2> model_tokens{0, 0};
     const auto boundary =
-        session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+        session.preview_model(model_tokens, 20, voidinfer::FinishReason::OutputLimit);
     failures +=
         check(boundary.accepted_tokens == model_tokens.size() && !boundary.finished() &&
-                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                  boundary.continuation == voidinfer::runtime::ContinuationAction::ApplyTargetControl,
               "thinking boundary did not request target control");
     const auto model_output = session.commit_preview();
-    failures += check(channel_text(model_output, ninfer::OutputChannel::Reasoning) == "xx",
+    failures += check(channel_text(model_output, voidinfer::OutputChannel::Reasoning) == "xx",
                       "model-origin thinking output was not published before control");
 
-    const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+    const std::span<const voidinfer::TokenId> pending = session.pending_control_tokens();
     const auto prepared_control=frontend.thinking_control_tokens();
     failures+=check(std::equal(pending.begin(),pending.end(),prepared_control.begin(),prepared_control.end()),
         "pending thinking control differs from immutable prequeue suffix");
     failures += check(pending.size() > 1,
                       "thinking boundary did not expose a multi-token canonical control span");
-    const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+    const std::vector<voidinfer::TokenId> control(pending.begin(), pending.end());
     auto partial_control=control;
     partial_control.pop_back();
     failures+=check(throws_invalid_argument([&] {
@@ -1560,32 +1560,32 @@ int test_thinking_budget_control(const Frontend& frontend) {
         check(control_decision.accepted_tokens == control.size() && !control_decision.finished(),
               "canonical thinking control was not accepted atomically");
     const auto control_output = session.commit_preview();
-    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+    failures += check(channel_text(control_output, voidinfer::OutputChannel::Reasoning) ==
                               kThinkingControlGuidance &&
-                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                          channel_text(control_output, voidinfer::OutputChannel::Content).empty(),
                       "thinking control was truncated by caller stops or published to content");
-    const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+    const voidinfer::ThinkingBudgetStats stats = session.thinking_stats();
     failures += check(stats.configured_budget == 2 && stats.model_thinking_tokens == 2 &&
                           stats.injected_tokens == control.size() && stats.applied &&
                           session.pending_control_tokens().empty() &&
                           session.model_token_budget_remaining(17) == 17,
                       "thinking control accounting or post-close license is incorrect");
 
-    const auto content_decision = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 17,
-                                                        ninfer::FinishReason::OutputLimit);
+    const auto content_decision = session.preview_model(std::array<voidinfer::TokenId, 1>{0}, 17,
+                                                        voidinfer::FinishReason::OutputLimit);
     failures +=
         check(!content_decision.finished(), "post-control model token unexpectedly terminated");
     const auto content_output = session.commit_preview();
-    failures += check(channel_text(content_output, ninfer::OutputChannel::Content) == "x",
+    failures += check(channel_text(content_output, voidinfer::OutputChannel::Content) == "x",
                       "post-control model output did not enter the content channel");
 
     auto natural_prompt  = thinking_prompt(frontend);
     auto natural_session = frontend.make_output_session(
-        natural_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
-    const auto natural = natural_session.preview_model(std::array<ninfer::TokenId, 2>{3, 4}, 20,
-                                                       ninfer::FinishReason::OutputLimit);
+        natural_prompt, {}, {}, voidinfer::ThinkingControlOptions{.budget = 2});
+    const auto natural = natural_session.preview_model(std::array<voidinfer::TokenId, 2>{3, 4}, 20,
+                                                       voidinfer::FinishReason::OutputLimit);
     failures += check(!natural.finished() &&
-                          natural.continuation == ninfer::runtime::ContinuationAction::Decode,
+                          natural.continuation == voidinfer::runtime::ContinuationAction::Decode,
                       "natural thinking close at the budget boundary requested control");
     (void)natural_session.commit_preview();
     failures += check(natural_session.pending_control_tokens().empty() &&
@@ -1594,11 +1594,11 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     auto terminal_prompt  = thinking_prompt(frontend);
     auto terminal_session = frontend.make_output_session(
-        terminal_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
-    const auto terminal = terminal_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 10,
-                                                         ninfer::FinishReason::OutputLimit);
-    failures += check(terminal.finish_reason == ninfer::FinishReason::StopToken &&
-                          terminal.continuation == ninfer::runtime::ContinuationAction::Decode,
+        terminal_prompt, {}, {}, voidinfer::ThinkingControlOptions{.budget = 1});
+    const auto terminal = terminal_session.preview_model(std::array<voidinfer::TokenId, 1>{6}, 10,
+                                                         voidinfer::FinishReason::OutputLimit);
+    failures += check(terminal.finish_reason == voidinfer::FinishReason::StopToken &&
+                          terminal.continuation == voidinfer::runtime::ContinuationAction::Decode,
                       "terminal token at the thinking boundary did not take priority");
     (void)terminal_session.commit_preview();
     failures += check(terminal_session.pending_control_tokens().empty(),
@@ -1606,29 +1606,29 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     auto limit_prompt  = thinking_prompt(frontend);
     auto limit_session = frontend.make_output_session(limit_prompt, {}, {},
-                                                      ninfer::ThinkingControlOptions{.budget = 1});
-    const auto limited = limit_session.preview_model(std::array<ninfer::TokenId, 1>{0}, 1,
-                                                     ninfer::FinishReason::ContextCapacity);
-    failures += check(limited.finish_reason == ninfer::FinishReason::ContextCapacity &&
-                          limited.continuation == ninfer::runtime::ContinuationAction::Decode,
+                                                      voidinfer::ThinkingControlOptions{.budget = 1});
+    const auto limited = limit_session.preview_model(std::array<voidinfer::TokenId, 1>{0}, 1,
+                                                     voidinfer::FinishReason::ContextCapacity);
+    failures += check(limited.finish_reason == voidinfer::FinishReason::ContextCapacity &&
+                          limited.continuation == voidinfer::runtime::ContinuationAction::Decode,
                       "total capacity did not take priority at the thinking boundary");
     (void)limit_session.commit_preview();
 
     auto raw_prompt = thinking_prompt(frontend);
     auto raw_session =
-        frontend.make_output_session(raw_prompt, {}, ninfer::OutputOptions{.raw = true},
-                                     ninfer::ThinkingControlOptions{.budget = 1});
-    const auto raw_boundary = raw_session.preview_model(std::array<ninfer::TokenId, 1>{0}, 10,
-                                                        ninfer::FinishReason::OutputLimit);
+        frontend.make_output_session(raw_prompt, {}, voidinfer::OutputOptions{.raw = true},
+                                     voidinfer::ThinkingControlOptions{.budget = 1});
+    const auto raw_boundary = raw_session.preview_model(std::array<voidinfer::TokenId, 1>{0}, 10,
+                                                        voidinfer::FinishReason::OutputLimit);
     failures +=
-        check(raw_boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+        check(raw_boundary.continuation == voidinfer::runtime::ContinuationAction::ApplyTargetControl,
               "raw presentation disabled semantic thinking control");
     (void)raw_session.commit_preview();
-    const std::vector<ninfer::TokenId> raw_tokens(raw_session.pending_control_tokens().begin(),
+    const std::vector<voidinfer::TokenId> raw_tokens(raw_session.pending_control_tokens().begin(),
                                                   raw_session.pending_control_tokens().end());
     (void)raw_session.preview_control(raw_tokens, 9);
     const auto raw_output = raw_session.commit_preview();
-    failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) == kThinkingControl,
+    failures += check(channel_text(raw_output, voidinfer::OutputChannel::Content) == kThinkingControl,
                       "raw output did not preserve the inserted control representation");
     return failures;
 }
@@ -1639,9 +1639,9 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     session.preallocate_pending_storage();
     int failures            = 0;
     std::uint32_t remaining = 4;
-    for (const ninfer::TokenId token : {10, 11}) {
-        const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{token},
-                                                    remaining, ninfer::FinishReason::OutputLimit);
+    for (const voidinfer::TokenId token : {10, 11}) {
+        const auto decision = session.preview_model(std::array<voidinfer::TokenId, 1>{token},
+                                                    remaining, voidinfer::FinishReason::OutputLimit);
         failures += check(decision.accepted_tokens == 1 && !decision.finished(),
                           "partial UTF-8 token unexpectedly ended generation");
         const auto output = session.commit_preview();
@@ -1649,46 +1649,68 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
         failures += check(output.empty(), "partial UTF-8 codepoint was published");
     }
     const auto complete_decision = session.preview_model(
-        std::array<ninfer::TokenId, 1>{12}, remaining, ninfer::FinishReason::OutputLimit);
+        std::array<voidinfer::TokenId, 1>{12}, remaining, voidinfer::FinishReason::OutputLimit);
     failures += check(complete_decision.accepted_tokens == 1 && !complete_decision.finished(),
                       "complete UTF-8 token unexpectedly ended generation");
     const auto complete = session.commit_preview();
-    failures += check(channel_text(complete, ninfer::OutputChannel::Content) == "中",
+    failures += check(channel_text(complete, voidinfer::OutputChannel::Content) == "中",
                       "UTF-8 codepoint was not published when complete");
     auto isolated_a_prompt=frontend.prepare_tokens({0});
     auto isolated_b_prompt=frontend.prepare_tokens({0});
     auto isolated_a=frontend.make_output_session(isolated_a_prompt,{});
     auto isolated_b=frontend.make_output_session(isolated_b_prompt,{});
-    (void)isolated_a.preview_model(std::array<ninfer::TokenId,1>{10},4,
-        ninfer::FinishReason::OutputLimit);
+    (void)isolated_a.preview_model(std::array<voidinfer::TokenId,1>{10},4,
+        voidinfer::FinishReason::OutputLimit);
     failures+=check(isolated_a.commit_preview().empty(),
         "client A published an incomplete UTF-8 prefix");
-    (void)isolated_a.preview_model(std::array<ninfer::TokenId,1>{11},3,
-        ninfer::FinishReason::OutputLimit);
+    (void)isolated_a.preview_model(std::array<voidinfer::TokenId,1>{11},3,
+        voidinfer::FinishReason::OutputLimit);
     isolated_a.discard_preview();
-    (void)isolated_b.preview_model(std::array<ninfer::TokenId,1>{0},1,
-        ninfer::FinishReason::OutputLimit);
+    (void)isolated_b.preview_model(std::array<voidinfer::TokenId,1>{0},1,
+        voidinfer::FinishReason::OutputLimit);
     const auto isolated_b_output=isolated_b.commit_preview();
-    failures+=check(channel_text(isolated_b_output,ninfer::OutputChannel::Content)=="x",
+    failures+=check(channel_text(isolated_b_output,voidinfer::OutputChannel::Content)=="x",
         "client B observed client A incremental decoder state");
-    (void)isolated_a.preview_terminal(ninfer::FinishReason::Cancelled);
-    failures+=check(channel_text(isolated_a.commit_preview(),ninfer::OutputChannel::Content)==
+    (void)isolated_a.preview_terminal(voidinfer::FinishReason::Cancelled);
+    failures+=check(channel_text(isolated_a.commit_preview(),voidinfer::OutputChannel::Content)==
             "\xef\xbf\xbd",
         "discarded preview leaked into cancellation terminal repair");
     for(unsigned partial_count:{1u,2u}) {
         auto partial_prompt=frontend.prepare_tokens({0});
         auto partial=frontend.make_output_session(partial_prompt,{});
         for(unsigned index=0;index<partial_count;++index) {
-            const std::array<ninfer::TokenId,1> token{static_cast<ninfer::TokenId>(10+index)};
-            partial.preview_model(token,4-index,ninfer::FinishReason::OutputLimit);
+            const std::array<voidinfer::TokenId,1> token{static_cast<voidinfer::TokenId>(10+index)};
+            partial.preview_model(token,4-index,voidinfer::FinishReason::OutputLimit);
             failures+=check(partial.commit_preview().empty(),"partial UTF-8 fixture published before terminal repair");
         }
-        partial.preview_terminal(ninfer::FinishReason::Cancelled);
+        partial.preview_terminal(voidinfer::FinishReason::Cancelled);
         const auto repaired=partial.commit_preview();
-        const auto repaired_text=channel_text(repaired,ninfer::OutputChannel::Content);
+        const auto repaired_text=channel_text(repaired,voidinfer::OutputChannel::Content);
         failures+=check(repaired_text=="\xef\xbf\xbd" &&
             repaired_text.size()<=frontend.output_text_byte_bound(partial_count),
             "tokenizer-derived output bound omitted terminal UTF-8 repair");
+    }
+    // Sampled byte-level tokens can form ill-formed UTF-8: each ill-formed
+    // sequence decodes to U+FFFD and generation continues (it used to throw
+    // and fail the engine). Fixture ids: 10 = byte E4, 11 = byte B8, 0 = "x".
+    const std::vector<std::pair<std::vector<voidinfer::TokenId>,std::string>> ill_formed{
+        {{11,0},"\xef\xbf\xbd" "x"},  // stray continuation byte
+        {{10,0},"\xef\xbf\xbd" "x"},  // lead byte broken by ASCII
+        {{1000+0xC0,1000+0x80,0},"\xef\xbf\xbd\xef\xbf\xbd" "x"},  // invalid lead, then stray continuation
+        {{10,11,12},"中"}};  // well-formed bytes still join
+    for(const auto& [tokens,expected]:ill_formed) {
+        auto ill_prompt=frontend.prepare_tokens({0});
+        auto ill=frontend.make_output_session(ill_prompt,{});
+        ill.preallocate_pending_storage();
+        std::string text;
+        std::uint32_t left=8;
+        for(const auto token:tokens) {
+            const auto decision=ill.preview_model(std::array<voidinfer::TokenId,1>{token},left,
+                voidinfer::FinishReason::OutputLimit);
+            left-=decision.accepted_tokens;
+            text+=channel_text(ill.commit_preview(),voidinfer::OutputChannel::Content);
+        }
+        failures+=check(text==expected,"ill-formed UTF-8 token bytes did not decode to U+FFFD");
     }
 
     auto eos_prompt         = frontend.prepare_tokens({0});
@@ -1696,10 +1718,10 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     eos_session.preallocate_pending_storage();
     eos_session.preallocate_output_storage(frontend.output_text_byte_bound(2));
     const auto eos_storage=eos_session.retained_storage_bytes();
-    const auto eos_decision = eos_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
-                                                        ninfer::FinishReason::OutputLimit);
+    const auto eos_decision = eos_session.preview_model(std::array<voidinfer::TokenId, 1>{6}, 2,
+                                                        voidinfer::FinishReason::OutputLimit);
     failures += check(eos_decision.accepted_tokens == 1 &&
-                          eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                          eos_decision.finish_reason == voidinfer::FinishReason::StopToken,
                       "default EOS token did not end generation");
     failures+=check(eos_session.retained_storage_bytes()==eos_storage,
         "hidden EOS snapshot grew or discarded preallocated workspace");
@@ -1708,19 +1730,19 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     failures += check(!eos_session.completed_chat_turn(),
                       "generic model EOS was reinterpreted as a completed chat turn");
 
-    ninfer::StopPolicy turn_stop;
+    voidinfer::StopPolicy turn_stop;
     turn_stop.include_model_defaults=false;
     turn_stop.token_ids={248046};
     auto turn_prompt=frontend.prepare_tokens({0});
     auto turn_session=frontend.make_output_session(turn_prompt,turn_stop);
     const auto partial_turn=turn_session.preview_model(
-        std::array<ninfer::TokenId,1>{0},2,ninfer::FinishReason::OutputLimit);
+        std::array<voidinfer::TokenId,1>{0},2,voidinfer::FinishReason::OutputLimit);
     failures+=check(!partial_turn.finished() && !turn_session.completed_chat_turn(),
                     "partial assistant preview published a completed chat frontier");
     turn_session.discard_preview();
     const auto turn_end=turn_session.preview_model(
-        std::array<ninfer::TokenId,1>{248046},2,ninfer::FinishReason::OutputLimit);
-    failures+=check(turn_end.finish_reason==ninfer::FinishReason::StopToken &&
+        std::array<voidinfer::TokenId,1>{248046},2,voidinfer::FinishReason::OutputLimit);
+    failures+=check(turn_end.finish_reason==voidinfer::FinishReason::StopToken &&
                         !turn_session.completed_chat_turn(),
                     "uncommitted chat delimiter published a completed frontier");
     (void)turn_session.commit_preview();
@@ -1729,16 +1751,16 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
 
     auto raw_prompt  = frontend.prepare_tokens({0});
     auto raw_session = frontend.make_output_session(
-        raw_prompt, {}, ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
-    const auto raw_eos_decision = raw_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
-                                                            ninfer::FinishReason::OutputLimit);
+        raw_prompt, {}, voidinfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
+    const auto raw_eos_decision = raw_session.preview_model(std::array<voidinfer::TokenId, 1>{6}, 2,
+                                                            voidinfer::FinishReason::OutputLimit);
     failures += check(raw_eos_decision.accepted_tokens == 1 &&
-                          raw_eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                          raw_eos_decision.finish_reason == voidinfer::FinishReason::StopToken,
                       "raw EOS token did not end generation");
     const auto raw_eos = raw_session.commit_preview();
-    failures += check(channel_text(raw_eos, ninfer::OutputChannel::Content) == "<eos>",
+    failures += check(channel_text(raw_eos, voidinfer::OutputChannel::Content) == "<eos>",
                       "raw output did not preserve the terminal special token");
-    failures += check(channel_text(raw_eos,ninfer::OutputChannel::Content).size()<=frontend.output_text_byte_bound(1),
+    failures += check(channel_text(raw_eos,voidinfer::OutputChannel::Content).size()<=frontend.output_text_byte_bound(1),
                       "raw special-token output exceeded decoded vocabulary bound");
     return failures;
 }
@@ -1750,11 +1772,11 @@ int test_disabled_vision() {
     failures += check(throws_invalid_argument([&] { (void)frontend.count_tokens(image_input()); }),
                       "Vision-disabled frontend accepted media during token counting");
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        voidinfer::MessagePart{.kind = voidinfer::MessagePartKind::Text, .text = "x", .media = {}});
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     failures += check(frontend.prepare(std::move(input)).summary().prompt_tokens != 0,
                       "Vision-disabled frontend rejected a text prompt");
@@ -1784,20 +1806,20 @@ int test_media_cache_reuses_immutable_payload() {
                           first_data.vision_items.front().preprocess==
                               first_data.media_payloads.front()->preprocess,
                       "prepared image lost its owning preprocessing identity");
-    const ninfer::MediaCacheSummary cache = frontend.media_cache_summary();
+    const voidinfer::MediaCacheSummary cache = frontend.media_cache_summary();
     failures += check(cache.entries == 1 && cache.misses == 1 && cache.hits == 1 &&
                           cache.retained_bytes == 16 * 1536 * sizeof(std::uint16_t) &&
                           cache.live_bytes == cache.retained_bytes &&
                           cache.preprocess_threads >= 1 && cache.preprocess_threads <= 16,
                       "Frontend media-cache accounting does not describe the retained payload");
-    const std::size_t retained = sizeof(ninfer::targets::qwen3_6::PreparedMediaPayload) +
+    const std::size_t retained = sizeof(voidinfer::targets::qwen3_6::PreparedMediaPayload) +
                                 16 * 1536 * sizeof(std::uint16_t);
     failures += check(first.preparation_stats().retained_media_payload_bytes == retained &&
                           second.preparation_stats().retained_media_payload_bytes == retained,
                       "prepared input payload snapshot omitted shared cached storage");
     const auto initial_retention=first_data.media_payload_retention();
     failures+=check(initial_retention.mode==
-            ninfer::targets::qwen3_6::MediaPayloadRetentionMode::ReplayRequired &&
+            voidinfer::targets::qwen3_6::MediaPayloadRetentionMode::ReplayRequired &&
             initial_retention.live_items==1 && initial_retention.retained_bytes==retained,
         "prepared media did not declare its live replay owner and exact retained bytes");
     auto changed_input=image_input();
@@ -1822,14 +1844,14 @@ int test_media_cache_reuses_immutable_payload() {
                           repeated_data.media_payload_retention().retained_bytes==retained,
                       "logical repeated media uses were charged as distinct payload storage");
     const auto historical = repeated.preparation_stats();
-    auto released = ninfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(repeated));
+    auto released = voidinfer::targets::qwen3_6::PreparedPromptAccess::take(std::move(repeated));
     const auto retained_before_release=released.retained_storage_bytes();
     const std::array<std::uint32_t,1> second_item{1};
     released.retain_media_payloads_for_replay(second_item);
     const auto partial_retention=released.media_payload_retention();
     failures+=check(!released.media_payloads[0] && released.media_payloads[1] &&
             partial_retention.mode==
-                ninfer::targets::qwen3_6::MediaPayloadRetentionMode::ReplayRequired &&
+                voidinfer::targets::qwen3_6::MediaPayloadRetentionMode::ReplayRequired &&
             partial_retention.live_items==1 && partial_retention.retained_bytes==retained,
         "replay-required selection discarded its shared owner or double charged it");
     bool invalid_selection_refused=false;
@@ -1842,14 +1864,14 @@ int test_media_cache_reuses_immutable_payload() {
     const auto identity_after_release=released.retained_storage_bytes();
     failures += check(retained_before_release>=retained &&
                           retained_before_release-retained==identity_after_release &&
-                          identity_after_release>sizeof(ninfer::targets::qwen3_6::PreparedPromptData),
+                          identity_after_release>sizeof(voidinfer::targets::qwen3_6::PreparedPromptData),
                       "prepared storage visitor duplicated media or lost retained identity vectors");
     std::size_t current = 0;
     released.visit_media_payload_allocations([&](const void*, std::size_t bytes) { current += bytes; });
     const auto identity_only=released.media_payload_retention();
     failures += check(current == 0 &&
                           identity_only.mode==
-                              ninfer::targets::qwen3_6::MediaPayloadRetentionMode::IdentityOnly &&
+                              voidinfer::targets::qwen3_6::MediaPayloadRetentionMode::IdentityOnly &&
                           identity_only.live_items==0 && identity_only.retained_bytes==0 &&
                           released.prepare.retained_media_payload_bytes ==
                               historical.retained_media_payload_bytes,
@@ -1861,31 +1883,31 @@ int test_media_cache_reuses_immutable_payload() {
 }
 
 int test_output_session_storage(const Frontend& frontend) {
-    ninfer::targets::qwen3_6::OutputSession empty;
+    voidinfer::targets::qwen3_6::OutputSession empty;
     int failures=check(empty.retained_storage_bytes()==0,"empty output session retained private storage");
     {
         PublishedOutput slots;slots.preallocate_text(32);
         const auto capacity=slots.retained_text_capacity_bytes();
-        slots.append(ninfer::OutputChannel::Reasoning,std::string(20,'r'));
+        slots.append(voidinfer::OutputChannel::Reasoning,std::string(20,'r'));
         auto candidate=slots;
-        candidate.append(ninfer::OutputChannel::Reasoning,std::string(12,'s'));
+        candidate.append(voidinfer::OutputChannel::Reasoning,std::string(12,'s'));
         bool refused=false;
-        try{candidate.append(ninfer::OutputChannel::Reasoning,"x");}catch(const std::logic_error&){refused=true;}
+        try{candidate.append(voidinfer::OutputChannel::Reasoning,"x");}catch(const std::logic_error&){refused=true;}
         failures+=check(refused && candidate.back().text.size()==32 && slots.back().text.size()==20,
             "fixed output copy lost capacity policy or rejection changed existing text");
-        candidate.append(ninfer::OutputChannel::Content,std::string(32,'c'));
+        candidate.append(voidinfer::OutputChannel::Content,std::string(32,'c'));
         failures+=check(candidate.size()==2,"fixed output omitted second channel");
         slots.clear();
         failures+=check(slots.empty() && slots.retained_text_capacity_bytes()==capacity,
             "fixed output clear discarded preallocated slots");
-        slots.append(ninfer::OutputChannel::Content,std::string(32,'z'));
+        slots.append(voidinfer::OutputChannel::Content,std::string(32,'z'));
         failures+=check(slots.back().text.size()==32,"fixed output failed capacity reuse");
         PublishedOutput workspace;workspace.preallocate_text(32);
         const auto workspace_capacity=workspace.retained_text_capacity_bytes();
         workspace.copy_reusing_storage(candidate);
         failures+=check(workspace.size()==2 &&
-            channel_text(workspace,ninfer::OutputChannel::Reasoning)==std::string(20,'r')+std::string(12,'s') &&
-            channel_text(workspace,ninfer::OutputChannel::Content)==std::string(32,'c'),
+            channel_text(workspace,voidinfer::OutputChannel::Reasoning)==std::string(20,'r')+std::string(12,'s') &&
+            channel_text(workspace,voidinfer::OutputChannel::Content)==std::string(32,'c'),
             "candidate workspace copy changed two-channel text");
         workspace.copy_reusing_storage(slots);
         workspace.copy_reusing_storage(workspace);
@@ -1907,7 +1929,7 @@ int test_output_session_storage(const Frontend& frontend) {
             failures+=check(refused && fixed.retained_storage_bytes()==retained,
                 "incompatible recycled buffers changed fixed session storage");
         }
-        (void)fixed.preview_terminal(ninfer::FinishReason::Cancelled);
+        (void)fixed.preview_terminal(voidinfer::FinishReason::Cancelled);
         auto buffers=fixed.commit_preview();
         failures+=check(buffers.has_fixed_storage(32),"commit lost fixed output storage policy");
         fixed.recycle_output(std::move(buffers));
@@ -1917,8 +1939,8 @@ int test_output_session_storage(const Frontend& frontend) {
     const auto baseline_bytes=baseline.retained_storage_bytes();
     failures+=check(baseline_bytes<=frontend.output_session_storage_ceiling({}),
         "default output session exceeded preconstruction acceptance ceiling");
-    ninfer::StopPolicy policy;
-    policy.strings.push_back({std::string(8192,'x'),ninfer::OutputChannel::Content,false});
+    voidinfer::StopPolicy policy;
+    policy.strings.push_back({std::string(8192,'x'),voidinfer::OutputChannel::Content,false});
     auto expanded=frontend.make_output_session(prepared,policy);
     const auto before_preallocation=expanded.retained_storage_bytes();
     expanded.preallocate_pending_storage();
@@ -1935,8 +1957,8 @@ int test_output_session_storage(const Frontend& frontend) {
     empty=std::move(expanded);
     failures+=check(expanded.retained_storage_bytes()==0 && empty.retained_storage_bytes()==expanded_bytes,
         "output session move did not transfer private storage ownership");
-    const auto terminal=empty.preview_terminal(ninfer::FinishReason::Cancelled);
-    failures+=check(terminal.finish_reason==ninfer::FinishReason::Cancelled,
+    const auto terminal=empty.preview_terminal(voidinfer::FinishReason::Cancelled);
+    failures+=check(terminal.finish_reason==voidinfer::FinishReason::Cancelled,
         "preallocated session lost terminal preview decision");
     empty.discard_preview();
     bool late_reserve_refused=false;
@@ -1945,7 +1967,7 @@ int test_output_session_storage(const Frontend& frontend) {
     }
     failures+=check(late_reserve_refused && empty.retained_storage_bytes()>=expanded_bytes,
         "discarded empty preview reopened preallocation or dropped pending capacity");
-    (void)empty.preview_terminal(ninfer::FinishReason::Cancelled);
+    (void)empty.preview_terminal(voidinfer::FinishReason::Cancelled);
     const auto terminal_output=empty.commit_preview();
     failures+=check(terminal_output.empty() && empty.retained_storage_bytes()>=expanded_bytes,
         "terminal commit changed empty output or relinquished reserved lookbehind storage");
@@ -1960,7 +1982,7 @@ int test_output_session_storage(const Frontend& frontend) {
         invalid.preallocate_pending_storage();
         bool preview_refused=false;
         try {
-            if(kind==0)(void)invalid.preview_model({},1,ninfer::FinishReason::OutputLimit);
+            if(kind==0)(void)invalid.preview_model({},1,voidinfer::FinishReason::OutputLimit);
             else (void)invalid.preview_control({},1);
         } catch(const std::invalid_argument&){preview_refused=true;}
         invalid.discard_preview();
@@ -1973,7 +1995,7 @@ int test_output_session_storage(const Frontend& frontend) {
 }
 
 int test_prepared_prompt_spare_storage() {
-    using namespace ninfer::targets::qwen3_6;
+    using namespace voidinfer::targets::qwen3_6;
     PreparedPromptData data;
     int failures=check(data.retained_storage_bytes()==sizeof(PreparedPromptData),
         "empty prepared prompt did not retain exactly its data object");
@@ -1985,7 +2007,7 @@ int test_prepared_prompt_spare_storage() {
     data.vision_items.front().token_spans.reserve(29);
     const std::array<std::pair<const void*,std::size_t>,10> allocations{{
         {&data,sizeof(data)},
-        {data.token_ids.data(),data.token_ids.capacity()*sizeof(ninfer::TokenId)},
+        {data.token_ids.data(),data.token_ids.capacity()*sizeof(voidinfer::TokenId)},
         {data.token_types.data(),data.token_types.capacity()*sizeof(std::uint8_t)},
         {data.positions.data(),data.positions.capacity()*sizeof(std::int32_t)},
         {data.media_payloads.data(),data.media_payloads.capacity()*sizeof(std::shared_ptr<const PreparedMediaPayload>)},
@@ -2014,7 +2036,7 @@ int test_prepared_prompt_spare_storage() {
 }
 
 int test_media_payload_outlives_frontend_cache() {
-    ninfer::targets::qwen3_6::PreparedPrompt survivor;
+    voidinfer::targets::qwen3_6::PreparedPrompt survivor;
     {
         const Frontend frontend = FrontendFactory::create_component(resources());
         survivor                = frontend.prepare(image_input());
@@ -2041,7 +2063,7 @@ int test_media_cache_configuration_identity() {
     auto cache=std::make_shared<fi::MediaPreprocessCache>(1ULL<<20,2ULL<<20,1);
     fi::MediaCacheKey base;
     base.digest.front()=0x71;base.modality=fi::Modality::Image;
-    base.patch_storage=ninfer::VisionPatchStorage::BFloat16;
+    base.patch_storage=voidinfer::VisionPatchStorage::BFloat16;
     base.preprocess={1,1024,1048576,16,2,2,1,0.0,0,0};
     auto changed=base;++changed.preprocess.minimum_pixels;
     int builders=0;
@@ -2159,19 +2181,19 @@ int test_media_cache_runs_independent_misses_in_parallel() {
 
 int test_many_images_prepare_in_one_parallel_batch() {
     const Frontend frontend = FrontendFactory::create_component(resources());
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    voidinfer::ChatMessage message;
+    message.role = voidinfer::ChatRole::User;
     for (int index = 0; index < 19; ++index) {
-        ninfer::MessagePart image;
-        image.kind               = ninfer::MessagePartKind::Media;
-        image.media.kind         = ninfer::MediaKind::Image;
+        voidinfer::MessagePart image;
+        image.kind               = voidinfer::MessagePartKind::Media;
+        image.media.kind         = voidinfer::MediaKind::Image;
         image.media.bytes        = gradient_ppm();
         image.media.bytes.back() = static_cast<std::uint8_t>(index);
         image.media.media_type   = "image/x-portable-pixmap";
         image.media.source_name  = "parallel-" + std::to_string(index) + ".ppm";
         message.parts.push_back(std::move(image));
     }
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     const auto prepared = frontend.prepare(std::move(input));
     const auto& data    = FrontendFactory::inspect(prepared);
@@ -2183,24 +2205,24 @@ int test_many_images_prepare_in_one_parallel_batch() {
 
 int test_media_preparation_cancellation() {
     const Frontend frontend = FrontendFactory::create_component(resources());
-    ninfer::PreparationControl control{
+    voidinfer::PreparationControl control{
         .deadline     = {},
-        .cancellation = ninfer::CancellationView([] { return true; }),
+        .cancellation = voidinfer::CancellationView([] { return true; }),
     };
     try {
         (void)frontend.prepare(image_input(), control);
-    } catch (const ninfer::RequestError& error) {
-        return check(error.kind() == ninfer::RequestErrorKind::Cancelled &&
+    } catch (const voidinfer::RequestError& error) {
+        return check(error.kind() == voidinfer::RequestErrorKind::Cancelled &&
                          frontend.media_cache_summary().entries == 0,
                      "cancelled media preparation published a cache entry");
     }
     return check(false, "cancelled media preparation completed successfully");
 }
 
-ninfer::PromptInput exact_text_input(std::string text) {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage message;message.role=ninfer::ChatRole::User;
-    message.parts.push_back({.kind=ninfer::MessagePartKind::Text,
+voidinfer::PromptInput exact_text_input(std::string text) {
+    voidinfer::PromptInput input;
+    voidinfer::ChatMessage message;message.role=voidinfer::ChatRole::User;
+    message.parts.push_back({.kind=voidinfer::MessagePartKind::Text,
         .text=std::move(text),.media={}});
     input.messages.push_back(std::move(message));return input;
 }
@@ -2213,7 +2235,7 @@ int test_exact_text_preparation_cache(const Frontend& frontend) {
     int failures=check(a.prepare.frontend_cache_misses==1 &&
             a.prepare.frontend_cache_hits==0 && b.prepare.frontend_cache_hits==1 &&
             b.prepare.frontend_cache_misses==0 && b.prepare.tokenize_seconds==0 &&
-            b.prepare.reused_token_bytes==b.token_ids.size()*sizeof(ninfer::TokenId) &&
+            b.prepare.reused_token_bytes==b.token_ids.size()*sizeof(voidinfer::TokenId) &&
             a.token_ids==b.token_ids,
         "exact multilingual/special-token preparation was not privately reused");
 
@@ -2234,15 +2256,15 @@ int test_exact_text_preparation_cache(const Frontend& frontend) {
         "reordered tool payload shared an immutable preparation");
 
     const auto tool_exchange=[](std::string arguments,std::string result) {
-        ninfer::PromptInput input;
-        ninfer::ChatMessage user;user.role=ninfer::ChatRole::User;
-        user.parts.push_back({.kind=ninfer::MessagePartKind::Text,
+        voidinfer::PromptInput input;
+        voidinfer::ChatMessage user;user.role=voidinfer::ChatRole::User;
+        user.parts.push_back({.kind=voidinfer::MessagePartKind::Text,
             .text="weather?",.media={}});
-        ninfer::ChatMessage assistant;assistant.role=ninfer::ChatRole::Assistant;
+        voidinfer::ChatMessage assistant;assistant.role=voidinfer::ChatRole::Assistant;
         assistant.tool_calls.push_back({.id="call-1",.name="lookup",
             .arguments_json=std::move(arguments)});
-        ninfer::ChatMessage tool;tool.role=ninfer::ChatRole::Tool;
-        tool.parts.push_back({.kind=ninfer::MessagePartKind::Text,
+        voidinfer::ChatMessage tool;tool.role=voidinfer::ChatRole::Tool;
+        tool.parts.push_back({.kind=voidinfer::MessagePartKind::Text,
             .text=std::move(result),.media={}});
         tool.tool_call_id="call-1";
         input.messages={std::move(user),std::move(assistant),std::move(tool)};
@@ -2263,13 +2285,13 @@ int test_exact_text_preparation_cache(const Frontend& frontend) {
     failures+=check(FrontendTestAccess::inspect(changed_result).prepare.frontend_cache_misses==1,
         "changed tool-result bytes reused an exact preparation");
 
-    ninfer::PreparationControl cancelled{
-        .deadline={},.cancellation=ninfer::CancellationView([] {return true;})};
+    voidinfer::PreparationControl cancelled{
+        .deadline={},.cancellation=voidinfer::CancellationView([] {return true;})};
     bool cancelled_hit=false;
     try {
         (void)frontend.prepare(tool_exchange(R"({"city":"Paris"})","sunny"),cancelled);
-    } catch(const ninfer::RequestError& error) {
-        cancelled_hit=error.kind()==ninfer::RequestErrorKind::Cancelled;
+    } catch(const voidinfer::RequestError& error) {
+        cancelled_hit=error.kind()==voidinfer::RequestErrorKind::Cancelled;
     }
     const auto after_cancel=frontend.prepare(
         tool_exchange(R"({"city":"Paris"})","sunny"));

@@ -4,6 +4,7 @@
 // are resumed round-robin (restore -> AGENTS_DECODE greedy tokens -> park).
 // Agent 0's resumed tokens are checked against an uninterrupted reference run.
 // Reports park/resume times, decode rate and retained host bytes. Not a test.
+#include "exl3/engine_profile.h"
 #include "exl3/text_model.h"
 #include "exl3/branch_reference.h"
 
@@ -31,10 +32,11 @@ int env_int(const char* name, int fallback) {
 
 int main() {
     try {
-        using namespace ninfer::exl3;
-        const char* target = std::getenv("NINFER_EXL3_TARGET_PATH");
+        voidinfer::exl3::apply_engine_profile();
+        using namespace voidinfer::exl3;
+        const char* target = std::getenv("VOIDINFER_EXL3_TARGET_PATH");
         const char* ids_path = std::getenv("AGENTS_IDS");
-        if (!target || !ids_path) { std::cerr << "set NINFER_EXL3_TARGET_PATH, AGENTS_IDS\n"; return 77; }
+        if (!target || !ids_path) { std::cerr << "set VOIDINFER_EXL3_TARGET_PATH, AGENTS_IDS\n"; return 77; }
         const int agents = env_int("AGENTS_COUNT", 4);
         const int context = env_int("AGENTS_CONTEXT", 16384);
         const int decode = env_int("AGENTS_DECODE", 32);

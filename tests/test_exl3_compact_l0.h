@@ -1,14 +1,14 @@
 #pragma once
 
 void run_compact_l0_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
     require(target.max_context()==1024 && source.size()>600,"compact L0 fixture extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
     auto legacy=target.create_context(true);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");
     auto compact=target.create_context(true);
     require(compact->oscar_only_context() && compact->cache_staging_bytes()==256*4096,
         "compact L0 bounded allocation");

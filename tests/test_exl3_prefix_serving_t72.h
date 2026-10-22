@@ -8,10 +8,10 @@
 
 void run_prefix_serving_t72_qualification(Exl3TextModel& target,
     const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Index=ninfer::exl3::Exl3VeriCachePrefixIndex;
-    using Cache=ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity=ninfer::exl3::Exl3VeriCacheServingIdentity;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Index=voidinfer::exl3::Exl3VeriCachePrefixIndex;
+    using Cache=voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity=voidinfer::exl3::Exl3VeriCacheServingIdentity;
     const auto same_storage=[](const Index::StorageStats& a,const Index::StorageStats& b) {
         return a.entries==b.entries && a.payload_allocated_bytes==b.payload_allocated_bytes &&
             a.identity_allocated_bytes==b.identity_allocated_bytes && a.accounted_bytes==b.accounted_bytes &&
@@ -21,8 +21,8 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
     constexpr std::uint64_t reserve=8ULL<<30,unbounded=64ULL<<30;
     require(target.max_context()>=static_cast<int>(prefix_rows+tail_rows) &&
         source.size()>=prefix_rows+tail_rows+8,"T72 serving fixture extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto serving=target.create_context(true);serving->prepare_continuation(8);
     auto fresh=target.create_context(true);fresh->prepare_continuation(8);
     auto builder=std::shared_ptr<Exl3TextContext>(target.create_context(true));
@@ -78,10 +78,10 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         require(middle && root.owns_shared_text_page(middle,model,rope) &&
             second.request->owns_shared_text_page(middle,model,rope),
             "shared middle page lost acquired-root ancestry across distinct tails");
-        const auto different=std::make_shared<const ninfer::exl3::Exl3ExactKVPage>(*middle);
+        const auto different=std::make_shared<const voidinfer::exl3::Exl3ExactKVPage>(*middle);
         require(!root.owns_shared_text_page(different,model,rope),
             "equal page values and offsets substituted for immutable ancestor ownership");
-        const std::shared_ptr<const ninfer::exl3::Exl3ExactKVPage> foreign_owner(
+        const std::shared_ptr<const voidinfer::exl3::Exl3ExactKVPage> foreign_owner(
             middle.get(),[](const auto*){});
         require(!root.owns_shared_text_page(foreign_owner,model,rope) &&
             !root.owns_shared_text_page(middle,model,rope+1) &&
@@ -119,8 +119,8 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
     }
     const auto hit_retention=cache.retention_metadata();
     {
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Cache logical_cache(Cache::Policy{4,64,unbounded,reserve},identity);
         Coordinator authority(logical_cache,{1,1,unbounded,reserve});
         auto limits=Inventory::unlimited();limits[static_cast<unsigned>(Inventory::Domain::host_metadata)]=64;
@@ -133,7 +133,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
                 return Inventory::Allocation{storage,0,Inventory::Domain::host_metadata,64};
             },[&]{storage.reset();});
         };
-        bool refused=false;try{auto excess=allocate(65);}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        bool refused=false;try{auto excess=allocate(65);}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && !invoked,"logical output credit refusal reached allocator");
         for(unsigned fault=0;fault<3;++fault) {
             std::weak_ptr<const void> failed_owner;
@@ -162,7 +162,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         require(lease.bytes()==64 && !retained.expired(),"logical output reservation lost host ownership");
         require(!authority.retire_logical_host(lease,[]{return false;}) && !retained.expired(),
             "pending logical output retirement released its allocation");
-        invoked=false;refused=false;try{auto excess=allocate(1);}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+        invoked=false;refused=false;try{auto excess=allocate(1);}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
         require(refused && !invoked,"pending output retirement released reservation credit");
         auto moved=std::move(lease);
         refused=false;try{authority.retire_logical_host(lease,[]{return true;});}catch(const std::invalid_argument&){refused=true;}
@@ -171,7 +171,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
             "logical output final retirement retained storage");
         auto retry=allocate(64);
         require(authority.retire_logical_host(retry,[&]{storage.reset();return true;}),"logical output credit was not reusable");
-        using Extent=ninfer::exl3::Exl3HostResidentSet::ReservationExtent;
+        using Extent=voidinfer::exl3::Exl3HostResidentSet::ReservationExtent;
         std::shared_ptr<std::array<std::byte,32>> small,peer;
         auto bounded=authority.allocate_logical_host(64,[&] {
             small=std::make_shared<std::array<std::byte,32>>();
@@ -201,7 +201,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         authority.close();
     }
     {
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
         std::uint64_t root_budget=0;
         {
             Cache measured(Cache::Policy{4,64,unbounded,reserve},identity);
@@ -226,7 +226,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
                     const std::array<std::shared_ptr<const Request>,2> roots{first.request,second.request};
                     authority.admit_batch(roots);
                 } else authority.complete_and_admit(*active,second.request);
-            } catch(const ninfer::exl3::Exl3HostResidentBudgetExhausted& error) {
+            } catch(const voidinfer::exl3::Exl3HostResidentBudgetExhausted& error) {
                 exhausted=std::string_view(error.what())==
                     "resident page budget exhausted including in-flight roots";
             }
@@ -255,7 +255,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
     {
         // Exercise actual coordinator ordering with authoritative roots, without
         // inferring feasibility from token lengths or modeling numerical time.
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
         Cache order_cache(Cache::Policy{4,64,unbounded,reserve},identity);
         Coordinator order(order_cache,{4,1,unbounded,reserve});
         const auto long_ticket=order.admit(first.request);
@@ -336,10 +336,10 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
 
     // T234: rendezvous through progress callbacks, without timing-based sleeps.
     {
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
         Cache isolated(Cache::Policy{4,64,unbounded,reserve},identity);
         Coordinator authority(isolated,Coordinator::Policy{1,1,unbounded,reserve});
-        authority.bind_physical_resources({},ninfer::exl3::Exl3ResourceInventory::unlimited());
+        authority.bind_physical_resources({},voidinfer::exl3::Exl3ResourceInventory::unlimited());
         authority.reserve_runtime_host_sources();
         const auto cached_input=first.request->token_suffix();
         require(isolated.admit_input_authority(first.request,cached_input,unbounded).admitted,
@@ -347,9 +347,9 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         const auto ticket=authority.admit(first.request);auto lease=authority.acquire();
         require(bool(lease),"host source fixture missing acquired root");
         const auto& state=*first.request->state();
-        const ninfer::exl3::Exl3DevicePageKey key(state.model_identity(),state.shared_kv_page(64),
+        const voidinfer::exl3::Exl3DevicePageKey key(state.model_identity(),state.shared_kv_page(64),
             {state.rope_offset(),false},state.position());
-        auto lifetime=std::make_shared<const ninfer::exl3::Exl3DevicePageKey>(key);
+        auto lifetime=std::make_shared<const voidinfer::exl3::Exl3DevicePageKey>(key);
         const auto initial_locked=authority.stats().locked_page_bytes;
         authority.fail_next_residency_for_test(Coordinator::ResidencyFault::before_commit);
         bool failed=false;
@@ -369,7 +369,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         require(duplicate && authority.stats().locked_page_bytes==bound_locked,
             "duplicate source binding changed locked ownership");
         {
-            using Key=ninfer::exl3::Exl3DevicePageKey;
+            using Key=voidinfer::exl3::Exl3DevicePageKey;
             std::array<std::shared_ptr<const Key>,63> aliases;
             for(auto& alias:aliases) {
                 alias=std::make_shared<const Key>(key);
@@ -378,7 +378,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
             const auto full=authority.stats();
             bool exhausted=false;
             try{authority.bind_runtime_host_source(*lease,std::make_shared<const Key>(key),key);}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
             require(exhausted && full.locked_page_bytes==bound_locked &&
                 authority.stats().resident_updates==full.resident_updates,
                 "source binding saturation changed residency or multiplied aliased backing");
@@ -390,7 +390,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         }
         const auto stale=*lease;authority.yield(*lease);lease=authority.acquire();
         bool stale_refused=false;
-        try{authority.bind_runtime_host_source(stale,std::make_shared<const ninfer::exl3::Exl3DevicePageKey>(key),key);}
+        try{authority.bind_runtime_host_source(stale,std::make_shared<const voidinfer::exl3::Exl3DevicePageKey>(key),key);}
         catch(const std::invalid_argument&){stale_refused=true;}
         require(stale_refused && lease && lease->ticket.request_id==ticket.request_id,
             "old acquisition bound source to reacquired request");
@@ -404,7 +404,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         require(source_only>=key.retained_host_bytes() && source_only<bound_locked,
             "request removal lost live source or retained entire request lock set");
         lifetime.reset();
-        using Decision=ninfer::exl3::Exl3VeriCachePrefixIndex::RetentionDecision;
+        using Decision=voidinfer::exl3::Exl3VeriCachePrefixIndex::RetentionDecision;
         const auto expired=authority.trim_prefix_retention(unbounded,
             std::span<const Decision>{});
         require(expired.inputs_current && expired.budget_met && !expired.evicted &&
@@ -418,7 +418,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
             "root/source eviction fixture did not restore logical cache root");
         (void)authority.admit(first.request);lease=authority.acquire();
         require(bool(lease),"root/source eviction fixture reacquisition failed");
-        auto fill_lifetime=std::make_shared<const ninfer::exl3::Exl3DevicePageKey>(key);
+        auto fill_lifetime=std::make_shared<const voidinfer::exl3::Exl3DevicePageKey>(key);
         authority.bind_runtime_host_source(*lease,fill_lifetime,key);
         authority.complete(*lease);
         const auto before_trim=authority.stats();
@@ -443,8 +443,8 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         authority.close();
     }
     for(bool short_credit:{true,false}) {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
         Cache reserved(Cache::Policy{4,64,unbounded,reserve},identity);
         Coordinator authority(reserved,Coordinator::Policy{2,2,unbounded,reserve});
         const auto bytes=Coordinator::runtime_host_source_metadata_bytes();
@@ -453,7 +453,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         authority.bind_physical_resources({},limits);
         bool exhausted=false;
         try{authority.reserve_runtime_host_sources();}
-        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
+        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
         require(exhausted==short_credit && authority.runtime_host_source_storage_bytes()==(short_credit?0:bytes),
             "host source table violated short/exact metadata credit");
         if(!short_credit) {
@@ -462,7 +462,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
             extra.add(Inventory::Domain::host_metadata,1,1);
             bool invoked=false,refused=false;
             try{authority.allocate_startup_resources(extra,[&](auto){invoked=true;return Inventory{};});}
-            catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && !invoked && authority.runtime_host_source_storage_bytes()==bytes,
                 "host source table reservation was uncharged or duplicated");
         }
@@ -472,8 +472,8 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
     // Only the producer submits prefix work; the joined context restores after
     // publication. Both threads are joined before inspecting any result.
     for(unsigned slots:{1U,2U,8U})for(bool short_credit:{true,false}) {
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
         Cache reserved(Cache::Policy{4,64,unbounded,reserve},identity);
         Coordinator authority(reserved,Coordinator::Policy{2,2,unbounded,reserve});
         const auto requirement=Cache::preparation_storage_requirement(slots,serving->max_context());
@@ -504,7 +504,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         }
         bool exhausted=false;
         try{reserved.reserve_preparation_storage(authority,slots,serving->max_context());}
-        catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
+        catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){exhausted=true;}
         const auto storage=reserved.preparation_storage_stats();
         require(exhausted==short_credit && storage.slots==(short_credit?0U:slots) &&
             storage.metadata_bytes==(short_credit?0:requirement.units[domain]) &&
@@ -527,8 +527,8 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
                             PreparationCase::admission_failure}) {
         const bool reload_during_fill=scenario==PreparationCase::reload;
         Cache concurrent(Cache::Policy{4,64,unbounded,reserve},identity);
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
-        using Inventory=ninfer::exl3::Exl3ResourceInventory;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Inventory=voidinfer::exl3::Exl3ResourceInventory;
         Coordinator preparation_authority(concurrent,Coordinator::Policy{2,2,unbounded,reserve});
         if(pooled) {
             preparation_authority.bind_physical_resources({},Inventory::unlimited());
@@ -765,7 +765,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         // retain the same model authority but have different host extents.
         // Each fits the selected cap alone; the coordinator must not infer that
         // two individually feasible lane transitions also fit together.
-        using Coordinator=ninfer::exl3::Exl3VeriCacheServingCoordinator;
+        using Coordinator=voidinfer::exl3::Exl3VeriCacheServingCoordinator;
         const auto measure=[&](std::span<const std::shared_ptr<const Request>> roots) {
             Cache measured(Cache::Policy{4,64,unbounded,reserve},identity);
             Coordinator authority(measured,Coordinator::Policy{4,2,unbounded,reserve});
@@ -787,7 +787,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         Coordinator authority(bounded,Coordinator::Policy{4,2,independent_cap,reserve});
         const auto empty=authority.stats();bool exhausted=false;
         try{(void)authority.admit_batch(mixed);}
-        catch(const ninfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
+        catch(const voidinfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
         const auto rejected=authority.stats();
         require(exhausted && rejected.admitted==empty.admitted && rejected.queued==empty.queued &&
             rejected.active==empty.active && rejected.resident_updates==empty.resident_updates &&
@@ -799,7 +799,7 @@ void run_prefix_serving_t72_qualification(Exl3TextModel& target,
         const auto before_survivor_failure=authority.stats();
         const std::array<std::shared_ptr<const Request>,2> larger_pair{root129,root192};
         exhausted=false;try{(void)authority.admit_batch(larger_pair);}
-        catch(const ninfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
+        catch(const voidinfer::exl3::Exl3HostResidentBudgetExhausted&){exhausted=true;}
         const auto after_survivor_failure=authority.stats();
         const std::array<Coordinator::Lease,1> current{*survivor};
         require(exhausted && authority.compute_leases_current(current) &&

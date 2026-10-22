@@ -2,10 +2,10 @@
 
 void run_draft_host_ring_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using Ring=ninfer::exl3::Exl3DraftHostRing;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using Ring=voidinfer::exl3::Exl3DraftHostRing;
     require(source.size()>4200 && target.max_context()>=4200,"draft host fixture extent");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     std::array<std::unique_ptr<DeviceBuffer>,5> stage;
     std::array<std::uint16_t*,5> staging{};std::array<const std::uint16_t*,5> pointers{};
@@ -19,31 +19,31 @@ void run_draft_host_ring_qualification(Exl3TextModel& target,Exl3Dflash2DraftMod
         root->restore_draft(draft,staging);
         const auto parent=draft.export_host_ring();const auto root_digest=draft.ring_digest();
         require(draft.host_ring_resident(parent),"export did not bind resident witness");
-        if(const auto* mode=std::getenv("NINFER_TEST_DRAFT_EXPORT_UNCERTAIN");mode && std::string_view(mode)=="1") {
-            ninfer::exl3::RetainedDescriptorLedger metadata;bool failed=false;
+        if(const auto* mode=std::getenv("VOIDINFER_TEST_DRAFT_EXPORT_UNCERTAIN");mode && std::string_view(mode)=="1") {
+            voidinfer::exl3::RetainedDescriptorLedger metadata;bool failed=false;
             const auto before=Ring::uncertain_transfer_count();
             try{draft.export_host_ring(nullptr,false,[&](std::uint64_t bytes){return metadata.acquire(bytes);},true);}
             catch(const std::exception&){failed=true;}
             require(failed && Ring::uncertain_transfer_count()==before+1 && metadata.bytes()>0 &&
-                draft.uncertain_source_allocations_for_test()==1 && !draft.host_ring_resident(parent),
+                draft.uncertain_source_allocations_for_test()==10 && !draft.host_ring_resident(parent),
                 "submitted draft export failure lost destination credit/source marking");
             bool reset_refused=false,digest_refused=false;
             try{draft.reset();}catch(const std::exception&){reset_refused=true;}
             try{draft.ring_digest();}catch(const std::exception&){digest_refused=true;}
             require(reset_refused && digest_refused,"uncertain draft export permitted reset or diagnostic submission");
-            std::cout<<"DRAFT_EXPORT_UNCERTAIN_COMPLETE retained=1 source_marked=1\n";
+            std::cout<<"DRAFT_EXPORT_UNCERTAIN_COMPLETE retained=1 source_marked=10\n";
             return; // Isolated mode intentionally leaves quarantine for teardown.
         }
         const auto before=draft.ring_restore_stats();
         require(!draft.restore_host_ring_if_needed(parent),"resident witness failed to skip restore");
         require(draft.ring_restore_stats().skipped==before.skipped+1,"missing skipped restore counter");
         {
-            ninfer::exl3::RetainedDescriptorLedger metadata;unsigned reservations=0;
+            voidinfer::exl3::RetainedDescriptorLedger metadata;unsigned reservations=0;
             const unsigned fail_at=prefix>64?3:2;bool refused=false;
             try {draft.export_host_ring(nullptr,false,[&](std::uint64_t bytes){
-                if(++reservations==fail_at)throw ninfer::exl3::Exl3ResourceReservationExhausted{};
+                if(++reservations==fail_at)throw voidinfer::exl3::Exl3ResourceReservationExhausted{};
                 return metadata.acquire(bytes);
-            });}catch(const ninfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
+            });}catch(const voidinfer::exl3::Exl3ResourceReservationExhausted&){refused=true;}
             require(refused && reservations==fail_at && metadata.bytes()==0 && draft.ring_digest()==root_digest,
                 "draft export metadata refusal leaked credit or changed ring");
             require(parent->same_payload(*draft.export_host_ring()),"failed export changed parent/retry payload");

@@ -2,7 +2,7 @@
 #include "test_exl3_target_kv_oracle.h"
 
 struct TargetKvQualification {
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     static constexpr auto admit = Admission::target_continuation_kv;
     static constexpr int output = 1024;
     static constexpr std::size_t guard = 128, extent = 8u * output;
@@ -19,21 +19,21 @@ struct TargetKvQualification {
         f.write(reinterpret_cast<const char*>(data.data()),data.size()*sizeof(T));
         require(f.good(),"K/V small-M raw evidence write");
     }
-    static void callback(const ninfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
+    static void callback(const voidinfer::exl3::Exl3TargetProjectionObservation& x,void* user) {
         if ((std::string(x.operation)=="k" || std::string(x.operation)=="v") && (x.metadata.K==7 || x.metadata.K==8))
             static_cast<TargetKvQualification*>(user)->check(x);
     }
-    void check(const ninfer::exl3::Exl3TargetProjectionObservation& x) {
-        const auto stream_mode=env("NINFER_TEST_KV_K7_STREAM_REDUCTION");
+    void check(const voidinfer::exl3::Exl3TargetProjectionObservation& x) {
+        const auto stream_mode=env("VOIDINFER_TEST_KV_K7_STREAM_REDUCTION");
         require(stream_mode.empty() || stream_mode=="1","K7 KV stream fixture option");
         const bool stream_test=stream_mode=="1";
-        if(stream_test)require(env("NINFER_EXL3_EXTENDED_STREAM_REDUCTION").empty() ||
-            env("NINFER_EXL3_EXTENDED_STREAM_REDUCTION")=="0","K7 KV fixture isolates new route from extended stream option");
+        if(stream_test)require(env("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION").empty() ||
+            env("VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION")=="0","K7 KV fixture isolates new route from extended stream option");
         struct RestoreStream {
             std::string value;
-            ~RestoreStream(){_putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION",value.c_str());}
-        } restore_stream{env("NINFER_EXL3_KV_K7_STREAM_REDUCTION")};
-        if(stream_test)_putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION","0");
+            ~RestoreStream(){_putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION",value.c_str());}
+        } restore_stream{env("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION")};
+        if(stream_test)_putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION","0");
         require(x.rows==8 && (x.metadata.K==7 || x.metadata.K==8) && x.metadata.in_features==5120 && x.metadata.out_features==output && (std::string(x.operation)=="k" || std::string(x.operation)=="v"),"K/V small-M capture extent");
         const auto key=std::to_string(x.layer)+"-"+x.operation;
         require(std::find(layers.begin(),layers.end(),key)==layers.end(),"duplicate K/V small-M capture");
@@ -43,15 +43,15 @@ struct TargetKvQualification {
         std::vector<std::uint16_t> input(8u*5120);
         cuda_check(cudaMemcpy(input.data(),x.input,input.size()*2,cudaMemcpyDeviceToHost),"K/V small-M input copy");
         require(std::all_of(input.begin(),input.end(),[](std::uint16_t v){return (v&0x7c00)!=0x7c00;}),"K/V small-M finite represented inputs");
-        _putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M","0");
         Exl3CudaLinearWorkspace baseline(5120,output,8,false,false,false,false,false,false,false,{}, {},false,true);
-        _putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M","1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M","1");
         Exl3CudaLinearWorkspace parent(5120,output,8,false,false,false,false,false,false,false,{}, {},false,true);
-        if(stream_test)_putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION","1");
+        if(stream_test)_putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION","1");
         Exl3CudaLinearWorkspace candidate(5120,output,8,false,false,false,false,false,false,false,{}, {},false,true);
         Exl3CudaLinearWorkspace unowned(5120,output,8);
         Exl3CudaLinearWorkspace short_owner(5120,output,4,false,false,false,false,false,false,false,{}, {},false,true);
-        _putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M","0");
         require(candidate.target_kv_small_m_candidate(x.metadata,8,admit) && !baseline.target_kv_small_m_candidate(x.metadata,8,admit),"K/V small-M latched enable");
         require(!unowned.target_kv_small_m_candidate(x.metadata,8,admit) && !candidate.target_kv_small_m_candidate(x.metadata,8,Admission::ordinary) && !short_owner.target_kv_small_m_candidate(x.metadata,8,admit),"K/V small-M ownership/capacity");
         for(int m=0;m<=17;++m)require(candidate.target_kv_small_m_candidate(x.metadata,m,admit)==(m>=2 && m<=8),"K/V small-M width admission");
@@ -74,20 +74,20 @@ struct TargetKvQualification {
                 "K7 KV stream admitted incompatible metadata");
         }
         if(layers.size()==1)for(const char* disabled:{"","0","2","true","01"}) {
-            _putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M",disabled);
+            _putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M",disabled);
             Exl3CudaLinearWorkspace off(5120,output,8,false,false,false,false,false,false,false,{}, {},false,true);
             require(!off.target_kv_small_m_candidate(x.metadata,8,admit),"K/V small-M exact flag1 required");
         }
-        _putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M","0");
         if(stream_test && layers.size()==1) {
             for(const char* malformed:{"2","true","01"," 1","1 "}) {
-                _putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION",malformed);
+                _putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION",malformed);
                 bool refused=false;
                 try{Exl3CudaLinearWorkspace invalid(5120,output,8,false,false,false,false,false,false,false,{}, {},false,true);}
                 catch(const std::invalid_argument&){refused=true;}
                 require(refused,"malformed K7 KV stream option admitted");
             }
-            _putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION","0");
+            _putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION","0");
         }
         require(std::string(candidate.dispatch_name(x.metadata,8,admit))==
             (stream_test && x.metadata.K==7?"target_extended_stream_reduction":"target_kv_small_m_mma_split") &&
@@ -176,8 +176,8 @@ struct TargetKvQualification {
 };
 
 void run_target_kv_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& draft) {
-    require(env("NINFER_EXL3_TARGET_KV_SMALL_M")=="0","K/V small-M capture requires construction flag0");
-    auto ids=load_ids(env("NINFER_E5A4_PROMPT_FILE"));require(ids.size()>=512,"K/V small-M prompt extent");
+    require(env("VOIDINFER_EXL3_TARGET_KV_SMALL_M")=="0","K/V small-M capture requires construction flag0");
+    auto ids=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));require(ids.size()>=512,"K/V small-M prompt extent");
     std::vector<std::int64_t> prompt(ids.begin(),ids.begin()+512);
     TapStage stage;
     for(int tap=0;tap<kTapCount;++tap){
@@ -194,20 +194,20 @@ void run_target_kv_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& d
     const auto proposals=draft.propose_cached(block,512,ctx->target_embedding(),ctx->target_lm_head_weights(),ctx->target_lm_head_metadata(),kMaskToken);
     require(proposals.size()==7,"K/V small-M real proposals");
     block.assign(1,pending);block.insert(block.end(),proposals.begin(),proposals.end());
-    TargetKvQualification check(env("NINFER_E5A4_OUT"));
+    TargetKvQualification check(env("VOIDINFER_E5A4_OUT"));
     std::ofstream request(check.directory/"request.txt");request << "pending=" << pending << " proposals=";for(auto token:proposals)request << token << ',';request << '\n';request.flush();require(request.good(),"K/V small-M request witness write");
     ctx->prepare_transaction();ctx->prepare_continuation(8);const auto ring=draft.ring_digest();
-    ctx->set_target_projection_observer_for_test(TargetKvQualification::callback,&check,nullptr,ninfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
+    ctx->set_target_projection_observer_for_test(TargetKvQualification::callback,&check,nullptr,voidinfer::exl3::Exl3TargetProjectionObserverSelection::wide_prefill_all);
     ctx->begin_transaction();ctx->continue_rows(block);ctx->set_target_projection_observer_for_test(nullptr,nullptr);ctx->rollback_transaction();
     cuda_check(cudaDeviceSynchronize(),"K/V small-M sweep ready");
     require(check.layers.size()==32 && ctx->position()==512 && ctx->device_position_host()==511 && sample_target(*ctx)==pending && !ctx->transaction_active(),"K/V small-M full layer coverage/rollback");
     require(draft.ring_digest()==ring && draft.ring_count()==512 && draft.ring_base_abs()==0,"K/V small-M ring unchanged");
-    if(env("NINFER_TEST_KV_K7_STREAM_REDUCTION")=="1") {
+    if(env("VOIDINFER_TEST_KV_K7_STREAM_REDUCTION")=="1") {
         struct RestoreContextFlags {
             std::string kv,stream;
-            ~RestoreContextFlags(){_putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M",kv.c_str());
-                _putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION",stream.c_str());}
-        } restore{env("NINFER_EXL3_TARGET_KV_SMALL_M"),env("NINFER_EXL3_KV_K7_STREAM_REDUCTION")};
+            ~RestoreContextFlags(){_putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M",kv.c_str());
+                _putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION",stream.c_str());}
+        } restore{env("VOIDINFER_EXL3_TARGET_KV_SMALL_M"),env("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION")};
         const auto snapshot=[](Exl3TextContext& context) {
             auto bytes=context.oscar_live_state_host_for_test();
             const auto append=[&](const auto& values) {
@@ -227,8 +227,8 @@ void run_target_kv_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& d
         std::vector<std::uint16_t> expected_logits;
         std::array<std::vector<std::uint16_t>,5> expected_taps;
         for(bool candidate:{false,true}) {
-            _putenv_s("NINFER_EXL3_TARGET_KV_SMALL_M","1");
-            _putenv_s("NINFER_EXL3_KV_K7_STREAM_REDUCTION",candidate?"1":"0");
+            _putenv_s("VOIDINFER_EXL3_TARGET_KV_SMALL_M","1");
+            _putenv_s("VOIDINFER_EXL3_KV_K7_STREAM_REDUCTION",candidate?"1":"0");
             auto comparison=target.create_context(true);
             require(comparison->try_enable_oscar_from_environment(),"K7 KV context OSCAR required");
             ingest_prefix(*comparison,prompt,CommitSink{});

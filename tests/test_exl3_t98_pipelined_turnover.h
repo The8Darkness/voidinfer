@@ -15,7 +15,7 @@ struct T98ArmTrace {
     std::uint64_t committed_rows = 0;
     std::array<double,8> replacement_ttft_ms{};
     std::array<std::int64_t,16> tokens{};
-    std::array<std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest>,16>
+    std::array<std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest>,16>
         roots{};
     std::uint64_t resident_payload_bytes = 0;
     std::uint64_t locked_payload_bytes = 0;
@@ -27,10 +27,10 @@ void run_t98_pipelined_turnover(
     Exl3TextModel& target, const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose,
     const std::filesystem::path& output) {
-    using Request = ninfer::exl3::Exl3VeriCacheRequest;
-    using Cache = ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using Identity = ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using Coordinator = ninfer::exl3::Exl3VeriCacheServingCoordinator;
+    using Request = voidinfer::exl3::Exl3VeriCacheRequest;
+    using Cache = voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using Identity = voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using Coordinator = voidinfer::exl3::Exl3VeriCacheServingCoordinator;
     using Clock = std::chrono::steady_clock;
     constexpr std::size_t kPrefix = 3840;
     constexpr std::array<int,8> kInitialTails{32,48,64,80,96,112,128,144};
@@ -42,8 +42,8 @@ void run_t98_pipelined_turnover(
     require(!output.empty() && !std::filesystem::exists(output),
             "T98 output must be new");
     std::filesystem::create_directories(output);
-    const auto reserve_gib = std::stoull(env("NINFER_T98_RESERVE_GIB"));
-    const auto cache_mib = std::stoull(env("NINFER_T98_CACHE_MIB"));
+    const auto reserve_gib = std::stoull(env("VOIDINFER_T98_RESERVE_GIB"));
+    const auto cache_mib = std::stoull(env("VOIDINFER_T98_CACHE_MIB"));
     require(reserve_gib >= 8 && cache_mib >= 1024,
             "T98 memory policy extent");
     const std::uint64_t reserve = reserve_gib * (1ULL << 30);
@@ -61,11 +61,11 @@ void run_t98_pipelined_turnover(
         return value.ullAvailPhys;
     };
     const Identity identity{
-        env("NINFER_T98_NAMESPACE"), env("NINFER_T98_ARTIFACT_ID"),
-        env("NINFER_T98_TOKENIZER_ID"), env("NINFER_T98_CONFIGURATION_ID"),
-        env("NINFER_T98_MODALITY_ID")};
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY", "0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV", "1");
+        env("VOIDINFER_T98_NAMESPACE"), env("VOIDINFER_T98_ARTIFACT_ID"),
+        env("VOIDINFER_T98_TOKENIZER_ID"), env("VOIDINFER_T98_CONFIGURATION_ID"),
+        env("VOIDINFER_T98_MODALITY_ID")};
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY", "0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV", "1");
     Cache cache(Cache::Policy{16, 64, cache_budget, reserve}, identity);
     auto context_a = target.create_context(true);
     auto context_b = target.create_context(true);

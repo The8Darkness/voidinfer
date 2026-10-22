@@ -10,7 +10,7 @@
 #include <array>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace voidinfer::ops {
 
 inline constexpr int kOscarInt2G128HeadDim       = 256;
 inline constexpr int kOscarInt2G128GroupSize     = 128;
@@ -38,4 +38,4 @@ OscarInt2G128EncodedRow oscar_int2_g128_encode(const float* values, int count,
 // (symbol - zero_point) * scale reconstruction.
 void oscar_int2_g128_decode(const OscarInt2G128EncodedRow& encoded, float* output, int count);
 
-} // namespace ninfer::ops
+} // namespace voidinfer::ops

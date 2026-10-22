@@ -2,17 +2,17 @@
 
 void run_vericache_queue_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& code,const std::vector<std::int64_t>& prose) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using State=ninfer::exl3::Exl3ExactHostState;
-    using Queue=ninfer::exl3::Exl3VeriCacheQueue;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using State=voidinfer::exl3::Exl3ExactHostState;
+    using Queue=voidinfer::exl3::Exl3VeriCacheQueue;
     require(target.max_context()==1024 && code.size()>2200 && prose.size()>2200,"queue fixture extent");
-    const auto prefill_setting=env("NINFER_TEST_EXACT_PREFILL_ROWS");
+    const auto prefill_setting=env("VOIDINFER_TEST_EXACT_PREFILL_ROWS");
     const int prefill_rows=prefill_setting.empty()?8:std::stoi(prefill_setting);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","1");_putenv_s("NINFER_EXL3_EXACT_HOST_KV","0");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","1");_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","0");
     auto inner=target.create_context(true);
     require(inner->try_enable_oscar_from_environment(),"queue compact OSCAR");
     inner->prepare_transaction();inner->prepare_continuation(8);
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");_putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     TapStage stage;std::array<std::uint16_t*,5> staging{};
     for(int tap=0;tap<5;++tap) {

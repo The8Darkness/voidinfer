@@ -2,10 +2,10 @@
 #include "exl3_host_residency.h"
 
 void run_host_residency_qualification(Exl3TextModel& target,const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    using State=ninfer::exl3::Exl3ExactHostState;
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    using State=voidinfer::exl3::Exl3ExactHostState;
     qualify_residency_page_probe();
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     int cases=0;
     for(int prefix:{63,64,65}) {

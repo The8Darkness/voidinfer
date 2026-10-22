@@ -3,6 +3,9 @@
 // Windows read-only page probe. No touching, locking, trimming or prefaulting:
 // QueryWorkingSetEx observes residency at sample time, not a permanent guarantee.
 // https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-queryworkingsetex
+// Ranges the CUDA driver page-locks (cudaHostRegister, cudaHostAlloc) count as
+// resident and locked: the driver's lock does not set the working-set Locked
+// bit, and serving keeps them out of its VirtualLock set.
 struct Exl3HostResidency {
     std::uint64_t allocated_union_bytes=0,resident_tensor_bytes=0,locked_tensor_bytes=0;
     std::uint64_t page_coverage_bytes=0,resident_page_bytes=0,query_calls=0;
@@ -11,23 +14,39 @@ struct Exl3HostResidency {
 
 class Exl3HostResidencyProbe {
     using Range=std::pair<std::uintptr_t,std::uintptr_t>;
-    std::vector<Range> ranges_;
-public:
-    void add(const void* pointer,std::size_t bytes) {
-        if(!bytes) return;
-        const auto first=reinterpret_cast<std::uintptr_t>(pointer);
-        require(first && bytes<=std::numeric_limits<std::uintptr_t>::max()-first,"residency address overflow");
-        ranges_.emplace_back(first,first+bytes);
+    std::vector<Range> ranges_,pinned_;
+    static bool driver_pinned(std::uintptr_t address) {
+        cudaPointerAttributes attributes{};
+        if(cudaPointerGetAttributes(&attributes,reinterpret_cast<const void*>(address))!=cudaSuccess) {
+            (void)cudaGetLastError();return false;
+        }
+        return attributes.type==cudaMemoryTypeHost;
     }
-    Exl3HostResidency measure() const {
-        const auto start=std::chrono::steady_clock::now();
-        Exl3HostResidency result;
-        auto sorted=ranges_;std::sort(sorted.begin(),sorted.end());
+    static std::vector<Range> merged(std::vector<Range> sorted) {
+        std::sort(sorted.begin(),sorted.end());
         std::vector<Range> bytes;
         for(const auto& range:sorted) {
             if(!bytes.empty() && range.first<=bytes.back().second) bytes.back().second=std::max(bytes.back().second,range.second);
             else bytes.push_back(range);
         }
+        return bytes;
+    }
+public:
+    void add(const void* pointer,std::size_t bytes) {
+        if(!bytes) return;
+        const auto first=reinterpret_cast<std::uintptr_t>(pointer);
+        require(first && bytes<=std::numeric_limits<std::uintptr_t>::max()-first,"residency address overflow");
+        (driver_pinned(first) && driver_pinned(first+bytes-1) ? pinned_ : ranges_).emplace_back(first,first+bytes);
+    }
+    Exl3HostResidency measure() const {
+        const auto start=std::chrono::steady_clock::now();
+        Exl3HostResidency result;
+        for(const auto& range:merged(pinned_)) {
+            result.allocated_union_bytes+=range.second-range.first;
+            result.resident_tensor_bytes+=range.second-range.first;
+            result.locked_tensor_bytes+=range.second-range.first;
+        }
+        const auto bytes=merged(ranges_);
         SYSTEM_INFO info{};GetSystemInfo(&info);const std::uintptr_t page=info.dwPageSize;
         require(page && (page&(page-1))==0,"residency page geometry");
         std::vector<Range> pages;

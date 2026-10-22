@@ -1,4 +1,7 @@
 #include "exl3/exl3_engine_core.h"
+#include "core/capture_guard.h"
+#include "exl3/engine_profile.h"
+#include "exl3/host_memory_ledger.h"
 #include "exl3/environment_options.h"
 #include "exl3/layer_buffer_retirement.h"
 #include "exl3/reconstruction_control_allocator.h"
@@ -8,18 +11,19 @@
 #include "exl3/bounded_shared_owner.h"
 #include "exl3/embedded_shared_control.h"
 #include "exl3/request_option_storage.h"
-#include "exl3/candidate_option_compatibility.h"
 #include "exl3/candidate_route_contract.h"
 #include "exl3/complete_route_counters.h"
 #include "exl3/reconstruction_config.h"
 #include "exl3/exl3_frontend_resources.h"
 #include "exl3/dflash2_execution.h"
 #include "exl3/fast_device_round.h"
+#include "exl3/batched_verify_coordinator.h"
 #include "exl3/engine_scratch_requirements.h"
 #include "exl3/resource_availability.h"
 #include "exl3/engine_target_q.h"
 #include "exl3/engine_greedy_packet_batch.h"
 #include "exl3/registered_kv_backing.h"
+#include "exl3/host_memory_available.h"
 #include "exl3/kv_transfer_lease.h"
 #include "exl3/kv_registration_cache.h"
 #include "exl3/registered_kv_upload.h"
@@ -31,15 +35,16 @@
 #include "exl3/device_page_readers.h"
 #include "exl3/attention_stage_resources.h"
 #include "exl3/native_context_extent.h"
+#include "exl3/l0_oscar_format.h"
 #include "exl3/control_publication_boundary.h"
 #include "exl3/host_preparation_completion.h"
-#include "exl3/public_media_qualification.h"
-#include "exl3/vision_model.h"
+#include "exl3/vision_dense.h"
+#include <voidinfer/targets/qwen3_6/vision_control.h>
 #include "exl3/request_sampling_state.h"
 #include "exl3/sampling_policy.h"
 #include "exl3/sampled_authority_boundary.h"
 #include "exl3/sampling_control_stop_semantics.h"
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <charconv>
@@ -47,9 +52,39 @@
 #include <condition_variable>
 #include <deque>
 #include <thread>
+#include <shared_mutex>
 #include <Windows.h>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
+namespace {
+// VOIDINFER_EXL3_ROUND_WIDTH (2..8, research): coherent-device verifier rows per round.
+std::size_t round_width_limit() {
+    static const std::size_t value=[] {
+        const char* text=std::getenv("VOIDINFER_EXL3_ROUND_WIDTH");
+        return text?static_cast<std::size_t>(std::clamp(std::atoi(text),2,8)):std::size_t{8};
+    }();
+    return value;
+}
+}
+
+// VOIDINFER_EXL3_MEMORY_TRACE: runtime device-memory movement (>8 MiB) at
+// prompt-pass and round boundaries.
+static void runtime_memory_mark(const char* stage,unsigned lane) {
+    static const bool enabled=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
+    if(!enabled)return;
+    static std::mutex mutex;static std::size_t last=0;
+    std::size_t free=0,total=0;
+    if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return;
+    const std::lock_guard lock(mutex);
+    const auto delta=static_cast<long long>(last)-static_cast<long long>(free);
+    if(last && (delta<0?-delta:delta)<(8LL<<20))return;
+    std::size_t stack=0;(void)cudaDeviceGetLimit(&stack,cudaLimitStackSize);
+    std::fprintf(stderr,"RUNTIME_MEMORY %s lane=%u free=%.1f MiB delta=%.1f MiB stack=%zu%c",stage,lane,
+        free/1048576.0,last?delta/1048576.0:0.0,stack,10);
+    last=free;
+}
+
+
 namespace {
 using Clock=std::chrono::steady_clock;
 using Root=std::shared_ptr<const Exl3VeriCacheRequest>;
@@ -63,14 +98,47 @@ double seconds(Clock::time_point t){return std::chrono::duration<double>(Clock::
 void check(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 struct DraftTapStaging {
     std::array<std::uint16_t*,Exl3EngineTapRequirements::layers> pointers{};
-    ~DraftTapStaging(){for(auto p:pointers)if(p)cudaFree(p);}
+    // First output position of every token of the lane's request (presence
+    // penalty; Exl3DeviceSampling::first_occurrence).
+    std::int32_t* first_occurrence=nullptr;
+    ~DraftTapStaging(){for(auto p:pointers)if(p)cudaFree(p);if(first_occurrence)cudaFree(first_occurrence);}
 };
+// Presence penalty of one lane request: the lane's first-occurrence table
+// (Exl3DeviceSampling::first_occurrence) follows its output, published and
+// drafted (unverified) tokens alike, at positions prompt, prompt+1, ... after
+// every round and verification; only the changed suffix is rewritten.
+struct PresenceTrack {
+    std::int32_t* table=nullptr;
+    int first_position=0;
+    std::vector<std::int64_t> recorded;
+    void begin(std::int32_t* value,int prompt_tokens,cudaStream_t stream) {
+        table=value;first_position=prompt_tokens;recorded.clear();
+        exl3_presence_reset(table,stream);
+    }
+    void sync(std::span<const std::int64_t> published,std::span<const std::int64_t> drafted,
+              int frontier,cudaStream_t stream) {
+        if(!table)return;
+        const auto count=published.size()+drafted.size();
+        if(first_position+static_cast<int>(count)!=frontier)
+            throw std::logic_error("presence penalty output/frontier mismatch");
+        const auto at=[&](std::size_t i){return i<published.size()?published[i]:drafted[i-published.size()];};
+        std::size_t keep=0;
+        while(keep<recorded.size() && keep<count && recorded[keep]==at(keep))++keep;
+        if(keep<recorded.size())exl3_presence_truncate(table,first_position+static_cast<int>(keep),stream);
+        recorded.resize(keep);
+        for(std::size_t i=keep;i<count;++i)recorded.push_back(at(i));
+        if(keep<count)exl3_presence_record(table,first_position+static_cast<int>(keep),
+            recorded.data()+keep,count-keep,stream);
+    }
+};
+// Physical Engine lanes (coherent-device C1..C8; the ordinary route C1/C2).
+constexpr std::size_t kMaxLanes=8;
 struct ExecutionStream {
-    inline static std::array<std::atomic<cudaStream_t>,2> unresolved{};
-    inline static std::array<std::atomic<bool>,2> occupied{};
+    inline static std::array<std::atomic<cudaStream_t>,kMaxLanes> unresolved{};
+    inline static std::array<std::atomic<bool>,kMaxLanes> occupied{};
     inline static std::atomic<int> first_destroy_error{0};
     cudaStream_t value=nullptr;
-    unsigned retirement_slot=2;
+    unsigned retirement_slot=kMaxLanes;
     int destroy_fault_for_test=0;
     static std::size_t occupied_count() noexcept {
         std::size_t count=0;for(const auto& slot:occupied)if(slot.load())++count;return count;
@@ -95,32 +163,25 @@ struct ExecutionStream {
     cudaError_t retire_idle() noexcept {
         if(!value){
             if(retirement_slot<occupied.size())occupied[retirement_slot].store(false);
-            retirement_slot=2;return cudaSuccess;
+            retirement_slot=kMaxLanes;return cudaSuccess;
         }
         const auto error=destroy_fault_for_test?static_cast<cudaError_t>(destroy_fault_for_test):cudaStreamDestroy(value);
-        if(error==cudaSuccess){occupied[retirement_slot].store(false);retirement_slot=2;value=nullptr;return error;}
+        if(error==cudaSuccess){occupied[retirement_slot].store(false);retirement_slot=kMaxLanes;value=nullptr;return error;}
         int expected=0;first_destroy_error.compare_exchange_strong(expected,static_cast<int>(error));
         // This slot was reserved before CUDA stream creation and is never reused
         // after failure. Teardown cannot exhaust capacity or allocate storage.
         unresolved[retirement_slot].store(value);
-        retirement_slot=2;value=nullptr;return error;
+        retirement_slot=kMaxLanes;value=nullptr;return error;
     }
     ~ExecutionStream(){retire_idle();}
 };
-std::uint64_t available(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);if(!GlobalMemoryStatusEx(&m))throw std::runtime_error("EXL3 physical memory query");return m.ullAvailPhys;}
+std::uint64_t available(){const auto bytes=exl3_available_host_bytes();if(!bytes)throw std::runtime_error("EXL3 physical memory query");return *bytes;}
 std::uint64_t total_memory(){MEMORYSTATUSEX m{};m.dwLength=sizeof(m);if(!GlobalMemoryStatusEx(&m))throw std::runtime_error("EXL3 physical memory query");return m.ullTotalPhys;}
 std::uint64_t resident_budget(const EngineOptions& options) {
-    constexpr std::uint64_t reserve=8ULL<<30;
+    constexpr std::uint64_t reserve=kExl3HostReserveBytes;
     const auto total=total_memory();
     if(total<=reserve)throw std::invalid_argument("EXL3 physical memory is below the resident reserve");
-    auto result=total-reserve;
-    // For the genuine native64K configuration, the declared HostKV capacity is
-    // also a hard resident ceiling. Smaller configurations preserve their
-    // established policy while the wider configuration fails closed.
-    if(options.max_context==Exl3NativeContextExtent::native64k_tokens &&
-        options.context_cache.host_kv_capacity_bytes)
-        result=std::min<std::uint64_t>(result,options.context_cache.host_kv_capacity_bytes);
-    return result;
+    return total-reserve;
 }
 std::uint64_t host_plan_fingerprint(std::span<const std::int64_t> tokens) noexcept {
     std::uint64_t value=1469598103934665603ULL;
@@ -139,92 +200,38 @@ std::optional<std::uint64_t> measured_microseconds(double milliseconds) noexcept
     if(!(milliseconds>=0.0) || milliseconds>maximum)return std::nullopt;
     return static_cast<std::uint64_t>(milliseconds*1000.0);
 }
-void require_exact_profile(){
-    const auto flag=[](const char* name){const auto* p=std::getenv(name);return p?std::string(p):std::string();};
-    if(flag("NINFER_EXL3_EXACT_HOST_KV")!="1" || flag("NINFER_EXL3_OSCAR_L0_ONLY")=="1")
-        throw std::invalid_argument("EXL3 Engine requires explicit ordinary FP16 host profile");
-    if(!flag("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION").empty() &&
-        flag("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION")!="0" && flag("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION")!="1")
-        throw std::invalid_argument("K6 small-M stream reduction must be0 or1");
-    if(!flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX").empty() &&
-        flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX")!="0" && flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX")!="1")
-        throw std::invalid_argument("represented device prefix must be0 or1");
-    if(!flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS").empty()&&flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS")!="4096"&&flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS")!="16384")
-        throw std::invalid_argument("EXL3 Engine device prefix row menu4096/16384");
-    if(!flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH").empty() &&
-        flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH")!="0" &&
-        flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH")!="1")
-        throw std::invalid_argument("EXL3 Engine device prefix forward publication must be0 or1");
-    if(flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_FORWARD_PUBLISH")=="1" &&
-        (flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX")!="1" ||
-         flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS")!="16384" ||
-         flag("NINFER_EXL3_SEGMENTED_DEVICE_PREFIX")=="1" ||
-         flag("NINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX")=="1"))
-        throw std::invalid_argument(
-            "EXL3 Engine device prefix forward publication requires private unsegmented 16K prefix storage");
-    if(!flag("NINFER_EXL3_EXTENDED_STREAM_REDUCTION").empty()&&flag("NINFER_EXL3_EXTENDED_STREAM_REDUCTION")!="0"&&flag("NINFER_EXL3_EXTENDED_STREAM_REDUCTION")!="1")
-        throw std::invalid_argument("EXL3 Engine extended stream reduction must be0 or1");
-    Exl3PublicMediaQualification::require_research_profile_disabled(
-        flag("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH"));
-    require_engine_exact_route({"ordinary-host-kv",Exl3NumericalRouteClass::exact,
-        "host-kv-fp16","fp16",true,false},"host-kv-fp16","fp16");
-    for(const auto* name:{"NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_NUMERIC","NINFER_EXL3_PREFILL_RECONSTRUCT_GEMM_K7_NUMERIC","NINFER_EXL3_NUMERIC_ATTENTION_TILED","NINFER_EXL3_NATIVE_CONTINUATION16"})
-        if(!flag(name).empty() && flag(name)!="0")require_engine_exact_route({name,
-            std::string_view(name).find("NUMERIC")!=std::string_view::npos ||
-                std::string_view(name).find("NATIVE_CONTINUATION16")!=std::string_view::npos
-                ?Exl3NumericalRouteClass::numeric:Exl3NumericalRouteClass::exact,
-            "host-kv-fp16","fp16",false,false},"host-kv-fp16","fp16");
-    if(!flag("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7").empty() &&
-        flag("NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7")!="0")
-        require_engine_exact_route({"NINFER_EXL3_PREFILL_RECONSTRUCT_EXACT_K7",
-            Exl3NumericalRouteClass::exact,"host-kv-fp16","fp16",true,false},
-            "host-kv-fp16","fp16");
-}
 void require_coherent_device_profile(const EngineOptions& options) {
-    if(options.max_concurrency!=1 || options.enable_vision || options.use_cuda_graph ||
+    if(options.max_concurrency<1 || options.max_concurrency>kMaxLanes ||
        options.max_context<2048 || options.max_context>(Exl3NativeContextExtent::l0_oscar_enabled()?
            static_cast<int>(Exl3NativeContextExtent::l0_oscar_tokens):32768))
         throw std::invalid_argument(
-            "coherent-device EXL3 requires C1 greedy text and context 2048..32768 (262144 with L0 OSCAR)");
+            "Engine requires C1..C8 and context 2048..32768 (262144 with L0 OSCAR)");
     const auto equals=[](const char* name,std::string_view expected) {
         const auto* actual=std::getenv(name);
         if(!actual || std::string_view(actual)!=expected)
             throw std::invalid_argument(std::string("coherent-device EXL3 requires ")+
                 name+"="+std::string(expected));
     };
-    equals("NINFER_EXL3_EXACT_HOST_KV","0");
-    equals("NINFER_OSCAR_EXL3","0");
-    equals("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION","1");
-    equals("NINFER_EXL3_DEVICE_GREEDY","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32","1");
-    equals("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL","1");
+    equals("VOIDINFER_EXL3_EXACT_HOST_KV","0");
+    equals("VOIDINFER_OSCAR_EXL3","0");
+    equals("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION","1");
+    equals("VOIDINFER_EXL3_DEVICE_GREEDY","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_TILED","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_PREFILL_WMMA32","1");
+    equals("VOIDINFER_EXL3_FAST_LAYER_MAJOR_PREFILL","1");
     // K5 layer reconstruction (FP32-accumulated cuBLAS at live context >= 8192)
     // is a quality-gated numerics policy; both settings are admitted.
     {
-        const auto* k5=std::getenv("NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
+        const auto* k5=std::getenv("VOIDINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT");
         if(!k5 || (std::string_view(k5)!="0" && std::string_view(k5)!="1"))
             throw std::invalid_argument(
-                "coherent-device EXL3 requires NINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT=0|1");
+                "coherent-device EXL3 requires VOIDINFER_EXL3_FAST_LAYER_MAJOR_K5_RECONSTRUCT=0|1");
     }
-    equals("NINFER_DFLASH2_PREFILL_WINDOW","1");
-    equals("NINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
-    equals("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW","1");
-    equals("NINFER_EXL3_COHERENT_DOWN_K6","1");
-}
-Exl3PublicMediaModality public_media_modality(
-    const targets::qwen3_6::PreparedPromptData& prepared) noexcept {
-    bool image=false,video=false;
-    for(const auto& item:prepared.vision_items) {
-        if(item.modality==targets::qwen3_6::PromptModality::Image)image=true;
-        else if(item.modality==targets::qwen3_6::PromptModality::Video)video=true;
-        else return Exl3PublicMediaModality::unsupported;
-    }
-    if(image&&video)return Exl3PublicMediaModality::image_and_video;
-    if(image)return Exl3PublicMediaModality::image;
-    if(video)return Exl3PublicMediaModality::video;
-    return Exl3PublicMediaModality::text;
+    equals("VOIDINFER_DFLASH2_PREFILL_WINDOW","1");
+    equals("VOIDINFER_EXL3_EXACT_ATTENTION_GQA_SIX_SCORES","1");
+    equals("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW","1");
+    equals("VOIDINFER_EXL3_COHERENT_DOWN_K6","1");
 }
 }
 struct Exl3EngineCore::Request {
@@ -260,6 +267,13 @@ struct Exl3EngineCore::Request {
     OutputConsumerMode consumer;
     Clock::time_point submitted,deadline;
     std::atomic<bool> cancelled{false};
+    // Set once the prefill has looked up (and holds) its retained root: until
+    // then a lane's request still counts as prefix cache demand.
+    std::atomic<bool> prefix_resolved{false};
+    // Coherent-device lane affinity: the longest retained root this input
+    // extends, resolved once while queued (engine mutex).
+    bool affinity_resolved=false;
+    std::weak_ptr<const Exl3VeriCacheRequest> affinity_root;
     std::optional<Exl3RequestSamplingState> sampling;
     std::uint64_t host_preparation_generation=0;
     Exl3HostPreparationCompletion host_preparation;
@@ -314,14 +328,14 @@ struct Exl3EngineCore::Request::Storage {
 };
 struct Exl3EngineCore::Impl {
     std::shared_ptr<Request::CancellationOwner> cancellation_owner;
-    bool coherent_device=false;
     // Admission of the ordinary graph families (each still selected by its
     // own switch) into the coherent-device context.  Qualified for GDN-segment
-    // and full-layer graphs; NINFER_EXL3_COHERENT_ORDINARY_GRAPHS=0 selects the
+    // and full-layer graphs; VOIDINFER_EXL3_COHERENT_ORDINARY_GRAPHS=0 selects the
     // eager fallback.
     bool coherent_ordinary_graphs=false;
     EngineOptions options;
-    bool public_media_enabled=false;
+    // Coherent-device vision: BF16 tower (Exl3DenseVision) streamed from host.
+    bool dense_vision_enabled=false;
     std::optional<Exl3VerifierHorizonPolicy::CostMenu> verifier_cost_menu;
     std::optional<Exl3SuffixProposer::SelectionLimits> suffix_selection_limits;
     bool conditional_b8=false;
@@ -331,12 +345,89 @@ struct Exl3EngineCore::Impl {
     Family frontend;
     ModelSamplingDefaults defaults;
     std::shared_ptr<Exl3TextModel> target;
-    std::shared_ptr<Exl3VisionModel> vision_model;
-    std::shared_ptr<Exl3VisionContext> vision;
-    std::array<std::shared_ptr<ExecutionStream>,2> streams;
-    std::array<std::shared_ptr<Exl3Dflash2DraftModel>,2> drafts;
-    std::array<std::shared_ptr<Exl3Dflash2Execution>,2> lanes;
-    std::array<std::shared_ptr<DraftTapStaging>,2> staging_owners;
+    std::unique_ptr<Exl3DenseVision> dense_vision;
+    std::array<std::shared_ptr<ExecutionStream>,kMaxLanes> streams;
+    std::array<std::shared_ptr<Exl3Dflash2DraftModel>,kMaxLanes> drafts;
+    // The exact VeriCache line, shared by every lane (Exl3ExactLinePool), and
+    // each lane's slots in it. Folded VeriCache (one lane,
+    // VOIDINFER_EXL3_VERICACHE_FOLD=1) verifies blocks on it inside the decode
+    // rounds.
+    // VOIDINFER_EXL3_VERICACHE_LINES (1..lanes, default 1) lines; lane i
+    // verifies on line i % lines.
+    std::vector<std::unique_ptr<Exl3ExactLinePool>> exact_line_pools;
+    std::array<Exl3ExactLinePool::Lane,kMaxLanes> exact_line_slots;
+    static std::uint32_t exact_line_count(std::uint32_t lanes) {
+        const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_LINES");
+        return static_cast<std::uint32_t>(std::clamp(value?std::atoi(value):1,1,static_cast<int>(lanes)));
+    }
+    static bool vericache_fold_enabled() {
+        static const bool enabled=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_FOLD");
+            return value && std::string_view(value)=="1";
+        }();
+        return enabled;
+    }
+    static constexpr int kFoldBlock=16,kFoldRows=24,kFoldRingRows=128;
+    // Asynchronous exact VeriCache (single lane, default; VOIDINFER_EXL3_VERICACHE_ASYNC=0
+    // keeps the synchronous verify pass): the line verifies a block of >= async block rows (64: one
+    // FA2 row tile; the projections cost per row) while
+    // drafting runs ahead by at most async_lead_limit() tokens (L0 ages rows 256+
+    // behind the frontier: they must be the line's exact ones).
+    static bool vericache_async_enabled() {
+        static const bool enabled=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled;
+    }
+    static int vericache_async_block() {
+        static const int block=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC_BLOCK");
+            // 48 since Oct 15 (hot 256: more corrections): sampled LCB C4
+            // 98.1 vs 92.9 kept tok/s per lane (3 paired runs), C1 equal.
+            return value?std::clamp(std::atoi(value),1,192):48;
+        }();
+        return block;
+    }
+    static constexpr int kAsyncRingRows=256;
+    // VOIDINFER_EXL3_VERICACHE_ASYNC_LEAD (16..200, default 200).
+    static int async_lead_limit() {
+        static const int lead=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_ASYNC_LEAD");
+            return value?std::clamp(std::atoi(value),16,200):200;
+        }();
+        return lead;
+    }
+    // One exact line for all lanes (Exl3ExactLinePool): folded or asynchronous
+    // at C1; asynchronous at C2-C8, whose line passes join the ordered prompt
+    // passes. A lane verifies on the line at C1, for every sampled request,
+    // and at C2 for greedy requests of at least kLaneLineMinContext tokens;
+    // other requests verify in exclusive passes. One line instead of one per
+    // lane (~530 MiB device memory each): line passes run one at a time
+    // across lanes anyway; a lane taking the line after another restores its
+    // parked root (mapped host memory) and window rows.
+    // Greedy (exact code, 1,024 tokens, HTTP C2: 16K 157 vs 115 tok/s, 31K 131
+    // vs 115; 4K 198 vs 242, where the batched rounds leave the device no room
+    // for a line; C4 4K 338 vs 346, 31K 172 vs 193): rare corrections, the
+    // 256+-row exclusive blocks are cheaper. Sampled (T 1.0, LCB prompts, C4):
+    // L0 flips one sampled token per ~150-500 past the exact window, so a
+    // 256-row exclusive block keeps ~2.3 tokens per round against 3.15 on the
+    // line: 4K 313 vs 279, 12K 282 vs 222, 24K 244 vs 180 tok/s. The shared
+    // line (no INT4 meta planes or hot rows, 8-row private GDN/small tier) costs
+    // ~320 MiB at C8; sampled LCB 4,096 tokens vs a line per lane / exclusive
+    // passes: C2 135 vs 135 kept tok/s per lane (+0.41 GiB free), C4 341 vs 335
+    // tok/s (+1.22 GiB), C5 345 vs 324, C6 355 vs 270, C7 361 vs 360, C8 360 vs
+    // 324 (corrections ~24 vs ~77 per 16 requests).
+    static constexpr int kLaneLineMinContext=12288;
+    bool exact_line_planned(const EngineOptions& value) const {
+        return
+            (value.max_concurrency==1?vericache_fold_enabled() || vericache_async_enabled():
+                vericache_async_enabled() && prompt_pass_overlap) &&
+            Exl3NativeContextExtent::l0_oscar_enabled() && Exl3VeriCacheConfig::get().enabled &&
+            Exl3VeriCacheConfig::get().delta<0.5f;
+    }
+    std::array<std::shared_ptr<Exl3Dflash2Execution>,kMaxLanes> lanes;
+    std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> staging_owners;
     std::shared_ptr<Exl3EngineTargetQ> shared_q;
     std::shared_ptr<Exl3EngineGreedyPacketBatch> greedy_packet_batch;
     std::shared_ptr<Exl3KVRegistrationCache> kv_registrations;
@@ -384,23 +475,299 @@ struct Exl3EngineCore::Impl {
     Exl3VeriCacheServingIdentity identity;
     Exl3VeriCacheServingPrefixCache cache;
     Exl3VeriCacheServingCoordinator coordinator;
+    // Host memory pressure on a lane's path (lane_kv_source.h) evicts the
+    // retained roots of this cache through the coordinator.
+    struct CacheEviction {
+        explicit CacheEviction(Exl3VeriCacheServingCoordinator& coordinator) {
+            Exl3HostMemoryEviction::set([&coordinator](std::uint64_t extra) {
+                return coordinator.evict_retained_for_memory(extra);
+            });
+        }
+        ~CacheEviction() {Exl3HostMemoryEviction::set({});}
+        CacheEviction(const CacheEviction&)=delete;
+        CacheEviction& operator=(const CacheEviction&)=delete;
+    } cache_eviction{coordinator};
     LoadSummary load;
     mutable std::mutex mutex;
     std::mutex admission_mutex;
     std::condition_variable changed;
     ReservedRequestQueue<Request> queue;
-    std::array<std::shared_ptr<Request>,2> active;
+    std::array<std::shared_ptr<Request>,kMaxLanes> active;
+    // Queue demand for the prefix cache's eviction order
+    // (Exl3VeriCachePrefixIndex::set_demand): the lanes' requests that have
+    // not yet looked up their root (prefill passes run one at a time, so a
+    // lane can wait seconds for its lookup), then the waiting requests in
+    // queue order; republished under `mutex` whenever the queue changes, so
+    // the cache never takes the Engine lock. VOIDINFER_EXL3_DEMAND_EVICTION=0 off.
+    std::atomic<std::shared_ptr<const std::vector<std::shared_ptr<Request>>>> demand_order;
+    void publish_demand_locked() {
+        auto next=std::make_shared<std::vector<std::shared_ptr<Request>>>();
+        next->reserve(active.size()+queue.size());
+        for(const auto& lane:active)if(lane && !lane->prefix_resolved.load())next->push_back(lane);
+        for(const auto& waiting:queue)if(waiting)next->push_back(waiting);
+        demand_order.store(std::move(next));
+    }
+    struct DemandRegistration {
+        Exl3VeriCacheServingPrefixCache& cache;
+        DemandRegistration(Exl3VeriCacheServingPrefixCache& prefix_cache,
+            std::atomic<std::shared_ptr<const std::vector<std::shared_ptr<Request>>>>& order) : cache(prefix_cache) {
+            static const bool enabled=[] {
+                const auto* value=std::getenv("VOIDINFER_EXL3_DEMAND_EVICTION");
+                return !value || std::string_view(value)!="0";
+            }();
+            if(!enabled)return;
+            cache.set_demand([&order](const Exl3VeriCacheRequest& root)->std::optional<std::size_t> {
+                const auto waiting=order.load();
+                if(!waiting)return std::nullopt;
+                const auto rows=root.token_count();
+                for(std::size_t i=0;i<waiting->size();++i) {
+                    const auto& request=(*waiting)[i];
+                    if(request->cancelled.load() || request->prefix_resolved.load())continue;
+                    const auto ids=request->ready_work.input_tokens();
+                    if(rows<=ids.size() && root.matches_tokens(ids.first(rows)))return i;
+                }
+                return std::nullopt;
+            });
+        }
+        ~DemandRegistration() {cache.set_demand({});}
+        DemandRegistration(const DemandRegistration&)=delete;
+        DemandRegistration& operator=(const DemandRegistration&)=delete;
+    } demand_registration{cache,demand_order};
+    // L0 OSCAR code memory of concurrent lanes (coherent-device C>=2): the
+    // INT4 code/meta planes grow with each lane's context on the device.
+    // Past physical VRAM, WDDM silently demotes allocations to system memory
+    // (one 4 x 104K run: a lane's history kernel 10x slower, every batched
+    // round ~2.5x slower; 8 x 106K: the Engine failed). A lane only takes a
+    // request whose projected codes (input + output allowance) fit in the free
+    // device memory beside the growth the other active lanes still have ahead
+    // (their projections minus the codes already backed), keeping
+    // VOIDINFER_EXL3_L0_CODE_RESERVE_MIB (default 512) free; the request otherwise
+    // waits for a lane to finish, at most until shortly before its queue
+    // deadline. VOIDINFER_EXL3_L0_CODE_ADMISSION=0 disables.
+    std::array<std::uint64_t,kMaxLanes> lane_code_projection{};
+    static std::uint64_t projected_l0_code_bytes(std::size_t tokens) {
+        // Per token: 16 full-attention layers x 4 KV heads x (K and V codes + FP16 metadata),
+        // plus half a 2 MiB granule of rounding for each of the 32 code planes.
+        const std::uint64_t per_token=16ull*4ull*2ull*
+            (static_cast<std::uint64_t>(l0_oscar_format::code_bytes())+l0_oscar_format::kMetaHalves*2ull);
+        return static_cast<std::uint64_t>(tokens)*per_token+32ull*(1ull<<20);
+    }
+    bool l0_code_admission_enabled() const {
+        static const bool enabled=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_CODE_ADMISSION");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled && options.max_concurrency>=2 &&
+            Exl3NativeContextExtent::l0_oscar_enabled();
+    }
+    std::uint64_t request_code_projection(const Request& request) const {
+        const auto input=request.ready_work.input_tokens().size();
+        auto output=static_cast<std::size_t>(request.options.execution.requested_output_tokens);
+        // Lanes that can suspend under pressure reserve a bounded output
+        // allowance, not the whole max_tokens (most outputs stop far earlier).
+        if(l0_suspend_enabled())output=std::min(output,l0_admit_output_tokens());
+        return projected_l0_code_bytes(std::min<std::size_t>(input+output,options.max_context));
+    }
+    // Device-memory pressure between rounds (coherent-device C2+ with L0 code
+    // admission; VOIDINFER_EXL3_L0_SUSPEND=0 off): requests are admitted on
+    // their input plus VOIDINFER_EXL3_L0_ADMIT_OUTPUT_TOKENS (default 4096) of
+    // output. When free device memory falls below VOIDINFER_EXL3_L0_SUSPEND_MIB
+    // (default 256) the youngest decoding lane suspends at its next round: its
+    // L0 codes move to pinned host memory (Exl3TextContext::suspend_l0_codes)
+    // until, oldest suspended lane first, they fit again with the threshold
+    // and the code reserve to spare. The oldest decoding lane never suspends, and no request is
+    // admitted while a lane is suspended.
+    std::array<bool,kMaxLanes> lane_decoding{},lane_suspended{};
+    std::array<std::uint64_t,kMaxLanes> lane_admission{};
+    std::uint64_t next_lane_admission=1;
+    bool l0_suspend_enabled() const {
+        static const bool enabled=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_SUSPEND");
+            return !value || std::string_view(value)!="0";
+        }();
+        return enabled && l0_code_admission_enabled();
+    }
+    static std::size_t l0_admit_output_tokens() {
+        static const std::size_t tokens=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_ADMIT_OUTPUT_TOKENS");
+            return static_cast<std::size_t>(value?std::max(0L,std::atol(value)):4096L);
+        }();
+        return tokens;
+    }
+    static std::uint64_t l0_code_reserve_bytes() {
+        static const std::uint64_t reserve=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_CODE_RESERVE_MIB");
+            return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):512L)<<20;
+        }();
+        return reserve;
+    }
+    static std::uint64_t l0_suspend_threshold_bytes() {
+        static const std::uint64_t threshold=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_MIB");
+            return static_cast<std::uint64_t>(value?std::max(0L,std::atol(value)):256L)<<20;
+        }();
+        return threshold;
+    }
+    // Locked: lanes in their decode loop that are not suspended.
+    std::size_t running_decoders_locked(std::size_t except=kMaxLanes) const {
+        std::size_t count=0;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(i!=except && lane_decoding[i] && !lane_suspended[i])++count;
+        return count;
+    }
+    // At the top of every decode round of a lane.
+    void l0_memory_gate(std::size_t lane_index,Exl3TextContext& context,cudaStream_t stream,const Request& request) {
+        if(!l0_suspend_enabled())return;
+        // One free-memory query per 20 ms across lanes (each round of each lane asks).
+        static std::atomic<std::int64_t> checked_at{0};
+        static std::atomic<std::size_t> cached_free{0};
+        const auto now_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count();
+        std::size_t free=cached_free.load(std::memory_order_relaxed);
+        if(now_ns-checked_at.load(std::memory_order_relaxed)>=20'000'000) {
+            std::size_t total=0;
+            if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return;
+            cached_free.store(free,std::memory_order_relaxed);
+            checked_at.store(now_ns,std::memory_order_relaxed);
+            // Lanes back their projected codes as they grow: refresh the
+            // reservation the layer-major cache budget subtracts.
+            std::lock_guard lock(mutex);
+            publish_l0_code_growth_locked();
+        }
+        if(free>=l0_suspend_threshold_bytes())return;
+        // The retained layer-major projection cache goes before any lane's
+        // codes (0 while a prompt block holds it).
+        static const bool cache_trace=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_TRACE")!=nullptr;
+        if(const auto released=context.release_prompt_projection_cache(0)) {
+            checked_at.store(0,std::memory_order_relaxed);
+            if(cache_trace)std::fprintf(stderr,"L0_CACHE_RELEASE lane=%zu released=%.0f MiB free=%.0f MiB\n",
+                lane_index,released/1048576.0,free/1048576.0);
+            return;
+        }
+        if(cache_trace)std::fprintf(stderr,"L0_CACHE_KEPT lane=%zu cache=%.0f MiB free=%.0f MiB\n",lane_index,
+            context.prompt_projection_cache_bytes()/1048576.0,free/1048576.0);
+        std::unique_lock lock(mutex);
+        std::size_t victim=kMaxLanes;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(lane_decoding[i] && !lane_suspended[i] &&
+               (victim==kMaxLanes || lane_admission[i]>lane_admission[victim]))victim=i;
+        if(victim!=lane_index || running_decoders_locked()<2)return;
+        lane_suspended[lane_index]=true;
+        lock.unlock();
+        struct Clear {
+            Impl& engine;std::size_t lane;Exl3TextContext& context;cudaStream_t stream;
+            ~Clear() {
+                if(context.l0_codes_suspended())try {context.resume_l0_codes(stream);} catch(...) {}
+                {std::lock_guard lock(engine.mutex);engine.lane_suspended[lane]=false;}
+                engine.changed.notify_all();
+            }
+        } clear{*this,lane_index,context,stream};
+        const BatchedInactive inactive(lane_batched_verify[lane_index]);
+        // Another lane's batched round may still read these codes.
+        check(voidinfer::cuda_device_synchronize_outside_capture());
+        const auto started=Clock::now();
+        const auto released=context.suspend_l0_codes(stream);
+        checked_at.store(0,std::memory_order_relaxed); // the released bytes count from the next query
+        const double suspend_ms=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+        lock.lock();
+        changed.notify_all();
+        const auto resumable=[&] {
+            if(stopping || request.cancelled.load(std::memory_order_acquire))return true;
+            for(std::size_t i=0;i<options.max_concurrency;++i)
+                if(i!=lane_index && lane_suspended[i] && lane_admission[i]<lane_admission[lane_index])return false;
+            // The oldest suspended lane runs when no other lane decodes.
+            if(!running_decoders_locked(lane_index))return true;
+            std::size_t now=0,all=0;
+            // Above the suspension threshold by the code reserve once resumed (hysteresis).
+            return cudaMemGetInfo(&now,&all)==cudaSuccess &&
+                now>=released+l0_suspend_threshold_bytes()+l0_code_reserve_bytes();
+        };
+        while(!resumable())changed.wait_for(lock,std::chrono::milliseconds(100));
+        lock.unlock();
+        const auto waited=Clock::now();
+        context.resume_l0_codes(stream);
+        static const bool trace=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"L0_SUSPEND lane=%zu rows=%d released=%.0f MiB free=%.0f MiB suspend_ms=%.1f waited_ms=%.0f resume_ms=%.1f\n",
+            lane_index,context.position(),released/1048576.0,free/1048576.0,suspend_ms,
+            std::chrono::duration<double,std::milli>(waited-started).count()-suspend_ms,
+            std::chrono::duration<double,std::milli>(Clock::now()-waited).count());
+    }
+    // Locked: whether `request` fits beside the other active lanes' codes.
+    // Requests younger than the oldest one waiting for code memory wait as
+    // well (lanes drain until it fits; smaller arrivals cannot starve it).
+    bool l0_codes_fit_locked(const Request& request,std::size_t lane_index) {
+        if(!l0_code_admission_enabled())return true;
+        // A request about to reach its queue deadline runs anyway (as without
+        // admission: slower, never refused for waiting on code memory).
+        if(Clock::now()+std::chrono::seconds(1)>=request.deadline)return true;
+        const auto submitted=request.ready_work.submitted();
+        for(const auto& queued:queue) {
+            if(queued.get()==&request)break;
+            if(queued->cancelled.load(std::memory_order_acquire) ||
+               queued->ready_work.submitted()>submitted)continue;
+            if(!l0_codes_fit_alone_locked(*queued,lane_index))return false;
+        }
+        return l0_codes_fit_alone_locked(request,lane_index);
+    }
+    bool l0_codes_fit_alone_locked(const Request& request,std::size_t lane_index) {
+        for(std::size_t i=0;i<options.max_concurrency;++i)if(lane_suspended[i])return false;
+        std::uint64_t growth=0;bool any=false;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(i!=lane_index && active[i] && lanes[i]) {
+                any=true;
+                const std::uint64_t backed=lanes[i]->context().l0_code_device_bytes();
+                if(lane_code_projection[i]>backed)growth+=lane_code_projection[i]-backed;
+            }
+        // A lone lane always runs (its own context bound is the Engine's max_context).
+        if(!any)return true;
+        std::size_t free=0,total=0;
+        if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
+        const std::uint64_t reserve=l0_code_reserve_bytes();
+        // This lane's own (parked or retained) backing is reused by the request.
+        const std::uint64_t own=lanes[lane_index]?lanes[lane_index]->context().l0_code_device_bytes():0;
+        const std::uint64_t need=request_code_projection(request);
+        const std::uint64_t required=growth+reserve+(need>own?need-own:0);
+        if(required<=free)return true;
+        // The shared layer-major projection cache yields to codes: prompt
+        // blocks then run with a smaller cache (or row-major).
+        if(!lanes[lane_index])return false;
+        auto& context=lanes[lane_index]->context();
+        const std::uint64_t cache=context.prompt_projection_cache_bytes();
+        if(required>free+cache)return false;
+        // A prompt block sizing its cache after the release sees this request's
+        // codes as promised (the next publication corrects it if not admitted).
+        Exl3TextContext::set_reserved_l0_code_growth(growth+(need>own?need-own:0));
+        const auto released=context.release_prompt_projection_cache(
+            static_cast<std::size_t>(cache-(required-free)));
+        static const bool trace=std::getenv("VOIDINFER_EXL3_L0_SUSPEND_TRACE")!=nullptr;
+        if(trace)std::fprintf(stderr,"L0_CACHE_ADMIT lane=%zu released=%.0f MiB cache=%.0f MiB short=%.0f MiB\n",
+            lane_index,released/1048576.0,cache/1048576.0,(required-free)/1048576.0);
+        if(cudaMemGetInfo(&free,&total)!=cudaSuccess)return true;
+        return required<=free;
+    }
+    // Locked: publishes the code growth still ahead of the active lanes
+    // (projection minus backed codes) for the layer-major cache budget.
+    void publish_l0_code_growth_locked() {
+        if(!l0_code_admission_enabled())return;
+        std::uint64_t growth=0;
+        for(std::size_t i=0;i<options.max_concurrency;++i)
+            if(active[i] && lanes[i]) {
+                const std::uint64_t backed=lanes[i]->context().l0_code_device_bytes();
+                if(lane_code_projection[i]>backed)growth+=lane_code_projection[i]-backed;
+            }
+        Exl3TextContext::set_reserved_l0_code_growth(growth);
+    }
     Exl3ReadyWorkSnapshotAuthority ready_work_authority;
     struct LaneFrontier {
         std::weak_ptr<const Exl3VeriCacheRequest> root;
         std::uint64_t request_generation=0;
         Exl3ReadyLocalityCost locality;
     };
-    std::array<LaneFrontier,2> lane_frontiers;
+    std::array<LaneFrontier,kMaxLanes> lane_frontiers;
     // True from the first request-local prefill operation through the last
     // numerical/transfer cleanup in execute().  It is an overlap witness only;
     // it never grants another request access to this lane's state.
-    std::array<std::atomic<bool>,2> numerical_active{};
+    std::array<std::atomic<bool>,kMaxLanes> numerical_active{};
     std::uint64_t next_host_preparation_generation=1;
     bool stopping=false,failed=false;
     unsigned result_allocation_fault=0;
@@ -423,7 +790,197 @@ struct Exl3EngineCore::Impl {
     std::size_t outstanding=0;
     RuntimeStats stats;
     MemorySummary memory;
-    std::array<std::thread,2> workers;
+    std::array<std::thread,kMaxLanes> workers;
+    // Batched multi-agent rounds of the coherent-device lanes
+    // (VOIDINFER_EXL3_BATCHED_ROUNDS, default on for C2+): one coordinator per
+    // group of up to four lanes (the widest batched forward).
+    std::vector<std::unique_ptr<Exl3BatchedVerifyCoordinator>> batched_verify;
+    std::array<Exl3BatchedVerifyCoordinator*,kMaxLanes> lane_batched_verify{};
+    // Concurrent coherent-device lanes: prompt ingestion runs alone on the
+    // device (exclusive; process-wide prefill scratch, and DFlash2 rounds are
+    // not qualified to overlap another lane's ingestion), decode rounds of all
+    // lanes run together (shared).
+    std::shared_mutex coherent_prefill_mutex;
+    // Writer-preferring turnstile: a waiting prompt pass holds it while it
+    // acquires coherent_prefill_mutex, so lanes starting new rounds queue
+    // behind the pass instead of starving it (shared_mutex grants new shared
+    // owners ahead of a waiting exclusive one).
+    std::mutex coherent_prefill_turnstile;
+    void lock_round(std::shared_lock<std::shared_mutex>& round) {
+        { const std::lock_guard turnstile(coherent_prefill_turnstile); }
+        round.lock();
+    }
+    // Prompt passes (ingestion, VeriCache verifier/fix/rewind) share the
+    // model's prompt-scale pool: they run one at a time, ordered on the device
+    // by prompt_pass_done, while other lanes keep decoding (their rounds use
+    // private small-tier state only). Default since exact VeriCache verifies
+    // every 16-32 tokens: device-exclusive passes stalled every lane (and
+    // synchronized the device) per block. Exact 4K code, 4,096 tokens: C4
+    // 227 -> 346 tok/s, C2 207 -> 225 (means of 2-3 noisy runs), 15 runs
+    // without error (an Oct 9 build once hit an illegal address in draft
+    // completion at C2). VOIDINFER_EXL3_PROMPT_PASS_OVERLAP=0: exclusive passes.
+    // One pass at a time, in three classes. A request's first verification (its
+    // first published tokens) goes first, other verification passes (lines'
+    // passes and fixes, exclusive verify / rewind passes: tens of rows) alternate
+    // with queued prompt ingestions (up to whole prompts). FIFO passes held every
+    // lane's first verified block, hence its first token, behind a burst's
+    // prefills (C8 first wave: all 8 TTFTs 4.61 s).
+    enum PassClass {kIngestPass,kVerifyPass,kFirstVerifyPass};
+    struct PassQueue {
+        static constexpr int kVerifyStreak=1;
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool busy=false;
+        PassClass holder=kIngestPass;
+        std::array<int,3> waiting{};
+        int streak=0;
+        // A long ingestion yielding between its blocks: the verification
+        // passes waiting then run first, other ingestions wait for it.
+        int yielding=0;
+        std::uint64_t verify_done=0;
+        void lock(PassClass type) {
+            std::unique_lock guard(mutex);
+            ++waiting[type];
+            changed.wait(guard,[&] {
+                if(busy)return false;
+                if(type==kFirstVerifyPass)return true;
+                if(waiting[kFirstVerifyPass])return false;
+                if(type==kVerifyPass)return yielding || !waiting[kIngestPass] || streak<kVerifyStreak;
+                if(yielding)return false;
+                return !waiting[kVerifyPass] || streak>=kVerifyStreak;
+            });
+            --waiting[type];
+            if(type==kVerifyPass)streak=waiting[kIngestPass]?streak+1:0;
+            else if(type==kIngestPass)streak=0;
+            busy=true;
+            holder=type;
+        }
+        void unlock() {
+            {
+                const std::lock_guard guard(mutex);
+                busy=false;
+                if(holder!=kIngestPass)++verify_done;
+            }
+            changed.notify_all();
+        }
+        bool verify_waiting() {
+            const std::lock_guard guard(mutex);
+            return waiting[kVerifyPass] || waiting[kFirstVerifyPass];
+        }
+        // Held by an ingestion: lets the verification passes waiting now run,
+        // then takes the queue back ahead of other ingestions.
+        void yield() {
+            std::unique_lock guard(mutex);
+            const int let=waiting[kVerifyPass]+waiting[kFirstVerifyPass];
+            if(!let)return;
+            const auto target=verify_done+static_cast<std::uint64_t>(let);
+            busy=false;
+            ++yielding;
+            changed.notify_all();
+            changed.wait(guard,[&] {
+                return !busy && (verify_done>=target ||
+                    (!waiting[kVerifyPass] && !waiting[kFirstVerifyPass]));
+            });
+            --yielding;
+            busy=true;
+            holder=kIngestPass;
+            streak=0;
+        }
+        // Held by an ingestion: hands the queue to verification passes (as
+        // yield) and keeps it released until `done` holds or `limit` passes,
+        // then takes it back ahead of other ingestions.
+        template<class Done> void pause(std::chrono::microseconds limit,Done&& done) {
+            std::unique_lock guard(mutex);
+            busy=false;
+            ++yielding;
+            changed.notify_all();
+            const auto until=std::chrono::steady_clock::now()+limit;
+            while(!done() && std::chrono::steady_clock::now()<until)
+                changed.wait_until(guard,std::min(until,
+                    std::chrono::steady_clock::now()+std::chrono::microseconds(500)));
+            changed.wait(guard,[&] {return !busy;});
+            --yielding;
+            busy=true;
+            holder=kIngestPass;
+            streak=0;
+        }
+    } prompt_pass_queue;
+    // Decode rounds completed per lane (prefill policy decode-priority).
+    std::array<std::atomic<std::uint64_t>,kMaxLanes> lane_rounds{};
+    cudaEvent_t prompt_pass_done=nullptr;
+    bool prompt_pass_overlap=[] {
+        const char* value=std::getenv("VOIDINFER_EXL3_PROMPT_PASS_OVERLAP");
+        return !value || std::string_view(value)!="0";
+    }();
+    struct PromptPass {
+        Impl& engine;
+        cudaStream_t stream;
+        bool ordered=false;
+        std::unique_lock<std::shared_mutex> exclusive;
+        PromptPass(Impl& value,cudaStream_t pass_stream,PassClass type=kIngestPass) :
+            engine(value),stream(pass_stream) {
+            if(engine.prompt_pass_overlap) {
+                engine.prompt_pass_queue.lock(type);
+                ordered=true;
+                if(engine.prompt_pass_done)
+                    check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
+            } else {
+                const std::lock_guard turnstile(engine.coherent_prefill_turnstile);
+                exclusive=std::unique_lock(engine.coherent_prefill_mutex);
+                if(engine.options.max_concurrency>1)check(voidinfer::cuda_device_synchronize_outside_capture());
+            }
+        }
+        ~PromptPass() {
+            if(!ordered)return;
+            if(!engine.prompt_pass_done &&
+               cudaEventCreateWithFlags(&engine.prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
+                engine.prompt_pass_done=nullptr;
+            if(engine.prompt_pass_done)(void)cudaEventRecord(engine.prompt_pass_done,stream);
+            engine.prompt_pass_queue.unlock();
+        }
+        PromptPass(const PromptPass&)=delete;
+        PromptPass& operator=(const PromptPass&)=delete;
+    };
+    // The asynchronous lines' passes and fixes (several lanes) in the same
+    // order as PromptPass with overlap.
+    struct LinePassOrder final : Exl3FastDeviceRound::PassOrder {
+        Impl& engine;
+        PassClass type;
+        LinePassOrder(Impl& value,PassClass pass) : engine(value),type(pass) {}
+        void enter(cudaStream_t stream) override {
+            engine.prompt_pass_queue.lock(type);
+            if(engine.prompt_pass_done)check(cudaStreamWaitEvent(stream,engine.prompt_pass_done,0));
+        }
+        void leave(cudaStream_t stream) override {
+            if(!engine.prompt_pass_done &&
+               cudaEventCreateWithFlags(&engine.prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
+                engine.prompt_pass_done=nullptr;
+            if(engine.prompt_pass_done)(void)cudaEventRecord(engine.prompt_pass_done,stream);
+            engine.prompt_pass_queue.unlock();
+        }
+    };
+    LinePassOrder line_pass_order{*this,kVerifyPass},first_line_pass_order{*this,kFirstVerifyPass};
+    // Lanes per batched-round coordinator (VOIDINFER_EXL3_BATCHED_GROUP_LANES,
+    // 2..8, default 8): eight lanes share one 64-row forward instead of two
+    // groups of four.
+    static std::uint32_t batched_group_lanes() {
+        static const std::uint32_t lanes=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_GROUP_LANES");
+            const int parsed=value?std::atoi(value):static_cast<int>(Exl3BatchedVerifyCoordinator::kMaxGroup);
+            return static_cast<std::uint32_t>(std::clamp(parsed,2,static_cast<int>(Exl3BatchedVerifyCoordinator::kMaxGroup)));
+        }();
+        return lanes;
+    }
+    // A lane in a prompt pass is not a batched-round candidate.
+    struct BatchedInactive {
+        Exl3BatchedVerifyCoordinator* coordinator;
+        explicit BatchedInactive(Exl3BatchedVerifyCoordinator* value) : coordinator(value) {
+            if(coordinator)coordinator->set_active(false);
+        }
+        ~BatchedInactive() { if(coordinator)coordinator->set_active(true); }
+        BatchedInactive(const BatchedInactive&)=delete;
+        BatchedInactive& operator=(const BatchedInactive&)=delete;
+    };
     Exl3RetirementState retirement;
     int retirement_fault=0;
     std::exception_ptr first_execution_failure;
@@ -439,82 +996,113 @@ struct Exl3EngineCore::Impl {
 
     explicit Impl(const EngineOptions& value,unsigned shared_allocation_fault,unsigned draft_clone_fault,unsigned first_draft_fault,unsigned context_startup_fault,
         Exl3DeviceAvailability::Provider supplied_availability):
-        coherent_device(value.exl3_package->round_implementation==
-            Exl3RoundImplementation::CoherentDevice),
-        coherent_ordinary_graphs(coherent_device && [] {
-            const char* value=std::getenv("NINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
+        coherent_ordinary_graphs([] {
+            const char* value=std::getenv("VOIDINFER_EXL3_COHERENT_ORDINARY_GRAPHS");
             if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
                 throw std::invalid_argument("coherent ordinary graphs must be 0 or 1");
             return !value || std::string_view(value)=="1";
         }()),options(value),
-        public_media_enabled(
-            !coherent_device && Exl3PublicMediaQualification::evaluate_current(
-                Exl3PublicMediaModality::image).media_allowed() &&
-            Exl3PublicMediaQualification::evaluate_current(
-                Exl3PublicMediaModality::video).media_allowed()),
-        resources(load_pinned_frontend_resources(value.exl3_package->target_directory)),
+        dense_vision_enabled(value.vision_enabled()),
+        resources(load_pinned_frontend_resources(value.model.target_directory)),
         frontend(targets::qwen3_6::make_frontend(resources,targets::qwen3_6::FrontendOptions{
-            .vision_enabled=public_media_enabled,.max_context=value.max_context,
+            .vision_enabled=dense_vision_enabled,.max_context=value.max_context,
             .max_cache_markers_per_request=value.context_cache.max_cache_markers_per_request.value_or(4)})),
-        identity{"exl3-engine-epoch-1","SC_6.00bpw_H6_V6","0997f410-c3cf9e34",
-            coherent_device?"coherent-device-P1-K6-B8-greedy":"ordinary-FP16-B8-greedy",
-            public_media_enabled?"text+qualified-v6-media":"text"},
-        cache(Exl3VeriCacheServingPrefixCache::Policy{std::max(1U,value.context_cache.max_shared_prefixes.value_or(1)),64,std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),8ULL<<30},identity),
-        coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),8ULL<<30}) {
-        if(coherent_device)require_coherent_device_profile(value);
-        else require_exact_profile();
+        identity{"exl3-engine-epoch-1",pinned_weights_id(value.model.target_directory),"0997f410-c3cf9e34",
+            "coherent-device-P1-K6-B8-greedy",dense_vision_enabled?"text+bf16-vision":"text"},
+        cache(Exl3VeriCacheServingPrefixCache::Policy{
+            std::max(1U,value.context_cache.max_private_continuations.value_or(2*value.max_concurrency)),64,
+            std::max<std::size_t>(1,value.context_cache.host_kv_capacity_bytes),kExl3HostReserveBytes,
+            value.context_cache.max_shared_prefixes.value_or(value.max_concurrency)},identity),
+        coordinator(cache,{value.max_concurrency,value.max_concurrency,resident_budget(value),kExl3HostReserveBytes}) {
+        // A single exact-VeriCache lane gets an exact line (below): its
+        // contexts share prompt workspaces, and with the asynchronous line two
+        // host threads drive the device (polled waits, core/poll_wait.h).
+        {
+            const bool line=exact_line_planned(value);
+            exl3_set_exact_line_workspace_sharing(line);
+            exl3_set_exact_line_compact_gdn(line && vericache_async_enabled());
+            voidinfer::cuda_set_poll_waits(line && vericache_async_enabled());
+        }
+        require_coherent_device_profile(value);
+        if(value.max_concurrency>=2) {
+            // Several resident lanes: halve the per-context L0 prompt-block row
+            // buffers and let exclusive prompt ingestion use a smaller
+            // layer-major reserve, so both lanes keep the fast prefill.
+            if(!std::getenv("VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS"))
+                _putenv_s("VOIDINFER_EXL3_L0_PREFILL_BLOCK_ROWS","4096");
+            // Decode keeps 1 GiB of device headroom; the retained layer-major
+            // projection cache is capped instead (one layer's projections at
+            // C3+). Oversubscribed WDDM memory corrupts batched graph replays.
+            if(!std::getenv("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB"))
+                _putenv_s("VOIDINFER_EXL3_L0_LAYER_MAJOR_RESERVE_MIB","1024");
+            if(!std::getenv("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB") && value.max_concurrency>=3)
+                _putenv_s("VOIDINFER_EXL3_LAYER_MAJOR_CACHE_MIB",value.max_concurrency>=5?"640":"1536");
+            // Batched rounds of more than 32 rows (lanes x round width): 64-row
+            // private tiers (eight lanes' verifier rows in one forward).
+            if(!std::getenv("VOIDINFER_EXL3_BATCH_ROWS") &&
+               std::min(value.max_concurrency,batched_group_lanes())*round_width_limit()>32)
+                _putenv_s("VOIDINFER_EXL3_BATCH_ROWS","64");
+        }
+        // Prompt-scale passes never overlap (lanes order them; at C1 the exact
+        // line and the drafting context take turns): one reconstruct workspace
+        // and one set of prompt-row planes serve every context (C1 code
+        // workload, Oct 15 2026: ~0.95 GiB more free memory, speed equal).
+        if(!std::getenv("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE"))
+            _putenv_s("VOIDINFER_EXL3_SHARE_PROMPT_WORKSPACE","1");
+        // C1 keeps its verified roots on the device: in mapped host memory a
+        // root copy per verified block cost ~1.7% of decode at 4K-32K.
+        if(value.max_concurrency==1 && !std::getenv("VOIDINFER_EXL3_HOST_VERIFIED_ROOT"))
+            _putenv_s("VOIDINFER_EXL3_HOST_VERIFIED_ROOT","0");
+        // The default 1 KiB per-thread stack reserves ~256 MiB of local
+        // memory for every resident thread; the driver raises the limit
+        // for any kernel that needs more. VOIDINFER_EXL3_STACK_BYTES overrides.
+        {
+            const char* requested=std::getenv("VOIDINFER_EXL3_STACK_BYTES");
+            const std::size_t stack=requested?std::strtoull(requested,nullptr,10):256;
+            if(stack)(void)cudaDeviceSetLimit(cudaLimitStackSize,stack);
+        }
         const auto flag=[](const char* name) {
             const auto* value=std::getenv(name);
             if(value && std::string_view(value)!="0" && std::string_view(value)!="1")
                 throw std::invalid_argument(std::string(name)+" must be0 or1");
             return value && std::string_view(value)=="1";
         };
-        const bool native64k=flag("NINFER_EXL3_EXTENDED_CONTEXT_64K");
-        const bool candidate128k=flag("NINFER_EXL3_EXTENDED_CONTEXT_128K");
-        const bool exact_host=flag("NINFER_EXL3_EXACT_HOST_KV");
-        const bool oscar_only=flag("NINFER_EXL3_OSCAR_L0_ONLY");
-        const bool device_prefix=flag("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
-        Exl3NativeContextExtent::refuse_candidate128k_execution(value.max_context,
-            native64k,candidate128k,exact_host,oscar_only,value.max_concurrency,
-            value.context_cache.host_kv_capacity_bytes,device_prefix);
-        Exl3NativeContextExtent::require_native64k_engine(value.max_context,
-            native64k,candidate128k,exact_host,oscar_only,
-            value.max_concurrency,value.context_cache.host_kv_capacity_bytes);
-        conditional_b8 = read_binary_option("NINFER_EXL3_ENGINE_CONDITIONAL_B8",
-            "NINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
-        const bool device_taps_only=flag("NINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
+        const bool device_prefix=flag("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+        conditional_b8 = read_binary_option("VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8",
+            "VOIDINFER_EXL3_ENGINE_CONDITIONAL_B8 must be 0 or 1");
+        const bool device_taps_only=flag("VOIDINFER_EXL3_COMPACT_DEVICE_TAPS_ONLY");
         if(device_taps_only &&
-           (!flag("NINFER_EXL3_COMMITTED_TAP_D2D") ||
-            !flag("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING")))
+           (!flag("VOIDINFER_EXL3_COMMITTED_TAP_D2D") ||
+            !flag("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING")))
             throw std::invalid_argument(
                 "device-only committed taps require direct D2D tap staging");
         if(device_taps_only && conditional_b8)
             throw std::invalid_argument(
                 "device-only committed taps are incompatible with conditional B8");
-        if(device_taps_only && flag("NINFER_EXL3_STAGED_B8_VERIFIER"))
+        if(device_taps_only && flag("VOIDINFER_EXL3_STAGED_B8_VERIFIER"))
             throw std::invalid_argument(
                 "device-only committed taps are incompatible with staged B8");
         const bool reconstruction_fallback=exl3_reconstruction_budget_fallback(
-            std::getenv("NINFER_EXL3_RECONSTRUCTION_BUDGET_FALLBACK"));
-        concurrent_prefix_preparation = read_binary_option("NINFER_EXL3_ENGINE_SHARED_PREPARATION",
-            "NINFER_EXL3_ENGINE_SHARED_PREPARATION must be 0 or 1");
-        declared_prefix_preparation = read_binary_option("NINFER_EXL3_ENGINE_DECLARED_PREFIX",
-            "NINFER_EXL3_ENGINE_DECLARED_PREFIX must be 0 or 1");
-        request_affinity = read_binary_option("NINFER_EXL3_REQUEST_AFFINITY",
-            "NINFER_EXL3_REQUEST_AFFINITY must be 0 or 1");
-        const auto* preserve_option=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
+            std::getenv("VOIDINFER_EXL3_RECONSTRUCTION_BUDGET_FALLBACK"));
+        concurrent_prefix_preparation = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_PREPARATION",
+            "VOIDINFER_EXL3_ENGINE_SHARED_PREPARATION must be 0 or 1");
+        declared_prefix_preparation = read_binary_option("VOIDINFER_EXL3_ENGINE_DECLARED_PREFIX",
+            "VOIDINFER_EXL3_ENGINE_DECLARED_PREFIX must be 0 or 1");
+        request_affinity = read_binary_option("VOIDINFER_EXL3_REQUEST_AFFINITY",
+            "VOIDINFER_EXL3_REQUEST_AFFINITY must be 0 or 1");
+        const auto* preserve_option=std::getenv("VOIDINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
         if(request_affinity && (!preserve_option || std::string_view(preserve_option)!="1"))
             throw std::invalid_argument("request affinity requires acquired-root preservation");
-        const bool share_prefix = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX",
+        const bool share_prefix = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DEVICE_PREFIX",
             "Engine shared device prefix must be0 or1") && value.max_concurrency==2;
         if(share_prefix) {
-            const auto* cache=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+            const auto* cache=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
             if(!cache || std::string_view(cache)!="1")
                 throw std::invalid_argument("Engine shared prefix requires represented device prefix option");
         }
-        const bool share_q = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_Q",
+        const bool share_q = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_Q",
             "Engine shared target Q must be0 or1") && value.max_concurrency==2;
-        const bool batch_greedy = read_binary_option("NINFER_EXL3_ENGINE_BATCHED_GREEDY_PACKET",
+        const bool batch_greedy = read_binary_option("VOIDINFER_EXL3_ENGINE_BATCHED_GREEDY_PACKET",
             "Engine batched greedy packet must be0 or1");
         const bool device_greedy=exl3_device_greedy_enabled();
         if(batch_greedy && value.max_concurrency!=2)
@@ -523,90 +1111,90 @@ struct Exl3EngineCore::Impl {
             if(!device_greedy)
                 throw std::invalid_argument("Engine batched greedy packet requires device greedy");
         }
-        const bool share_kv = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_KV",
+        const bool share_kv = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_KV",
             "Engine shared target KV must be0 or1") && value.max_concurrency==2;
-        const bool share_o = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_O",
+        const bool share_o = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_O",
             "Engine shared target O must be0 or1") && value.max_concurrency==2;
-        const bool share_gateup = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_GATEUP",
+        const bool share_gateup = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_GATEUP",
             "Engine shared gate/up must be0 or1") && value.max_concurrency==2;
         if(share_gateup) {
-            const auto* k5=std::getenv("NINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
-            const auto* k6=std::getenv("NINFER_EXL3_TARGET_GATEUP_SMALL_M");
-            const auto* k7=std::getenv("NINFER_EXL3_TARGET_GATEUP_K7_SMALL_M");
+            const auto* k5=std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K5_SMALL_M");
+            const auto* k6=std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_SMALL_M");
+            const auto* k7=std::getenv("VOIDINFER_EXL3_TARGET_GATEUP_K7_SMALL_M");
             if(!share_q || ((!k5 || std::string_view(k5)!="1") &&
                 (!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared gate/up requires shared Q and explicit gate/up small-M route");
         }
-        const bool share_down = read_binary_option("NINFER_EXL3_ENGINE_SHARED_TARGET_DOWN",
+        const bool share_down = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_TARGET_DOWN",
             "Engine shared down must be0 or1") && value.max_concurrency==2;
         if(share_down) {
-            const auto* k6=std::getenv("NINFER_EXL3_TARGET_DOWN_SMALL_M");
-            const auto* k7=std::getenv("NINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
+            const auto* k6=std::getenv("VOIDINFER_EXL3_TARGET_DOWN_SMALL_M");
+            const auto* k7=std::getenv("VOIDINFER_EXL3_TARGET_DOWN_K7_SMALL_M");
             if(!share_q || ((!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared down requires shared Q and explicit down small-M route");
             // Family-specific 16-k6/16-k7 selections fall back for the other K.
             // The workspace retains the existing split and async-A policy.
         }
-        const bool share_head = read_binary_option("NINFER_EXL3_ENGINE_SHARED_HEAD",
+        const bool share_head = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_HEAD",
             "Engine shared head must be0 or1") && value.max_concurrency==2;
-        const auto* h6=std::getenv("NINFER_EXL3_H6_SMALL_M");
+        const auto* h6=std::getenv("VOIDINFER_EXL3_H6_SMALL_M");
         if(share_head && (!share_q || (h6 && std::string_view(h6)=="0")))
             throw std::invalid_argument("Engine shared head requires shared Q and enabled H6 small-M");
-        const bool share_gather = read_binary_option("NINFER_EXL3_ENGINE_SHARED_GATHER_REUSE",
+        const bool share_gather = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_GATHER_REUSE",
             "Engine gather reuse must be0 or1") && value.max_concurrency==2;
         if(share_o) {
-            const auto* k6=std::getenv("NINFER_EXL3_TARGET_O_K6_SMALL_M");
-            const auto* k7=std::getenv("NINFER_EXL3_TARGET_O_K7_SMALL_M");
+            const auto* k6=std::getenv("VOIDINFER_EXL3_TARGET_O_K6_SMALL_M");
+            const auto* k7=std::getenv("VOIDINFER_EXL3_TARGET_O_K7_SMALL_M");
             if(!share_q || ((!k6 || std::string_view(k6)!="1") && (!k7 || std::string_view(k7)!="1")))
                 throw std::invalid_argument("Engine shared O requires shared Q owner and explicit O small-M route");
         }
-        const bool share_draft = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_Q_M16",
+        const bool share_draft = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_Q_M16",
             "Engine shared draft Q M16 must be0 or1") && value.max_concurrency==2;
         if(share_draft) {
-            const auto* route=std::getenv("NINFER_EXL3_DRAFT_SMALL_M");
+            const auto* route=std::getenv("VOIDINFER_EXL3_DRAFT_SMALL_M");
             if(route && std::string_view(route)!="1")
                 throw std::invalid_argument("Engine shared draft requires enabled draft small-M route");
         }
         // Target and private-draft families share one bounded rendezvous owner,
         // but neither family is a prerequisite for executing the other.
         const bool share_projection_owner=share_q || share_draft;
-        const bool share_draft_kv = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_KV_M16",
+        const bool share_draft_kv = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_KV_M16",
             "Engine draft KV must be0 or1") && value.max_concurrency==2;
         if(share_draft_kv && !share_draft)throw std::invalid_argument("Engine draft KV requires shared draft Q M16");
-        const bool share_draft_o = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_O_M16",
+        const bool share_draft_o = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_O_M16",
             "Engine draft O must be0 or1") && value.max_concurrency==2;
         if(share_draft_o && !share_draft)throw std::invalid_argument("Engine draft O requires shared draft Q M16");
-        const bool share_draft_down = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_DOWN_M16",
+        const bool share_draft_down = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_DOWN_M16",
             "Engine draft down must be0 or1") && value.max_concurrency==2;
         if(share_draft_down && !share_draft)throw std::invalid_argument("Engine draft down requires shared draft Q M16");
-        const bool share_draft_gateup = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DRAFT_GATEUP_M16",
+        const bool share_draft_gateup = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DRAFT_GATEUP_M16",
             "Engine shared draft gate/up M16 option requires 0 or 1");
         if(share_draft_gateup && !share_draft)
             throw std::invalid_argument("Engine draft gate/up requires C2 shared draft Q M16");
         if(share_gather && !share_gateup && !share_draft_gateup)
             throw std::invalid_argument("Engine gather reuse requires shared gate/up");
         if(share_kv) {
-            const auto* route=std::getenv("NINFER_EXL3_TARGET_KV_SMALL_M");
+            const auto* route=std::getenv("VOIDINFER_EXL3_TARGET_KV_SMALL_M");
             if(!share_q || !route || std::string_view(route)!="1")
                 throw std::invalid_argument("Engine shared KV requires shared Q and explicit KV small-M route");
         }
         if(share_q) {
-            for(const auto* name:{"NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","NINFER_EXL3_EXTENDED_STREAM_REDUCTION"}) {
+            for(const auto* name:{"VOIDINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION","VOIDINFER_EXL3_EXTENDED_STREAM_REDUCTION"}) {
                 const auto* selected=std::getenv(name);
                 if(selected && std::string_view(selected)!="0")
                     throw std::invalid_argument(std::string("Engine shared target route conflict: ")+name);
             }
-            const auto* route=std::getenv("NINFER_EXL3_TARGET_Q_K6_SMALL_M");
+            const auto* route=std::getenv("VOIDINFER_EXL3_TARGET_Q_K6_SMALL_M");
             if(!route || std::string_view(route)!="1")
                 throw std::invalid_argument("Engine shared Q requires explicit Q/K6 small-M route");
         }
         if(shared_allocation_fault && (!share_projection_owner || shared_allocation_fault>4U+unsigned(share_kv)+unsigned(share_draft)+unsigned(share_o)+unsigned(share_gateup)+unsigned(share_down)+unsigned(share_head)+unsigned(share_draft_kv)+unsigned(share_draft_o)+unsigned(share_draft_down)+unsigned(share_draft_gateup)))
             throw std::invalid_argument("shared allocation fault outside selected startup menu");
         std::uint64_t device_reserve=0;
-        const bool registered_upload = read_binary_option("NINFER_EXL3_ENGINE_REGISTERED_KV_UPLOAD",
+        const bool registered_upload = read_binary_option("VOIDINFER_EXL3_ENGINE_REGISTERED_KV_UPLOAD",
             "Engine registered KV upload must be0 or1");
         const auto* registered_upload_slots_option=
-            std::getenv("NINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
+            std::getenv("VOIDINFER_EXL3_EXACT_HOST_KV_PINNED_H2D_SLOTS");
         if(registered_upload_slots_option &&
            std::string_view(registered_upload_slots_option)!="2" &&
            std::string_view(registered_upload_slots_option)!="32")
@@ -615,24 +1203,24 @@ struct Exl3EngineCore::Impl {
         const unsigned registered_upload_slots=
             registered_upload_slots_option &&
             std::string_view(registered_upload_slots_option)=="32"?32:2;
-        const bool share_pages = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGES",
+        const bool share_pages = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DEVICE_PAGES",
             "Engine shared device pages must be0 or1");
-        const bool share_attention = read_binary_option("NINFER_EXL3_ENGINE_SHARED_DEVICE_PAGE_ATTENTION",
+        const bool share_attention = read_binary_option("VOIDINFER_EXL3_ENGINE_SHARED_DEVICE_PAGE_ATTENTION",
             "shared page attention option must be 0 or 1");
-        const bool attention_staging = read_binary_option("NINFER_EXL3_ENGINE_ATTENTION_STAGING",
+        const bool attention_staging = read_binary_option("VOIDINFER_EXL3_ENGINE_ATTENTION_STAGING",
             "attention staging option must be 0 or 1");
         if(attention_staging && (share_pages || share_prefix))
             throw std::invalid_argument("attention staging and shared cache routes are exclusive");
         if(share_attention && !share_pages)throw std::invalid_argument("shared page attention requires shared device pages");
         if(share_pages && share_prefix)
             throw std::invalid_argument("shared pages and whole-prefix sharing are exclusive Engine routes");
-        if(const auto* requested=std::getenv("NINFER_EXL3_ENGINE_DEVICE_RESERVE_BYTES");requested && *requested) {
+        if(const auto* requested=std::getenv("VOIDINFER_EXL3_ENGINE_DEVICE_RESERVE_BYTES");requested && *requested) {
             const std::string_view text(requested);
             const auto parsed=std::from_chars(text.data(),text.data()+text.size(),device_reserve);
             if(parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size())
                 throw std::invalid_argument("Engine device reserve requires unsigned bytes");
         }
-        const auto* prefix_rows=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
+        const auto* prefix_rows=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX_ROWS");
         std::uint32_t parsed_prefix_rows=0;
         if(prefix_rows && *prefix_rows) {
             const std::string_view text(prefix_rows);
@@ -645,39 +1233,23 @@ struct Exl3EngineCore::Impl {
         const auto selected=[](const char* name) {
             const auto* value=std::getenv(name);return value && std::string_view(value)=="1";
         };
-        if(coherent_device) {
-            if(native64k || candidate128k ||
-               selected("NINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
-               share_prefix || registered_upload || share_pages || share_attention ||
-               attention_staging || share_projection_owner || share_kv || share_o ||
-               share_gateup || share_down || share_head || share_gather ||
-               share_draft_kv || share_draft_o || share_draft_down ||
-               share_draft_gateup || batch_greedy || conditional_b8 ||
-               concurrent_prefix_preparation || declared_prefix_preparation ||
-               request_affinity)
-                throw std::invalid_argument(
-                    "coherent-device EXL3 cannot compose with host-KV Engine candidates");
-        } else {
-            require_candidate_option_compatibility({
-                value.max_concurrency,value.max_context,
-                parsed_prefix_rows,
-                exact_host,oscar_only,native64k,candidate128k,
-                selected("NINFER_EXL3_NATIVE_CONTINUATION16"),device_prefix,share_prefix,
-                registered_upload,share_pages,share_attention,attention_staging,
-                share_q,share_kv,share_o,share_gateup,share_down,share_head,share_gather,
-                selected("NINFER_EXL3_K6_SMALL_M_STREAM_REDUCTION") ||
-                    selected("NINFER_EXL3_EXTENDED_STREAM_REDUCTION"),
-                share_draft,share_draft_kv,share_draft_o,share_draft_down,
-                share_draft_gateup,device_greedy,batch_greedy});
-        }
-        const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("NINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
+        if(selected("VOIDINFER_EXL3_NATIVE_CONTINUATION16") || device_prefix ||
+           share_prefix || registered_upload || share_pages || share_attention ||
+           attention_staging || share_projection_owner || share_kv || share_o ||
+           share_gateup || share_down || share_head || share_gather ||
+           share_draft_kv || share_draft_o || share_draft_down ||
+           share_draft_gateup || batch_greedy || conditional_b8 ||
+           concurrent_prefix_preparation || declared_prefix_preparation ||
+           request_affinity)
+            throw std::invalid_argument(
+                "coherent-device EXL3 cannot compose with host-KV Engine candidates");
+        const auto host_metadata_limit=exl3_host_metadata_limit(std::getenv("VOIDINFER_EXL3_ENGINE_HOST_METADATA_LIMIT_BYTES"));
         if(!share_pages && prefix_rows&&std::string(prefix_rows)=="16384"&&value.max_concurrency!=1)
             throw std::invalid_argument("EXL3 Engine device prefix rows16384 require physicalC1");
-        if((value.max_concurrency!=1 && value.max_concurrency!=2) || value.enable_vision || value.use_cuda_graph || value.hierarchical_vericache.enabled ||
-            !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16 ||
-            value.speculative.backend!=SpeculativeBackend::DFlash2 || value.speculative.draft_tokens!=7)
-            throw std::invalid_argument("EXL3 text requires C1 or explicit C2/eager/DFlash2-K7 and disabled Vision");
-        const auto* private_prefix_option=std::getenv("NINFER_EXL3_HOST_KV_DEVICE_PREFIX");
+        if(value.max_concurrency<1 || value.max_concurrency>kMaxLanes ||
+            !value.max_pending_requests || !value.pending_timeout_ms || value.max_context<16)
+            throw std::invalid_argument("Engine requires C1..C8 lanes and a bounded pending queue");
+        const auto* private_prefix_option=std::getenv("VOIDINFER_EXL3_HOST_KV_DEVICE_PREFIX");
         // Attention staging has independent reserved storage.  The staged
         // producer may seed that storage from this lane-private prefix and
         // upload only the uncached suffix; both candidates remain default-off.
@@ -687,7 +1259,7 @@ struct Exl3EngineCore::Impl {
             std::string_view(prefix_rows)!="16384")
             throw std::invalid_argument("device prefix row menu4096/16384");
         const int private_prefix_capacity=prefix_rows && std::string_view(prefix_rows)=="16384"?16384:4096;
-        const auto* segmented_prefix_option=std::getenv("NINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
+        const auto* segmented_prefix_option=std::getenv("VOIDINFER_EXL3_SEGMENTED_DEVICE_PREFIX");
         const bool segmented_prefix_requested=segmented_prefix_option && std::string_view(segmented_prefix_option)=="1";
         const bool shared_workspace_unwind_fault=share_projection_owner && context_startup_fault==83 && shared_allocation_fault==2;
         const bool valid_startup_fault=context_startup_fault==128 || context_startup_fault==31 || context_startup_fault<=11*value.max_concurrency ||
@@ -752,10 +1324,15 @@ struct Exl3EngineCore::Impl {
         // floor, including mandatory opted-in attention metadata; weights,
         // other lane resources and runtime owners still need full admission.
         const auto cfg=nlohmann::json::parse(resources.generation_config_json);
-        SamplingPreset preset;
-        preset.temperature=cfg.value("temperature",1.0F);preset.top_k=cfg.value("top_k",20);preset.top_p=cfg.value("top_p",0.95F);
-        defaults={preset,preset};
-        Exl3LoadOptions loading;loading.verified_dual_manifest=value.exl3_package->verified_dual_manifest;
+        // generation_config.json carries the thinking preset; the model card's
+        // instruct (non-thinking) preset is temperature 0.7, top_p 0.8, top_k 20,
+        // presence_penalty 1.5.
+        SamplingPreset thinking;
+        thinking.temperature=cfg.value("temperature",1.0F);thinking.top_k=cfg.value("top_k",20);thinking.top_p=cfg.value("top_p",0.95F);
+        SamplingPreset non_thinking;
+        non_thinking.temperature=0.7F;non_thinking.top_k=20;non_thinking.top_p=0.8F;non_thinking.presence_penalty=1.5F;
+        defaults={thinking,non_thinking};
+        Exl3LoadOptions loading;loading.verified_dual_manifest=value.model.verified_dual_manifest;
         // Deliberate pre-authority construction boundary: target/draft immutable
         // weights (and qualified vision weights) are allocated by their artifact
         // loaders before an Engine coordinator exists. Their authoritative byte
@@ -765,26 +1342,44 @@ struct Exl3EngineCore::Impl {
         // roots is planned and transacted through `coordinator`. A future loader
         // preflight API must return the same owner/domain/extent manifest before
         // this boundary before weight construction can join startup reservation.
-        target=Exl3TextModel::load(value.exl3_package->target_directory,value.max_context,loading);
-        if(public_media_enabled) {
-            vision_model=make_bounded_shared<Exl3VisionModel>(
-                value.exl3_package->target_directory);
-            vision=make_bounded_shared<Exl3VisionContext>(*vision_model,1024,
-                Exl3EncodedMediaCacheLimits{});
+        if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")) {
+            cudaFree(nullptr);
+            std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
+            std::fprintf(stderr,"STARTUP_MEMORY before_target used=%.1f MiB",(t-f)/1048576.0);
+            std::fputc(10,stderr);
         }
-        drafts[0]=Exl3Dflash2DraftModel::load_impl(value.exl3_package->draft_directory,true);
+        target=Exl3TextModel::load(value.model.target_directory,value.max_context,loading);
+        const auto trace_free=[](const char* stage) {
+            if(!std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))return;
+            std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);
+            std::fprintf(stderr,"STARTUP_MEMORY %s used=%.1f MiB",stage,(t-f)/1048576.0);
+            std::fputc(10,stderr);
+        };
+        trace_free("after_target");
+        if(dense_vision_enabled) {
+            const auto vision_begin=Clock::now();
+            dense_vision=std::make_unique<Exl3DenseVision>(value.model.vision_directory);
+            {
+                cudaStream_t warm=nullptr;
+                check(cudaStreamCreateWithFlags(&warm,cudaStreamNonBlocking));
+                struct Destroy {cudaStream_t s;~Destroy(){(void)cudaStreamDestroy(s);}} destroy{warm};
+                dense_vision->warm_up(warm);
+            }
+            std::fprintf(stderr,"EXL3 vision: BF16 tower %.1f MiB pinned host (streamed per request), ready in %.1f s\n",
+                dense_vision->host_bytes()/1048576.0,seconds(vision_begin));
+        }
+        drafts[0]=Exl3Dflash2DraftModel::load_impl(value.model.draft_directory,true);
+        trace_free("after_draft");
         // Contexts and optional caches join after the single initial bind.
-        std::size_t scratch=vision?vision->device_bytes():0;
+        std::size_t scratch=0;
         for(std::uint32_t i=0;i<value.max_concurrency;++i){
             if(i)drafts[i]=drafts[0]->create_execution_impl(true);
         }
-        load.target="qwen3.8-27b/exl3";load.model_id="SC_6.00bpw_H6_V6";load.weights_id="SC_6.00bpw_H6_V6";
+        load.target="qwen3.8-27b/exl3";load.model_id=identity.artifact_identity;load.weights_id=identity.artifact_identity;
         load.load_seconds=seconds(begin);const auto& transfer=target->load_stats();
-        load.artifact_bytes_read=transfer.source_bytes[0]+transfer.source_bytes[1];load.peak_staging_bytes=transfer.staging_host_bytes;
+        load.model_bytes_read=transfer.source_bytes[0]+transfer.source_bytes[1];load.peak_staging_bytes=transfer.staging_host_bytes;
         memory.device=value.device;memory.max_context=value.max_context;
-        memory.kv_cache=value.kv_cache;
-        const auto shared_weight_bytes=target->model_bytes()+drafts[0]->weight_bytes()+
-            (vision_model?vision_model->device_bytes():0);
+        const auto shared_weight_bytes=target->model_bytes()+drafts[0]->weight_bytes();
         memory.weights={shared_weight_bytes,shared_weight_bytes,shared_weight_bytes};
         memory.workspace={scratch,scratch,scratch};memory.runtime_reservation_bytes=scratch;
         // Actual startup allocation groups, retained through every admission and
@@ -793,16 +1388,6 @@ struct Exl3EngineCore::Impl {
         // dynamic state/graph growth is separately reserved at its real caller.
         Exl3ResourceInventory inventory;
         inventory.add({target,0,Domain::device,target->model_bytes()});
-        if(vision_model) {
-            inventory.add({vision_model,0,Domain::device,vision_model->device_bytes()});
-            inventory.add({vision_model,1,Domain::host_metadata,
-                bounded_shared_allocation_bytes<Exl3VisionModel>()});
-        }
-        if(vision) {
-            inventory.add({vision,0,Domain::device,vision->device_bytes()});
-            inventory.add({vision,1,Domain::host_metadata,
-                bounded_shared_allocation_bytes<Exl3VisionContext>()});
-        }
         stats.target_allocation_owner_metadata_bytes=target->allocation_owner_metadata_bytes();
         if(stats.target_allocation_owner_metadata_bytes)
             inventory.add({target,1,Domain::host_metadata,stats.target_allocation_owner_metadata_bytes});
@@ -951,7 +1536,7 @@ struct Exl3EngineCore::Impl {
             stats.draft_linear_owner_metadata_bytes+=7*Exl3CudaLinearWorkspace::metadata_bytes();
             stats.draft_generic_owner_metadata_bytes+=drafts[0]->generic_owner_metadata_bytes();
         }
-        if(value.max_concurrency==2) {
+        for(std::uint32_t lane=1;lane<value.max_concurrency;++lane) {
             Exl3ResourceInventory::Requirement required;required.configuration=0x44524654434C;
             required.add(Domain::device,1,drafts[0]->execution_bytes_required());
             required.add(Domain::host_metadata,1,drafts[0]->execution_owner_metadata_bytes());
@@ -960,21 +1545,21 @@ struct Exl3EngineCore::Impl {
                 if(draft_clone_fault==5 || draft_clone_fault==6)throw std::logic_error("draft clone cap refusal reached allocator");
                 if(draft_clone_fault==1)throw std::runtime_error("injected Engine draft clone preconstruction failure");
                 if(draft_clone_fault==7)Exl3CudaLinearWorkspace::fail_constructor_cleanup_for_test(true);
-                drafts[1]->materialize_private_execution(&coordinator);
+                drafts[lane]->materialize_private_execution(&coordinator);
                 if(draft_clone_fault==2)throw std::runtime_error("injected Engine draft clone precommit failure");
-                if(draft_clone_fault==8 && !drafts[1]->fail_generic_retirement_for_test())throw std::logic_error("draft generic failure owner missing");
-                auto actual=drafts[1]->execution_resources(drafts[1],draft_clone_fault==3 || draft_clone_fault==8,draft_clone_fault==4);
+                if(draft_clone_fault==8 && !drafts[lane]->fail_generic_retirement_for_test())throw std::logic_error("draft generic failure owner missing");
+                auto actual=drafts[lane]->execution_resources(drafts[lane],draft_clone_fault==3 || draft_clone_fault==8,draft_clone_fault==4);
                 return actual;
-            },[&]() noexcept {drafts[1].reset();},[&]() noexcept {
+            },[&]() noexcept {drafts[lane].reset();},[&]() noexcept {
                 if(Exl3Dflash2DraftModel::generic_quarantined_allocations() || Exl3CudaLinearWorkspace::quarantined_workspaces())
                     coordinator.seal_failed_startup_retirement();
             });
-            drafts[1]->finish_constructor_credits();
-            scratch+=drafts[1]->execution_bytes();
+            drafts[lane]->finish_constructor_credits();
+            scratch+=drafts[lane]->execution_bytes();
             memory.workspace={scratch,scratch,scratch};memory.runtime_reservation_bytes=scratch;
-            stats.draft_execution_owner_metadata_bytes+=drafts[1]->execution_owner_metadata_bytes();
+            stats.draft_execution_owner_metadata_bytes+=drafts[lane]->execution_owner_metadata_bytes();
             stats.draft_linear_owner_metadata_bytes+=7*Exl3CudaLinearWorkspace::metadata_bytes();
-            stats.draft_generic_owner_metadata_bytes+=drafts[1]->generic_owner_metadata_bytes();
+            stats.draft_generic_owner_metadata_bytes+=drafts[lane]->generic_owner_metadata_bytes();
         }
         {
             for(std::uint32_t i=0;i<value.max_concurrency;++i) {
@@ -989,8 +1574,16 @@ struct Exl3EngineCore::Impl {
                         throw std::logic_error("Engine stream startup reservation identity");
                     if(context_startup_fault==31)throw std::logic_error("stream credit refusal reached allocator");
                     if(stream_fault==1)throw std::runtime_error("injected Engine stream preconstruction failure");
-                    stream_owner=make_bounded_shared<ExecutionStream>(value.max_concurrency==2);
-                    if(value.max_concurrency==2)
+                    // One lane with the asynchronous VeriCache line: its own
+                    // highest-priority stream, so decode kernels win the SMs
+                    // the line's PCIe-bound exact pass contends for.
+                    const bool priority_lane=exact_line_planned(value) && vericache_async_enabled();
+                    stream_owner=make_bounded_shared<ExecutionStream>(value.max_concurrency>=2 || priority_lane);
+                    if(priority_lane) {
+                        int least=0,greatest=0;
+                        check(cudaDeviceGetStreamPriorityRange(&least,&greatest));
+                        check(cudaStreamCreateWithPriority(&stream_owner->value,cudaStreamNonBlocking,greatest));
+                    } else if(value.max_concurrency>=2)
                         check(cudaStreamCreateWithFlags(&stream_owner->value,cudaStreamNonBlocking));
                     if(value.max_concurrency==2 && context_startup_fault==79+i) {
                         stream_owner->destroy_fault_for_test=static_cast<int>(cudaErrorUnknown);
@@ -1018,16 +1611,20 @@ struct Exl3EngineCore::Impl {
                 // The coherent route admits the ordinary graph families unless
                 // the eager fallback is selected.  The families themselves are
                 // selected by their own switches and captured at context creation.
+                static const bool lane_memory_trace=std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")!=nullptr;
+                const auto free_mib=[] {std::size_t f=0,t=0;cudaMemGetInfo(&f,&t);return f/1048576.0;};
+                const double lane_free0=lane_memory_trace?free_mib():0.0;
                 auto context=target->create_context_reserved(coordinator,true,
                     context_startup_fault>=90 && context_startup_fault<=100?context_startup_fault-73:
                     (context_startup_fault==88?16:(context_startup_fault==86?11:(fault<=4?fault:0))),
-                    public_media_enabled,!coherent_device || coherent_ordinary_graphs);
+                    false,coherent_ordinary_graphs);
                 const auto base_context_bytes=context->persistent_bytes();
                 context->prepare_continuation_reserved(coordinator,8,
                     context_startup_fault==89?6:(context_startup_fault==87?5:(fault>=5 && fault<=7?fault-4:0)));
                 const auto continuation_bytes=context->persistent_bytes()-base_context_bytes;
+                const double lane_free1=lane_memory_trace?free_mib():0.0;
                 const auto before_repair_checkpoint=context->persistent_bytes();
-                const auto* repair_checkpoint=std::getenv("NINFER_EXL3_REPAIR_CHECKPOINT");
+                const auto* repair_checkpoint=std::getenv("VOIDINFER_EXL3_REPAIR_CHECKPOINT");
                 if(repair_checkpoint && std::string_view(repair_checkpoint)!="0" &&
                     std::string_view(repair_checkpoint)!="1")
                     throw std::invalid_argument("repair checkpoint must be0 or1");
@@ -1039,8 +1636,12 @@ struct Exl3EngineCore::Impl {
                 }
                 const auto repair_checkpoint_bytes=
                     context->persistent_bytes()-before_repair_checkpoint;
+                const double lane_free2=lane_memory_trace?free_mib():0.0;
                 lanes[i]=Exl3Dflash2Execution::create_reserved(coordinator,std::move(context),
                     drafts[i],identity.contract(),streams[i]->value,streams[i],fault>=8?fault-7:0);
+                if(lane_memory_trace)std::fprintf(stderr,
+                    "LANE_MEMORY lane=%u context+continuation=%.1f repair=%.1f execution=%.1f MiB\n",i,
+                    lane_free0-lane_free1,lane_free1-lane_free2,lane_free2-free_mib());
                 ++stats.reserved_context_startup_lanes;
                 stats.reserved_context_startup_device_bytes+=base_context_bytes;
                 stats.reserved_context_fixed_owner_metadata_bytes+=Exl3TextContext::fixed_owner_metadata_bytes();
@@ -1075,7 +1676,7 @@ struct Exl3EngineCore::Impl {
             memory.workspace={scratch,scratch,scratch};memory.runtime_reservation_bytes=scratch;
         }
         {
-            std::array<Exl3TextContext*,2> contexts{};
+            std::array<Exl3TextContext*,kMaxLanes> contexts{};
             for(std::uint32_t i=0;i<value.max_concurrency;++i)contexts[i]=&lanes[i]->context();
             Exl3TextContext::reserve_reconstruction_lanes(coordinator,
                 std::span(contexts.data(),value.max_concurrency),reconstruction_fallback);
@@ -1262,24 +1863,26 @@ struct Exl3EngineCore::Impl {
             }
         }
         const auto taps=Exl3EngineTapRequirements::for_lanes(value.max_concurrency,sizeof(DraftTapStaging));
-        std::array<std::shared_ptr<DraftTapStaging>,2> prepared_staging;
+        std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> prepared_staging;
         coordinator.allocate_startup_resources(taps,[&](std::uint64_t configuration) {
             if(configuration!=value.max_concurrency)
                 throw std::logic_error("Engine tap allocation configuration changed");
             Exl3ResourceInventory actual;
             // Keep partial allocations private until the complete C1/C2 batch
             // has been acquired. This factory enqueues no consumers.
-            std::array<std::shared_ptr<DraftTapStaging>,2> pending;
+            std::array<std::shared_ptr<DraftTapStaging>,kMaxLanes> pending;
             unsigned allocated_planes=0;
             for(std::uint32_t i=0;i<value.max_concurrency;++i) {
                 pending[i]=std::make_shared<DraftTapStaging>();
+                check(cudaMalloc(reinterpret_cast<void**>(&pending[i]->first_occurrence),
+                    Exl3EngineTapRequirements::occurrence_bytes));
                 for(auto& p:pending[i]->pointers) {
                     check(cudaMalloc(reinterpret_cast<void**>(&p),Exl3EngineTapRequirements::plane_bytes));
                     if(context_startup_fault==40+(++allocated_planes))
                         throw std::runtime_error("injected Engine tap staging allocation failure");
                 }
                 actual.add({pending[i],0,Domain::device,
-                    Exl3EngineTapRequirements::layers*Exl3EngineTapRequirements::plane_bytes-
+                    Exl3EngineTapRequirements::lane_device_bytes-
                         (context_startup_fault==52 && i==0?1:0)});
                 actual.add({pending[i],1,Domain::host_metadata,sizeof(DraftTapStaging)-
                     (context_startup_fault==53 && i==0?1:0)});
@@ -1293,9 +1896,9 @@ struct Exl3EngineCore::Impl {
         stats.reserved_engine_tap_metadata_bytes=taps.units[static_cast<unsigned>(Domain::host_metadata)];
         scratch+=stats.reserved_engine_tap_device_bytes;
         const bool skip_context_hooks=[] {
-            const auto* skip=std::getenv("NINFER_EXL3_TEST_ENGINE_SKIP_CONTEXT_HOOKS");
+            const auto* skip=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_SKIP_CONTEXT_HOOKS");
             if(!skip || std::string_view(skip)!="1")return false;
-            const auto* root=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+            const auto* root=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH");
             if(!root || std::string_view(root)!="1")
                 throw std::invalid_argument("skip context hooks requires diagnostic root probe");
             return true;
@@ -1610,6 +2213,86 @@ struct Exl3EngineCore::Impl {
             stats.driver_unknown_device_bytes=attribution.driver_unknown_bytes;
             stats.driver_unknown_device_bytes_available=true;
         }
+        if(value.max_concurrency>=2) {
+            const char* batched=std::getenv("VOIDINFER_EXL3_BATCHED_ROUNDS");
+            if(!batched || std::string_view(batched)!="0") {
+                const char* wait=std::getenv("VOIDINFER_EXL3_BATCHED_ROUND_WAIT_US");
+                // Lanes [Gg, Gg+G) share coordinator g; the earliest lane of a
+                // group leads its forward, one captured graph per group.
+                const std::uint32_t group_lanes=batched_group_lanes();
+                for(std::uint32_t first=0;first<value.max_concurrency;first+=group_lanes) {
+                    const auto end=std::min<std::uint32_t>(first+group_lanes,value.max_concurrency);
+                    if(end-first<2)break;
+                    // Lanes wait for late lanes: a missed lane otherwise runs a
+                    // narrow (split or solo) round and stays out of phase.
+                    // Sampled LCB at C8 (32 x 4,096): 5 / 10 / 20 / 40 ms ->
+                    // 341 / 348 / 365 / 372 tok/s; C4 (8 x 6,144): 5 vs 20 ms
+                    // 87.5 / 86.4 vs 90.7 / 92.8 kept tok/s per lane.
+                    const int default_wait=end-first>4?40000:20000;
+                    auto group=std::make_unique<Exl3BatchedVerifyCoordinator>(
+                        std::chrono::microseconds(wait?std::atoi(wait):default_wait));
+                    for(std::uint32_t i=first;i<end;++i) {
+                        group->register_context(*lanes[i]->context_owner_for_device_round());
+                        lane_batched_verify[i]=group.get();
+                    }
+                    const char* graphs=std::getenv("VOIDINFER_EXL3_BATCHED_GRAPHS");
+                    if(!graphs || std::string_view(graphs)!="0")
+                    for(const auto& members:group->groups()) {
+                        std::vector<Exl3TextContext*> peers(members.begin()+1,members.end());
+                        // Full-width rounds (VOIDINFER_EXL3_ROUND_WIDTH rows per lane).
+                        const int width=static_cast<int>(round_width_limit());
+                        const std::vector<int> rows(peers.size(),width);
+                        members[0]->prepare_batched_continuation_graph(peers,width,rows);
+                    }
+                    // VOIDINFER_EXL3_BATCHED_DRAFT=0 keeps every lane's draft
+                    // proposals private (one draft forward per lane).
+                    static const bool batched_draft=[] {
+                        const char* value=std::getenv("VOIDINFER_EXL3_BATCHED_DRAFT");
+                        return !value || std::string_view(value)!="0";
+                    }();
+                    for(std::uint32_t i=first;i<end;++i) {
+                        if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+                            std::fprintf(stderr,"LANE_CONTEXT lane=%u context=%p\n",i,
+                                static_cast<const void*>(lanes[i]->context_owner_for_device_round().get()));
+                        lanes[i]->context_owner_for_device_round()->set_batched_verify(group.get());
+                        if(batched_draft)drafts[i]->set_batched_propose(group.get());
+                    }
+                    batched_verify.push_back(std::move(group));
+                }
+            }
+        }
+        if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE")) {
+            const auto mib=[](std::uint64_t bytes){return bytes/1048576.0;};
+            std::fprintf(stderr,"ENGINE_MEMORY lanes=%u context=%.1f continuation=%.1f repair=%.1f lane=%.1f reconstruction=%.1f taps=%.1f attention_stage=%.1f draft_scratch_total=%.1f MiB\n",
+                value.max_concurrency,mib(stats.reserved_context_startup_device_bytes),
+                mib(stats.reserved_continuation_startup_device_bytes),
+                mib(stats.reserved_repair_checkpoint_startup_device_bytes),
+                mib(stats.reserved_lane_startup_device_bytes),mib(stats.reconstruction_device_bytes),
+                mib(stats.reserved_engine_tap_device_bytes),mib(stats.attention_stage_device_bytes),
+                mib(memory.runtime_reservation_bytes));
+            std::size_t free_bytes=0,total_bytes=0;cudaMemGetInfo(&free_bytes,&total_bytes);
+            std::fprintf(stderr,"ENGINE_MEMORY target_weights=%.1f draft_weights=%.1f draft_execution=%.1f x%u free=%.1f MiB"
+                ,mib(target->model_bytes()),mib(drafts[0]->weight_bytes()),mib(drafts[0]->execution_bytes()),
+                value.max_concurrency,mib(free_bytes));
+            std::fputc(10,stderr);
+        }
+        if(exact_line_planned(value))
+            for(std::uint32_t i=0;i<exact_line_count(value.max_concurrency);++i) {
+                // Eager only: graphs captured at construction would keep the
+                // line's own planes, which make_exact_line replaces.
+                std::shared_ptr<Exl3TextContext> line=target->create_context_reserved(coordinator,true,0,false,false,true);
+                line->make_exact_line(*lanes[i]->context_owner_for_device_round());
+                line->prepare_continuation_reserved(coordinator,kFoldRows,0);
+                line->bind_request_compatibility("exact-line");
+                exact_line_pools.push_back(std::make_unique<Exl3ExactLinePool>(std::move(line)));
+            }
+        // The overlapped GDN retained-prefix repair (side stream) corrupts
+        // recurrent state under concurrent lanes (VeriCache corrections with
+        // 12-20 logit gaps at C3; clean when the repair replays in order on the
+        // target stream). Root cause open; C1 keeps the overlap.
+        if(value.max_concurrency>=2)
+            for(std::uint32_t i=0;i<value.max_concurrency;++i)
+                lanes[i]->context_owner_for_device_round()->set_gdn_repair_overlap(false);
         try{for(std::uint32_t i=0;i<value.max_concurrency;++i)workers[i]=std::thread([this,i]{loop(i);});}
         catch(...){
             {std::lock_guard lock(mutex);stopping=true;}
@@ -1636,7 +2319,7 @@ struct Exl3EngineCore::Impl {
             changed.notify_all();for(auto& worker:workers)if(worker.joinable())worker.join();
             retirement.begin(first_execution_failure!=nullptr);
             auto error=retirement_fault?static_cast<cudaError_t>(std::exchange(retirement_fault,0)):cudaSetDevice(options.device);
-            if(error==cudaSuccess)error=cudaDeviceSynchronize();
+            if(error==cudaSuccess)error=voidinfer::cuda_device_synchronize_outside_capture();
             if(error!=cudaSuccess){retirement.complete(static_cast<int>(error));return retirement.result();}
             if(workspace_cleanup_failed()) {
                 retirement.observe_cleanup_failure(-2);return retirement.result();
@@ -1732,7 +2415,7 @@ struct Exl3EngineCore::Impl {
     };
     std::optional<PreferredLane> preferred_lane_locked(const Request& request) {
         if(!request_affinity || options.max_concurrency<2)return std::nullopt;
-        std::array<Exl3ReadyLaneLocality,2> candidates{};
+        std::array<Exl3ReadyLaneLocality,kMaxLanes> candidates{};
         const auto input=request.ready_work.input_tokens();
         for(std::size_t index=0;index<options.max_concurrency;++index) {
             auto& candidate=candidates[index];candidate.lane=index;
@@ -1777,6 +2460,25 @@ struct Exl3EngineCore::Impl {
         std::uint32_t cancelled_rejected=0,physical_rejected=0;
         std::uint32_t identity_rejected=0,affinity_deferred=0;
     };
+    std::optional<std::size_t> coherent_home_lane_locked(Request& request) {
+        if(!request.affinity_resolved) {
+            request.affinity_resolved=true;
+            const auto input=request.ready_work.input_tokens();
+            std::shared_ptr<const Exl3VeriCacheRequest> best;
+            for(const auto& candidate:cache.roots())
+                if(candidate && candidate->compact_draft() && !candidate->prepared_identity() &&
+                   candidate->token_count()>=64 && candidate->token_count()<input.size() &&
+                   (!best || candidate->token_count()>best->token_count()) &&
+                   candidate->matches_tokens(input.first(candidate->token_count())))
+                    best=candidate;
+            request.affinity_root=best;
+        }
+        const auto root=request.affinity_root.lock();
+        if(!root || !root->state())return std::nullopt;
+        for(std::size_t index=0;index<options.max_concurrency;++index)
+            if(lanes[index] && lanes[index]->context().kv_lane_resident(*root->state()))return index;
+        return std::nullopt;
+    }
     std::optional<ReadyRequestSelection> ready_request_locked(std::size_t lane_index) {
         std::optional<ReadyRequestSelection> selected;
         std::optional<Exl3ReadyRequestCandidate> selected_age;
@@ -1803,7 +2505,8 @@ struct Exl3EngineCore::Impl {
             const bool identity_compatible=signature.device==options.device &&
                 Exl3ReadyExecutionSignature::same_owner(signature.model_owner,target);
             const bool physical_resources=!active[lane_index] && lanes[lane_index] &&
-                drafts[lane_index] && request->result_lease.has_value();
+                drafts[lane_index] && request->result_lease.has_value() &&
+                l0_codes_fit_locked(*request,lane_index);
             if(cancelled)increment(cancelled_rejected);
             else if(!identity_compatible)increment(identity_rejected);
             else if(!physical_resources)increment(physical_rejected);
@@ -1812,6 +2515,14 @@ struct Exl3EngineCore::Impl {
                 eligible=preferred && preferred->lane==lane_index;
                 affine=eligible && preferred->affine;
                 locality_costs_complete=eligible && preferred->locality_costs_complete;
+                if(!eligible)increment(affinity_deferred);
+            } else if(options.max_concurrency>=2) {
+                // A conversation's next turn goes to the lane still holding its
+                // history (lane-backed root pages, no restore copy) unless that
+                // lane is busy; any lane may take requests without a home lane.
+                const auto home=coherent_home_lane_locked(*request);
+                eligible=!home || *home==lane_index || active[*home];
+                affine=eligible && home && *home==lane_index;
                 if(!eligible)increment(affinity_deferred);
             } else {
                 eligible=true;
@@ -1881,6 +2592,79 @@ struct Exl3EngineCore::Impl {
             throw;
         }
     }
+    // Vision prompt on a coherent-device lane: every media item is encoded by
+    // the BF16 tower into the context's media rows (scattered over its
+    // placeholder tokens), and the frontend's M-RoPE positions become the
+    // context's rotary map: prompt rows up to the last one whose position is
+    // not row+rope_delta use the table, every later row (and every generated
+    // row) rotates at row+rope_delta. The DFlash2 draft keeps cache positions.
+    void prepare_media_prompt(Request& request,Exl3TextContext& context,cudaStream_t stream) {
+        const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
+        const auto begin=Clock::now();
+        const auto plan=targets::qwen3_6::plan_vision_control(prepared);
+        const auto control=targets::qwen3_6::build_vision_control(prepared,plan,0);
+        if(control.items.size()!=prepared.vision_items.size() ||
+           prepared.media_payloads.size()!=prepared.vision_items.size())
+            throw std::invalid_argument("EXL3 vision control does not cover the prepared items");
+        std::size_t total=0;
+        for(const auto& item:control.items)total+=item.merged_count;
+        auto* rows=context.media_rows_buffer(total,stream);
+        std::vector<Exl3TextContext::MediaRowSpan> spans;
+        std::size_t offset=0;
+        double encode_ms=0;
+        for(std::size_t i=0;i<control.items.size();++i) {
+            if(request.cancelled)throw RequestError(RequestErrorKind::Cancelled,"EXL3 vision cancelled");
+            const auto& item=control.items[i];
+            const auto& payload=prepared.media_payloads[i];
+            if(!payload || item.scatter_indices.size()!=item.merged_count)
+                throw std::invalid_argument("EXL3 vision item payload or scatter extent");
+            const auto stats=dense_vision->encode(*payload,item,
+                rows+offset*Exl3DenseVision::kOutputWidth,stream);
+            encode_ms+=stats.encode_ms;
+            if(const auto* dump=std::getenv("VOIDINFER_EXL3_VISION_DUMP"); dump && *dump) {
+                std::vector<std::uint16_t> host(item.merged_count*Exl3DenseVision::kOutputWidth);
+                check(cudaMemcpy(host.data(),rows+offset*Exl3DenseVision::kOutputWidth,
+                    host.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost));
+                const auto path=std::string(dump)+"/vision_"+std::to_string(request.ready_work.generation())+
+                    "_"+std::to_string(i)+"_"+std::to_string(item.grid.temporal)+"x"+
+                    std::to_string(item.grid.height)+"x"+std::to_string(item.grid.width)+".f16";
+                if(auto* file=std::fopen(path.c_str(),"wb")) {
+                    std::fwrite(host.data(),sizeof(std::uint16_t),host.size(),file);
+                    std::fclose(file);
+                }
+            }
+            // Scatter indices are ascending prompt rows; consecutive runs are spans.
+            for(std::size_t j=0;j<item.scatter_indices.size();) {
+                std::size_t k=j+1;
+                while(k<item.scatter_indices.size() &&
+                      item.scatter_indices[k]==item.scatter_indices[k-1]+1)++k;
+                spans.push_back({item.scatter_indices[j],static_cast<int>(k-j),offset+j});
+                j=k;
+            }
+            offset+=item.merged_count;
+        }
+        context.set_media_rows(std::move(spans));
+        const auto t=prepared.position_axis(0),h=prepared.position_axis(1),w=prepared.position_axis(2);
+        const auto ids=request.ready_work.input_tokens();
+        if(t.size()!=ids.size() || h.size()!=ids.size() || w.size()!=ids.size())
+            throw std::invalid_argument("EXL3 vision M-RoPE positions do not cover the prompt");
+        const auto delta=prepared.rope_delta;
+        std::size_t table_rows=ids.size();
+        while(table_rows>0) {
+            const auto row=static_cast<std::int64_t>(table_rows-1)+delta;
+            if(t[table_rows-1]!=row || h[table_rows-1]!=row || w[table_rows-1]!=row)break;
+            --table_rows;
+        }
+        std::vector<std::int32_t> table(table_rows*3);
+        for(std::size_t row=0;row<table_rows;++row) {
+            table[row*3]=t[row];table[row*3+1]=h[row];table[row*3+2]=w[row];
+        }
+        context.set_rope_map(table,delta,stream);
+        if(std::getenv("VOIDINFER_EXL3_VISION_STATS"))
+            std::fprintf(stderr,"VISION_PROMPT items=%zu media_tokens=%zu prompt=%zu table_rows=%zu delta=%d encode_ms=%.1f total_ms=%.1f\n",
+                control.items.size(),total,ids.size(),table_rows,delta,encode_ms,
+                std::chrono::duration<double,std::milli>(Clock::now()-begin).count());
+    }
     void execute_coherent_device(Request& request,std::size_t lane_index) {
         auto& lane=lanes[lane_index];
         auto& draft=*drafts[lane_index];
@@ -1888,15 +2672,14 @@ struct Exl3EngineCore::Impl {
         auto& output=request.output;
         const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
         const auto ids=request.ready_work.input_tokens();
-        if(lane_index!=0 || prepared.has_media() || ids.size()<2048 ||
-           ids.size()>options.max_context || request.sampling ||
+        const bool media=prepared.has_media();
+        if((media && !dense_vision) || ids.empty() ||
+           ids.size()>options.max_context ||
            !request.options.stop.strings.empty() ||
            request.options.execution.thinking.budget.has_value() ||
-           request.options.execution.sampling.temperature!=0 ||
-           request.options.execution.sampling.presence_penalty!=0 ||
            request.options.execution.sampling.frequency_penalty!=0)
             throw std::invalid_argument(
-                "coherent-device EXL3 requires C1 greedy text with saturated draft ring");
+                "coherent-device EXL3 requires a prompt without frequency penalty, stop strings or a thinking budget (media needs --vision)");
         if(request.cancelled) {result.finish_reason=FinishReason::Cancelled;return;}
         if(Clock::now()>=request.deadline)
             throw RequestError(RequestErrorKind::QueueTimeout,
@@ -1909,6 +2692,7 @@ struct Exl3EngineCore::Impl {
         std::unique_ptr<Exl3FastDeviceRound> round;
         std::optional<std::uint64_t> pending_ticket;
         std::vector<std::int64_t> committed;
+        PresenceTrack presence;
         auto root=Root{};
         std::vector<std::int64_t> terminal_tokens;
         if(request.options.stop.include_model_defaults)
@@ -1916,7 +2700,7 @@ struct Exl3EngineCore::Impl {
                 terminal_tokens.push_back(token);
         for(const auto token:request.options.stop.token_ids)
             terminal_tokens.push_back(token);
-        if(const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+        if(const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH");
            value && std::string_view(value)=="1") {
             std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_TERMINAL ids=");
             for(const auto token:terminal_tokens)
@@ -1924,22 +2708,128 @@ struct Exl3EngineCore::Impl {
             std::fprintf(stderr,"\n");
         }
         const auto& vericache=Exl3VeriCacheConfig::get();
+        std::optional<PromptPass> prefill_pass;
+        runtime_memory_mark("prefill_begin",lane_index);
+        prefill_pass.emplace(*this,stream);
+        // Long prompts (several L0 blocks) let the other lanes' waiting
+        // verification passes run between blocks: their decoding would
+        // otherwise stall for the whole ingestion (VOIDINFER_EXL3_PREFILL_YIELD=0 off).
+        static const bool prefill_yield=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_YIELD");
+            return !value || std::string_view(value)!="0";
+        }();
+        struct PrefillYield {
+            Exl3TextContext* context=nullptr;
+            ~PrefillYield() {if(context)context->set_prefill_yield({});}
+        } yield_scope;
+        // VOIDINFER_EXL3_PREFILL_POLICY: balanced (default; the yield above),
+        // decode-priority (at each block boundary the queue stays released
+        // until every other decoding lane completed VOIDINFER_EXL3_PREFILL_DECODE_ROUNDS
+        // rounds, default 2, at most VOIDINFER_EXL3_PREFILL_DECODE_WAIT_MS, default 120)
+        // or prefill-priority (no yield). Only the timing between blocks
+        // changes: the blocks and their arithmetic are the same.
+        static const int prefill_policy=[] {
+            const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_POLICY");
+            if(!value || !*value || std::string_view(value)=="balanced")return 0;
+            if(std::string_view(value)=="decode-priority")return 1;
+            if(std::string_view(value)=="prefill-priority")return 2;
+            throw std::invalid_argument("VOIDINFER_EXL3_PREFILL_POLICY must be balanced, decode-priority or prefill-priority");
+        }();
+        if(prefill_yield && prefill_policy!=2 && prompt_pass_overlap && options.max_concurrency>1) {
+            context->set_prefill_yield([this,lane_index](cudaStream_t pass_stream) {
+                static const int decode_rounds=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_DECODE_ROUNDS");
+                    return value?std::clamp(std::atoi(value),1,16):2;
+                }();
+                static const int decode_wait_ms=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_PREFILL_DECODE_WAIT_MS");
+                    return value?std::clamp(std::atoi(value),1,2000):120;
+                }();
+                std::array<std::uint64_t,kMaxLanes> started{};
+                std::array<bool,kMaxLanes> decoding{};
+                bool any_decoding=false;
+                if(prefill_policy==1) {
+                    std::lock_guard lock(mutex);
+                    for(std::size_t i=0;i<kMaxLanes;++i)
+                        if(i!=lane_index && active[i] && lane_decoding[i] && !lane_suspended[i]) {
+                            decoding[i]=true;any_decoding=true;
+                            started[i]=lane_rounds[i].load(std::memory_order_relaxed);
+                        }
+                }
+                if(!any_decoding && !prompt_pass_queue.verify_waiting())return;
+                if(!prompt_pass_done &&
+                   cudaEventCreateWithFlags(&prompt_pass_done,cudaEventDisableTiming)!=cudaSuccess)
+                    prompt_pass_done=nullptr;
+                if(prompt_pass_done)check(cudaEventRecord(prompt_pass_done,pass_stream));
+                if(any_decoding)
+                    prompt_pass_queue.pause(std::chrono::milliseconds(decode_wait_ms),[&] {
+                        for(std::size_t i=0;i<kMaxLanes;++i)
+                            if(decoding[i] && lane_rounds[i].load(std::memory_order_relaxed)<
+                               started[i]+static_cast<std::uint64_t>(decode_rounds))return false;
+                        return true;
+                    });
+                else prompt_pass_queue.yield();
+                if(prompt_pass_done)check(cudaStreamWaitEvent(pass_stream,prompt_pass_done,0));
+            });
+            yield_scope.context=context.get();
+        }
+        // VOIDINFER_EXL3_PREFILL_TRACE: request-start phases (stream-synchronized marks).
+        static const bool prefill_trace=std::getenv("VOIDINFER_EXL3_PREFILL_TRACE")!=nullptr;
+        std::string prefill_phases;
+        auto prefill_mark_at=Clock::now();
+        const auto prefill_mark=[&](const char* phase) {
+            if(!prefill_trace)return;
+            (void)cudaStreamSynchronize(stream);
+            const auto now=Clock::now();
+            prefill_phases+=std::string(" ")+phase+"="+std::to_string(static_cast<int>(
+                std::chrono::duration<double,std::milli>(now-prefill_mark_at).count()));
+            prefill_mark_at=now;
+        };
         try {
             (void)context->reset_for_request(identity.contract());
             const auto epoch=context->request_generation();
+            prefill_mark("reset");
+            // Coupled sampling (sampled_select.cuh): rounds and VeriCache rows
+            // share one noise stream. An unset seed (0) gets a per-request one.
+            {
+                const auto& sp=request.options.execution.sampling;
+                std::uint64_t seed=sp.seed;
+                if(sp.temperature>0 && !seed)
+                    seed=std::hash<std::uint64_t>{}(request.ready_work.generation()^
+                        (static_cast<std::uint64_t>(Clock::now().time_since_epoch().count())<<1))|1u;
+                Exl3DeviceSampling device_sampling{sp.temperature,sp.top_k,sp.top_p,sp.min_p,seed};
+                if(sp.presence_penalty!=0) {
+                    presence.begin(staging_owners[lane_index]->first_occurrence,static_cast<int>(ids.size()),stream);
+                    device_sampling.presence_penalty=sp.presence_penalty;
+                    device_sampling.first_occurrence=presence.table;
+                }
+                context->set_device_sampling(device_sampling);
+                draft.set_sampling(context->device_sampling());
+            }
+            struct SamplingReset {
+                Exl3TextContext* context;
+                Exl3Dflash2DraftModel* draft;
+                ~SamplingReset() {context->set_device_sampling({});draft->set_sampling({});}
+            } sampling_reset{context.get(),&draft};
+            if(media)prepare_media_prompt(request,*context,stream);
             // VeriCache verifies against exact history: ingest the prompt exactly too.
             if(vericache.enabled)context->set_l0_exact_history(true);
-            // Conversation reuse (NINFER_EXL3_COHERENT_ROOT_REUSE=1): the longest
-            // retained device root whose tokens prefix this input is restored
-            // (target exact state + draft ring) and only the suffix is ingested.
+            prefill_mark("setup");
+            // Conversation reuse (default; VOIDINFER_EXL3_COHERENT_ROOT_REUSE=0
+            // disables): the longest retained device root whose tokens prefix
+            // this input is restored (target exact state + draft ring) and only
+            // the suffix is ingested.
             static const bool root_reuse=[] {
-                const auto* value=std::getenv("NINFER_EXL3_COHERENT_ROOT_REUSE");
-                if(!value || !*value || std::string_view(value)=="0")return false;
+                const auto* value=std::getenv("VOIDINFER_EXL3_COHERENT_ROOT_REUSE");
+                if(!value || !*value)return true;
+                if(std::string_view(value)=="0")return false;
                 if(std::string_view(value)!="1")
-                    throw std::invalid_argument("NINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
+                    throw std::invalid_argument("VOIDINFER_EXL3_COHERENT_ROOT_REUSE must be 0 or 1");
                 return true;
             }();
-            const bool reuse_allowed=root_reuse && options.context_cache.enabled &&
+            // Media prompts neither reuse nor publish roots: roots are matched
+            // by token ids, which do not identify the media content.
+            const bool reuse_allowed=root_reuse && options.context_cache.enabled && !media &&
                 request.options.execution.allow_prefix_reuse && prepared.identity.reusable;
             std::shared_ptr<const Exl3VeriCacheRequest> reused;
             if(reuse_allowed)
@@ -1949,14 +2839,70 @@ struct Exl3EngineCore::Impl {
                        (!reused || candidate->token_count()>reused->token_count()) &&
                        candidate->matches_tokens(std::span<const std::int64_t>(ids).first(candidate->token_count())))
                         reused=candidate;
+            if(reused)(void)cache.refresh(reused);
+            request.prefix_resolved.store(true);
             // The turn-closure frontier is the rendered prefix the next turn of
             // this conversation agrees with: it gets its own retained root.
             std::size_t stable=ids.size();
             if(prepared.identity.rewrite_checkpoint)
                 stable=std::min<std::size_t>(stable,prepared.identity.rewrite_checkpoint->frontier);
+            // Cross-conversation prefix sharing: when a retained root of another
+            // conversation shares at least VOIDINFER_EXL3_SHARED_PREFIX_MIN_TOKENS
+            // (default 1024, 0 disables) leading tokens with this input beyond
+            // the reused root (agents with one system prompt and tool set), the
+            // common prefix (whole 64-row pages) gets its own retained root:
+            // later inputs restore it instead of prefilling it, and their
+            // exported states share its KV pages and code chunks.
+            static const std::size_t shared_minimum=[] {
+                const auto* value=std::getenv("VOIDINFER_EXL3_SHARED_PREFIX_MIN_TOKENS");
+                return static_cast<std::size_t>(value && *value?std::strtoull(value,nullptr,10):1024);
+            }();
+            std::size_t shared=0;
+            if(reuse_allowed && shared_minimum)
+                for(const auto& candidate:cache.roots())
+                    if(candidate)shared=std::max(shared,candidate->common_prefix_tokens(ids)/64*64);
+            // Burst coalescing: a text request waiting in the queue or running
+            // on another lane that shares at least the shared minimum of
+            // leading tokens with this input (agents dispatched together with
+            // one system prompt and tool set) makes this request publish that
+            // opening as a shared prefix root, so the others restore it
+            // instead of each prefilling it once more. Only the split point
+            // changes; every ingested row is computed exactly as before.
+            // VOIDINFER_EXL3_BURST_SHARED_PREFIX=0 disables.
+            static const bool burst_shared=[] {
+                const auto* value=std::getenv("VOIDINFER_EXL3_BURST_SHARED_PREFIX");
+                return !value || std::string_view(value)!="0";
+            }();
+            std::size_t burst_common=0;
+            if(reuse_allowed && shared_minimum && burst_shared) {
+                const auto common=[&](std::span<const std::int64_t> other) {
+                    const auto n=std::min(other.size(),ids.size());
+                    std::size_t i=0;
+                    while(i<n && other[i]==ids[i])++i;
+                    return i/64*64;
+                };
+                const auto text_only=[](const Request& other) {
+                    return !targets::qwen3_6::PreparedPromptAccess::view(other.prompt).has_media();
+                };
+                std::lock_guard lock(mutex);
+                for(const auto& other:queue)
+                    if(other && other.get()!=&request && text_only(*other))
+                        burst_common=std::max(burst_common,common(other->ready_work.input_tokens()));
+                for(std::size_t i=0;i<active.size();++i)
+                    if(i!=lane_index && active[i] && active[i].get()!=&request && text_only(*active[i]))
+                        burst_common=std::max(burst_common,common(active[i]->ready_work.input_tokens()));
+                shared=std::max(shared,burst_common);
+            }
+            const std::size_t reused_rows=reused?reused->token_count():0;
+            const bool shared_split=shared_minimum && shared>=shared_minimum &&
+                shared>=reused_rows+shared_minimum && shared<stable;
+            const std::size_t split_floor=shared_split?shared:reused_rows;
             const bool split=reuse_allowed && stable>=64 && stable<ids.size() &&
-                (!reused || stable>reused->token_count());
+                stable>split_floor;
             const auto span_ids=std::span<const std::int64_t>(ids);
+            if(std::getenv("VOIDINFER_EXL3_MEMORY_TRACE"))
+                std::fprintf(stderr,"PROMPT_ROUTE ids=%zu reused=%zu shared=%zu burst=%zu shared_split=%d stable=%zu split=%d%c",
+                    ids.size(),reused_rows,shared,burst_common,shared_split?1:0,stable,split?1:0,10);
             const auto extend_device=[&](const std::shared_ptr<const Exl3VeriCacheRequest>& from,std::size_t end,
                                          bool resident) {
                 const auto first=from->token_count();
@@ -1968,29 +2914,57 @@ struct Exl3EngineCore::Impl {
             };
             std::shared_ptr<const Exl3VeriCacheRequest> base=reused;
             bool base_resident=false;
-            if(split) {
-                if(base) base=extend_device(base,stable,false);
+            if(shared_split) {
+                if(base) base=extend_device(base,shared,false);
                 else {
+                    {
+                        Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
+                            1,epoch,false,stream);
+                        fresh.begin_fresh(span_ids.first(shared),shared>1040);
+                    }
+                    base=Exl3VeriCacheRequest::initialize_device_root(*context,draft,
+                        span_ids.first(shared),stream);
+                }
+                base_resident=true;
+                const auto admitted=cache.admit_shared_prefix(base,span_ids.first(shared),available());
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+                    std::fprintf(stderr,"SHARED_PREFIX_ROOT tokens=%zu reused=%zu admitted=%d%c",shared,reused_rows,
+                        admitted.admitted?1:0,10);
+            }
+            if(split) {
+                if(base) {
+                    base=extend_device(base,stable,base_resident);
+                    prefill_mark("split_extend");
+                } else {
                     {
                         Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
                             1,epoch,false,stream);
                         fresh.begin_fresh(span_ids.first(stable),stable>1040);
                     }
+                    prefill_mark("fresh");
                     base=Exl3VeriCacheRequest::initialize_device_root(*context,draft,
                         span_ids.first(stable),stream);
+                    prefill_mark("root");
                 }
                 base_resident=true;
-                (void)cache.admit_input_authority(base,span_ids.first(stable),available());
+                const auto admitted=cache.admit_input_authority(base,span_ids.first(stable),available());
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+                    std::fprintf(stderr,"PREFIX_ADMIT kind=stable tokens=%zu admitted=%d evicted=%zu entries=%zu "
+                        "accounted_mib=%.0f effective_mib=%.0f%c",stable,admitted.admitted?1:0,admitted.evicted,
+                        admitted.storage.entries,admitted.storage.accounted_bytes/1048576.0,
+                        admitted.effective_budget_bytes/1048576.0,10);
+                prefill_mark("admit_root");
             }
             if(base) {
                 root=extend_device(base,ids.size(),base_resident);
+                prefill_mark("extend");
             } else {
                 Exl3FastDeviceRound fresh(context,draft,staging_owners[lane_index]->pointers,
                     1,epoch,false,stream);
                 fresh.begin_fresh(ids,ids.size()>1040);
             }
             const bool root_diagnostic=[] {
-                const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROOT_HASH");
+                const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROOT_HASH");
                 return value && std::string_view(value)=="1";
             }();
             if(root_diagnostic) {
@@ -2061,24 +3035,68 @@ struct Exl3EngineCore::Impl {
             }
             {
                 std::lock_guard admission(admission_mutex);
-                const auto ticket=coordinator.admit(root);
+                Exl3VeriCacheServingCoordinator::Ticket ticket;
+                // Host memory refusals reject this request only (nothing is
+                // published yet; the lane resets for its next request).
+                try {ticket=coordinator.admit(root);}
+                catch(const Exl3HostResidentBudgetExhausted&) {
+                    throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds the resident page budget");
+                } catch(const Exl3HostResidentReserveExhausted&) {
+                    if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) Exl3HostMemoryLedger::print("refused");
+                    throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
+                }
                 host_lease=coordinator.acquire();
                 if(!host_lease || host_lease->ticket.request_id!=ticket.request_id)
                     throw std::logic_error("coherent-device physical/coordinator acquisition");
             }
+            prefill_mark("admit");
             draft.bind_ring_scope(host_lease->acquisition,epoch);
+            prefill_mark("ring_scope");
+            // This lane's DFlash2 rounds may meet the other lane's at verification.
+            struct BatchedLane {
+                Exl3BatchedVerifyCoordinator* coordinator;
+                explicit BatchedLane(Exl3BatchedVerifyCoordinator* value) : coordinator(value) {
+                    if(coordinator)coordinator->set_active(true);
+                }
+                ~BatchedLane() {
+                    if(!coordinator)return;
+                    coordinator->set_active(false);
+                    if(std::getenv("VOIDINFER_EXL3_BATCHED_STATS")) {
+                        const auto widths=coordinator->width_histogram();
+                        std::string histogram;
+                        for(std::size_t w=2;w<widths.size();++w)
+                            histogram+=(w>2?" w":"w")+std::to_string(w)+"="+std::to_string(widths[w]);
+                        std::fprintf(stderr,"BATCHED_ROUNDS batched=%llu (%s) split=%llu eager=%llu solo=%llu timeouts=%llu wait_ms=%.1f\n",
+                            static_cast<unsigned long long>(coordinator->batched_rounds()),histogram.c_str(),
+                            static_cast<unsigned long long>(coordinator->split_rounds()),
+                            static_cast<unsigned long long>(coordinator->eager_rounds()),static_cast<unsigned long long>(coordinator->solo_rounds()),
+                            static_cast<unsigned long long>(coordinator->timeouts()),coordinator->wait_us()/1000.0);
+                        if(std::getenv("VOIDINFER_EXL3_BATCHED_FORWARD_TIMING"))
+                            std::fprintf(stderr,"BATCHED_FORWARD_MS%s\n",coordinator->forward_timing().c_str());
+                    }
+                }
+            } batched_lane(lane_batched_verify[lane_index]);
             round=std::make_unique<Exl3FastDeviceRound>(context,draft,
                 staging_owners[lane_index]->pointers,host_lease->acquisition,
                 epoch,false,stream);
+            prefill_mark("round");
             if(vericache.enabled)context->set_l0_exact_history(false);
+            prefill_mark("coordinator");
             round->begin_prefilled();
+            check(cudaStreamSynchronize(stream));
+            prefill_mark("begin_round");
+            if(prefill_trace)std::fprintf(stderr,"PREFILL_PHASES lane=%zu prompt=%zu%s\n",lane_index,ids.size(),
+                prefill_phases.c_str());
+            context->set_prefill_yield({});
+            yield_scope.context=nullptr;
+            prefill_pass.reset();
+            runtime_memory_mark("prefill_end",lane_index);
             device_lease=coordinator.enter_device_logical(*host_lease,
                 std::static_pointer_cast<const void>(lane),context->position(),
                 allowance,options.max_context);
             host_lease.reset();
             if(acquired_root_observer)acquired_root_observer(root);
             result.speculative.enabled=true;
-            result.speculative.backend=SpeculativeBackend::DFlash2;
             result.speculative.draft_window=7;
             const auto decode=Clock::now();
             std::uint32_t remaining=allowance;
@@ -2086,7 +3104,7 @@ struct Exl3EngineCore::Impl {
             // Test-only host phase attribution (prepare / decide / settle /
             // publish), accumulated per request and printed after it.
             const bool round_phases=[] {
-                const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_ROUND_PHASES");
+                const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_ROUND_PHASES");
                 return value && std::string_view(value)=="1";
             }();
             std::array<double,4> phase_ms{};
@@ -2100,22 +3118,249 @@ struct Exl3EngineCore::Impl {
             if(vericache.enabled) {
                 // Draft numerically ahead with L0 rounds, verify each block, then
                 // publish only verified tokens (in <= 16-token output previews).
-                round->begin_verification(vericache.block);
+                // VOIDINFER_EXL3_GREEDY_LINES=1 (research): greedy requests at C2-C4 on
+                // lines too. Oct 15 (hot 256, LCB prompts): C2 4,096-token outputs
+                // +2-11% per lane, 1,024-token outputs -6%; C3/C4 neutral.
+                static const bool greedy_lines=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_GREEDY_LINES");
+                    return value && std::string_view(value)=="1";
+                }();
+                Exl3ExactLinePool* const line_pool=exact_line_pools.empty()?nullptr:
+                    exact_line_pools[lane_index%exact_line_pools.size()].get();
+                const bool fold_line=line_pool &&
+                    (options.max_concurrency==1 || context->device_sampling().temperature>0.0f || greedy_lines ||
+                     (options.max_concurrency==2 && context->position()>=kLaneLineMinContext));
+                const bool async_verify=fold_line && vericache_async_enabled();
+                const bool ordered_line=fold_line && options.max_concurrency>1;
+                round->set_pass_order(ordered_line?&first_line_pass_order:nullptr);
+                if(async_verify)
+                    round->begin_async_verification(*line_pool,exact_line_slots[lane_index],kAsyncRingRows);
+                else if(fold_line)round->begin_fold_verification(line_pool->line(),kFoldRingRows);
+                else round->begin_verification(vericache.block);
+                // Draft length per request (VeriCache paper, Fig. 8 / Alg. 1): the
+                // block that maximizes expected kept tokens per unit time from
+                // this request's measured drafting cost per token, verify-pass
+                // cost (a + b rows) and per-token mismatch rate. A mismatch at
+                // row j keeps j + 1 tokens, discards the rest of the drafted
+                // block and costs a fix pass over j + 1 rows.
+                struct DraftHorizon {
+                    double tok_ms=5.0,pass_a=25.0,pass_b=0.3,mismatch=0.004;
+                    // Verify and fix passes are exclusive across lanes: each one
+                    // also stalls the other lanes' drafting.
+                    double pass_weight=1.0;
+                    // Recursive least squares (forgetting 0.9) of pass ms on [1, rows].
+                    double p00=100.0,p01=0.0,p11=1.0;
+                    void observe_draft(double ms,int tokens) {
+                        if(tokens>0 && ms>0) tok_ms=0.8*tok_ms+0.2*(ms/tokens);
+                    }
+                    void observe_pass(int rows,double ms,bool corrected,int checked) {
+                        if(!corrected) {
+                            constexpr double lambda=0.9;
+                            const double x0=1.0,x1=rows;
+                            const double px0=p00*x0+p01*x1,px1=p01*x0+p11*x1;
+                            const double denom=lambda+x0*px0+x1*px1;
+                            const double k0=px0/denom,k1=px1/denom;
+                            const double err=ms-(pass_a+pass_b*rows);
+                            pass_a=std::max(1.0,pass_a+k0*err);
+                            pass_b=std::max(0.0,pass_b+k1*err);
+                            const double n00=(p00-k0*px0)/lambda,n01=(p01-k0*px1)/lambda,n11=(p11-k1*px1)/lambda;
+                            p00=n00;p01=n01;p11=n11;
+                        }
+                        if(checked>0) {
+                            const double w=std::min(1.0,checked/512.0);
+                            mismatch=std::clamp((1-w)*mismatch+w*(corrected?1.0:0.0)/checked,1e-5,0.2);
+                        }
+                    }
+                    int choose(int limit) const {
+                        // Verify passes of 9..32 rows take the coherent M32 projections,
+                        // 256+ the reconstruct+GEMM route; 33..255 rows have neither.
+                        static constexpr int kCandidates[]={16,24,32,256,384,512,768,1024};
+                        // Several lanes: every pass is exclusive and its fixed cost
+                        // (restore, ~2,250 eager launches, exact history) is far above
+                        // the one linear fit across both routes (HTTP C4 4K: ~27-row
+                        // passes ~72 ms vs ~512-row ~215 ms), so after an early
+                        // correction the fit drove whole runs onto 16..32-row blocks
+                        // (19-45 passes per request, 27-37 vs 53 ms/round). Only the
+                        // reconstruct route's blocks then. Oct 20: exact corrections at
+                        // C4 (~0.16% of rows, deterministic L0/exact near-ties) discard
+                        // 16-37% of a burst's drafted rows at this floor, but floors of
+                        // 64 / 128 rows (reconstruct route from 128) cut the discards by
+                        // 35-55% for no throughput (16 x 512 bursts 170.8 / 172.9 vs
+                        // 172.8 tok/s): the extra exclusive passes cost what the batched
+                        // rounds of discarded rows did.
+                        const int smallest=pass_weight>1.0 && limit>=256?256:0;
+                        int best=std::min(limit,std::max(smallest,kCandidates[0]));
+                        double best_rate=-1;
+                        for(const int x:kCandidates) {
+                            if(x<smallest) continue;
+                            if(x>limit) break;
+                            const double miss=1.0-std::pow(1.0-mismatch,x);
+                            const double kept=miss>1e-12?miss/mismatch:x;   // tokens up to and incl. the correction
+                            const double time=x*tok_ms+pass_weight*(pass_a+pass_b*x+
+                                miss*(pass_a+pass_b*std::min<double>(x,kept)));
+                            const double rate=std::min<double>(kept,x)/time;
+                            if(rate>best_rate) {best_rate=rate;best=x;}
+                        }
+                        return best;
+                    }
+                } horizon;
+                // Per-token mismatch: tolerance checks flip far less than exact
+                // ones. Exact requests start from the rate the previous exact
+                // requests ended with (INT4 L0 measures ~0.1% at 4K; a fresh
+                // per-request prior kept 1,024-token requests on 32-row blocks).
+                static std::atomic<double> exact_mismatch{0.002};
+                horizon.mismatch=vericache.delta>=0.5f?0.0005:exact_mismatch.load(std::memory_order_relaxed);
+                horizon.pass_weight=static_cast<double>(std::max<std::uint32_t>(1,options.max_concurrency));
+                // Tolerance mode keeps the longest block: its corrections are rare
+                // and a verify pass is exclusive across lanes (at C>=2 it stalls
+                // every other lane, which the per-request model does not price).
+                const bool adaptive_horizon=vericache.delta<0.5f;
+                // Sampled requests on exclusive passes (no line): blocks of at
+                // most VOIDINFER_EXL3_VERICACHE_SAMPLED_BLOCK (default 256) rows.
+                // L0 flips sampled tokens far more often than greedy ones, and a
+                // correction discards the rest of its block: sampled LCB C8
+                // 1024 / 512 / 256 -> ~314 / 343 / 343 tok/s (greedy: no gain).
+                static const int sampled_block=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_SAMPLED_BLOCK");
+                    return value?std::clamp(std::atoi(value),16,1024):256;
+                }();
+                // First verify block of a request (VOIDINFER_EXL3_VERICACHE_FIRST_BLOCK,
+                // default 4 rows, at most 16 on lines; 0 = off): tokens are published
+                // only after verification, so a 256+-row first block held the first
+                // token for seconds at C5-C8. 4 (was 32 / 16 on lines): the first round's
+                // tokens are verified at once; 128-token outputs C1 1060 / 2060-token
+                // prompts TTFT 0.51 / 0.73 -> 0.45 / 0.67 s, LCB first-wave C1 389 ->
+                // 287 ms, C2 0.79 -> 0.66 s, C8 mean 3.39 -> 3.27 s; tok/s within noise.
+                static const int first_block_setting=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_VERICACHE_FIRST_BLOCK");
+                    return value?std::clamp(std::atoi(value),0,1024):4;
+                }();
+                const int first_block=fold_line?(first_block_setting?std::min(first_block_setting,16):0):
+                    first_block_setting;
+                const int max_block=!fold_line && context->device_sampling().temperature>0.0f?
+                    std::min(vericache.block,sampled_block):vericache.block;
+                int block_now=fold_line?kFoldBlock:
+                    (adaptive_horizon?horizon.choose(max_block):max_block);
+                auto draft_mark=Clock::now();
                 std::vector<std::int64_t> unverified;
                 bool terminal_seen=false;
+                // The first round's first token (sampled from the exactly ingested
+                // prompt's last row) is never checked by a verification pass: it is
+                // published as soon as the round settles (VOIDINFER_EXL3_EARLY_FIRST_TOKEN=0
+                // waits for the first verified block). Its block then commits it
+                // without publishing it again.
+                static const bool early_first_token=[] {
+                    const char* value=std::getenv("VOIDINFER_EXL3_EARLY_FIRST_TOKEN");
+                    return !value || std::string_view(value)!="0";
+                }();
+                bool early_attempted=false;
+                std::vector<std::int64_t> early_published;
+                // VOIDINFER_EXL3_LANE_TRACE: per-request lane time attribution.
+                static const bool lane_trace=std::getenv("VOIDINFER_EXL3_LANE_TRACE")!=nullptr;
+                double lt_lock=0,lt_prepare=0,lt_settle=0,lt_verify=0;std::uint64_t lt_rounds=0;
+                const auto lt_begin=Clock::now();
+                struct LaneTraceReport {
+                    bool enabled;std::size_t lane;const double& lock;const double& prepare;const double& settle;
+                    const double& verify;const std::uint64_t& rounds;Clock::time_point begin;
+                    ~LaneTraceReport() {
+                        if(!enabled)return;
+                        const double total=std::chrono::duration<double,std::milli>(Clock::now()-begin).count();
+                        std::fprintf(stderr,"LANE_TRACE lane=%zu total_ms=%.0f rounds=%llu lock_ms=%.0f prepare_ms=%.0f settle_ms=%.0f verify_ms=%.0f per_round_ms=%.1f\n",
+                            lane,total,static_cast<unsigned long long>(rounds),lock,prepare,settle,verify,
+                            rounds?(prepare+settle)/rounds:0.0);
+                    }
+                } lt_report{lane_trace,lane_index,lt_lock,lt_prepare,lt_settle,lt_verify,lt_rounds,lt_begin};
+                // Rounds that start while the asynchronous line runs a pass vs while
+                // it idles (VOIDINFER_EXL3_LANE_TRACE): the line's contention cost.
+                struct LineOverlapReport {
+                    bool enabled;std::size_t lane;
+                    double busy_ms=0,idle_ms=0;std::uint64_t busy=0,idle=0;
+                    ~LineOverlapReport() {
+                        if(!enabled || !(busy+idle))return;
+                        std::fprintf(stderr,"LINE_OVERLAP lane=%zu busy_rounds=%llu busy_ms_per_round=%.2f idle_rounds=%llu idle_ms_per_round=%.2f\n",
+                            lane,static_cast<unsigned long long>(busy),busy?busy_ms/busy:0.0,
+                            static_cast<unsigned long long>(idle),idle?idle_ms/idle:0.0);
+                    }
+                } line_overlap{lane_trace,lane_index};
+                const auto lt_ms=[](Clock::time_point from){return std::chrono::duration<double,std::milli>(Clock::now()-from).count();};
+                struct Decoding {
+                    Impl& engine;std::size_t lane;
+                    Decoding(Impl& value,std::size_t index) : engine(value),lane(index) {
+                        std::lock_guard lock(engine.mutex);engine.lane_decoding[lane]=true;
+                    }
+                    ~Decoding() {
+                        {std::lock_guard lock(engine.mutex);engine.lane_decoding[lane]=false;}
+                        engine.changed.notify_all();
+                    }
+                } decoding{*this,lane_index};
                 while(!request.cancelled && remaining) {
+                    l0_memory_gate(lane_index,*context,stream,request);
+                    auto lt_mark=Clock::now();
+                    std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
+                    if(!prompt_pass_overlap)lock_round(round_lock);
+                    lt_lock+=lt_ms(lt_mark);lt_mark=Clock::now();
                     if(!output.pending_control_tokens().empty())
                         throw std::invalid_argument(
                             "coherent-device EXL3 does not admit injected control tokens");
-                    const auto budget=output.model_token_budget_remaining(remaining);
+                    const auto budget=output.model_token_budget_remaining(remaining)+early_published.size();
                     if(!budget)throw std::logic_error(
                         "coherent-device output has no model budget or control path");
                     const std::size_t room=budget>unverified.size()?budget-unverified.size():0;
-                    const std::size_t block=static_cast<std::size_t>(vericache.block);
-                    if(!terminal_seen && room && unverified.size()<block) {
+                    const std::size_t block=static_cast<std::size_t>(block_now);
+                    // Asynchronous: settle the block in flight once a later token
+                    // checks its last row (or drafting cannot go on), launch the
+                    // next block when the line is free, otherwise draft.
+                    std::optional<Exl3FastDeviceRound::VerifiedBlock> async_block;
+                    std::vector<std::int64_t> async_tail;
+                    bool async_tail_terminal=false;
+                    // Repeated corrections can fill the lead with the line head
+                    // alone: one more round then drafts a block to launch
+                    // (head + one round stays inside the kAsyncRingRows checkpoint).
+                    const bool async_can_draft=!terminal_seen && room &&
+                        (!async_verify || round->async_lead()<async_lead_limit() || unverified.empty());
+                    if(async_verify) {
+                        const auto rows=round->async_rows();
+                        if(round->async_pending() &&
+                           (!async_can_draft || (unverified.size()>rows && round->async_ready()))) {
+                            lt_mark=Clock::now();
+                            async_block=round->settle_async(unverified.size()>rows?unverified[rows]:-1,
+                                vericache.delta);
+                            lt_verify+=lt_ms(lt_mark);
+                            if(!async_block->corrected && unverified.size()>rows) {
+                                async_tail.assign(unverified.begin()+static_cast<std::ptrdiff_t>(rows),unverified.end());
+                                async_tail_terminal=terminal_seen;
+                            }
+                        } else if(!round->async_pending() && !unverified.empty() &&
+                                  (unverified.size()>=static_cast<std::size_t>(committed.empty() && first_block?
+                                       std::min(first_block,vericache_async_block()):vericache_async_block()) ||
+                                   !async_can_draft)) {
+                            round->launch_async(unverified,vericache.delta);
+                            continue;
+                        }
+                    }
+                    // Nothing published yet: the first verify block is short
+                    // (time to first token; the block policy's cost fit skips it).
+                    const bool first_pass=!fold_line && first_block && committed.empty();
+                    const std::size_t verify_at=first_pass?
+                        std::min<std::size_t>(block,static_cast<std::size_t>(first_block)):block;
+                    if(async_verify?!async_block && async_can_draft:
+                       !terminal_seen && room && unverified.size()<verify_at) {
+                        // A round may run past the chosen block (up to the pass
+                        // limit): the overrun is verified in the same pass instead
+                        // of cutting the round short at every block boundary.
+                        // (The overrun limit stays the configured block: a capped
+                        // sampled block must not narrow rounds below the batched
+                        // graphs' full width near its end.)
+                        const auto pass_limit=static_cast<std::size_t>(fold_line?kFoldRows:vericache.block);
                         const auto width=static_cast<int>(std::min<std::size_t>(
-                            {8,room,block-unverified.size()}));
+                            {round_width_limit(),room,async_verify?
+                                static_cast<std::size_t>(std::max(async_lead_limit()-round->async_lead(),
+                                    unverified.empty()?static_cast<int>(round_width_limit()):0)):
+                                pass_limit-unverified.size()}));
+                        const auto overlap_start=Clock::now();
+                        const bool line_busy=async_verify && round->async_pending() && !round->async_ready();
                         const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
+                        lt_prepare+=lt_ms(lt_mark);lt_mark=Clock::now();++lt_rounds;
                         pending_ticket=prepared_round.ticket;
                         const auto& candidate=prepared_round.candidate;
                         route.record_attempt(candidate.width,0,0);
@@ -2131,21 +3376,163 @@ struct Exl3EngineCore::Impl {
                                 candidate.committed_tokens.size());
                         } catch(...) {pending_ticket.reset();throw;}
                         pending_ticket.reset();
+                        lt_settle+=lt_ms(lt_mark);
+                        if(lane_trace && async_verify) {
+                            const double ms=lt_ms(overlap_start);
+                            (line_busy?line_overlap.busy_ms:line_overlap.idle_ms)+=ms;
+                            ++(line_busy?line_overlap.busy:line_overlap.idle);
+                        }
                         unverified.insert(unverified.end(),settled.committed_tokens.begin(),
                             settled.committed_tokens.end());
                         terminal_seen=settled.terminal;
-                        ++result.speculative.rounds;
+                        presence.sync(committed,unverified,round->frontier(),stream);
+                        if(early_first_token && !early_attempted && committed.empty() && !unverified.empty() &&
+                           (async_verify || !fold_line) && remaining>1 &&
+                           std::find(terminal_tokens.begin(),terminal_tokens.end(),unverified.front())==
+                               terminal_tokens.end()) {
+                            early_attempted=true;
+                            const auto chunk=std::span<const std::int64_t>(unverified).first(1);
+                            const auto boundary=request.publication_boundary.begin(
+                                device_lease->acquisition,epoch,
+                                Exl3ControlPublicationBoundary::Kind::model);
+                            if(!request.publication_boundary.numerical_ready(boundary))
+                                throw std::logic_error("coherent-device early token readiness ordering");
+                            auto tokens=request.round_tokens.assign(chunk);
+                            const auto decision=output.preview_model(tokens.span(),remaining,limit);
+                            if(!request.publication_boundary.prepare_output(boundary))
+                                throw std::logic_error("coherent-device early token preview ordering");
+                            request.require_output_storage();
+                            if(!decision.accepted_tokens) {
+                                if(!request.publication_boundary.abandon_private(boundary))
+                                    throw std::logic_error("coherent-device early token empty preview ordering");
+                                publish_preview(request);
+                                if(decision.finished())
+                                    throw std::logic_error("coherent-device early token finished the output");
+                            } else {
+                                const auto selected=request.round_tokens.repair().span();
+                                request.require_result_slots(selected.size());
+                                if(!request.publication_boundary.resume_numerical(boundary) ||
+                                   !request.publication_boundary.numerical_ready(boundary) ||
+                                   !request.publication_boundary.prepare_output(boundary) ||
+                                   !request.publication_boundary.begin_publication(boundary))
+                                    throw std::logic_error("coherent-device early token publication ordering");
+                                const auto publication=coordinator.publish_device_logical_window(
+                                    *device_lease,selected);
+                                device_lease=publication.lease;
+                                if(!request.publication_boundary.resident_committed(boundary))
+                                    throw std::logic_error("coherent-device early token logical commit ordering");
+                                early_published.assign(selected.begin(),selected.end());
+                                result.generated_token_ids.insert(
+                                    result.generated_token_ids.end(),tokens.begin(),tokens.end());
+                                remaining-=static_cast<std::uint32_t>(selected.size());
+                                result.token_accounting.visible_model_tokens+=selected.size();
+                                route.record_publication(selected.size(),selected.size(),0u);
+                                result.timings.first_token_seconds=
+                                    seconds(request.submitted)+result.timings.prepare_seconds;
+                                publish_preview(request,boundary);
+                                if(decision.finished())
+                                    throw std::logic_error("coherent-device early token finished the output");
+                            }
+                        }
+                        ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                         result.speculative.accepted_tokens+=settled.verification.accepted;
                         result.speculative.accepted_prefix_per_round.push_back(
                             static_cast<std::uint8_t>(settled.verification.accepted));
                         continue;
                     }
-                    const auto verified=round->verify(unverified,vericache.delta);
+                    // Folded: the block rides along the next round (its rows share
+                    // the round's projections); a block no round can carry
+                    // (terminal, budget, size) is verified on the line alone.
+                    std::vector<std::int64_t> fold_carried;
+                    bool fold_carried_terminal=false;
+                    const auto fold_verify=[&]() -> Exl3FastDeviceRound::VerifiedBlock {
+                        if(!terminal_seen && room && unverified.size()>=2 &&
+                           unverified.size()<=static_cast<std::size_t>(kFoldRows)) {
+                            round->arm_fold(unverified);
+                            const auto width=static_cast<int>(std::min<std::size_t>(
+                                {round_width_limit(),room,std::size_t{8},32-unverified.size()}));
+                            const auto prepared_round=round->prepare_device_pending(width,terminal_tokens);
+                            ++lt_rounds;
+                            pending_ticket=prepared_round.ticket;
+                            const auto& candidate=prepared_round.candidate;
+                            route.record_attempt(candidate.width,0,0);
+                            route.record_target_work(candidate.verification.verification_rows,
+                                candidate.verification.replay_rows);
+                            Exl3FastDeviceRound::Step settled;
+                            try {
+                                settled=round->settle_device_pending(*pending_ticket,
+                                    candidate.committed_tokens.size());
+                            } catch(...) {pending_ticket.reset();throw;}
+                            pending_ticket.reset();
+                            ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
+                            result.speculative.accepted_tokens+=settled.verification.accepted;
+                            result.speculative.accepted_prefix_per_round.push_back(
+                                static_cast<std::uint8_t>(settled.verification.accepted));
+                            auto block=round->finish_fold(settled.committed_tokens.front(),vericache.delta);
+                            if(!block.corrected) {
+                                fold_carried=settled.committed_tokens;
+                                fold_carried_terminal=settled.terminal;
+                            }
+                            return block;
+                        }
+                        return round->flush_fold(unverified,vericache.delta);
+                    };
+                    std::optional<Exl3FastDeviceRound::VerifiedBlock> folded=std::move(async_block);
+                    if(fold_line && !folded) {
+                        lt_mark=Clock::now();
+                        folded=fold_verify();
+                        lt_verify+=lt_ms(lt_mark);
+                    }
+                    // Verifier and fix passes use the process-wide prompt-scale
+                    // scratch: they run alone on the device like ingestion.
+                    if(round_lock.owns_lock())round_lock.unlock();
+                    lt_mark=Clock::now();
+                    const BatchedInactive verify_inactive(fold_line?nullptr:lane_batched_verify[lane_index]);
+                    std::optional<PromptPass> verify_pass;
+                    if(!fold_line)verify_pass.emplace(*this,stream,committed.empty()?kFirstVerifyPass:kVerifyPass);
+                    horizon.observe_draft(std::chrono::duration<double,std::milli>(Clock::now()-draft_mark).count(),
+                        static_cast<int>(unverified.size()));
+                    const auto pass_start=Clock::now();
+                    const auto verified=folded?std::move(*folded):round->verify(unverified,vericache.delta);
+                    if(!first_pass)
+                    horizon.observe_pass(static_cast<int>(unverified.size()),
+                        std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
+                        verified.corrected,static_cast<int>(verified.tokens.size()));
+                    if(adaptive_horizon && !fold_line) {
+                        block_now=horizon.choose(max_block);
+                        exact_mismatch.store(horizon.mismatch,std::memory_order_relaxed);
+                    }
+                    static const bool horizon_trace=std::getenv("VOIDINFER_EXL3_VERICACHE_HORIZON_TRACE")!=nullptr;
+                    if(horizon_trace)
+                        std::fprintf(stderr,"VERICACHE_HORIZON lane=%d rows=%zu corrected=%d kept=%zu committed=%zu pass_ms=%.1f tok_ms=%.2f pass=%.1f+%.3fx mismatch=%.4f next=%d\n",
+                            static_cast<int>(lane_index),unverified.size(),verified.corrected?1:0,verified.tokens.size(),
+                            committed.size(),std::chrono::duration<double,std::milli>(Clock::now()-pass_start).count(),
+                            horizon.tok_ms,horizon.pass_a,horizon.pass_b,horizon.mismatch,block_now);
+                    runtime_memory_mark("verify",lane_index);
+                    lt_verify+=lt_ms(lt_mark);
                     unverified.clear();
                     terminal_seen=false;
+                    if(!fold_carried.empty()) {
+                        unverified=fold_carried;
+                        terminal_seen=fold_carried_terminal;
+                    }
+                    if(!async_tail.empty()) {
+                        unverified=std::move(async_tail);
+                        terminal_seen=async_tail_terminal;
+                    }
                     std::vector<std::int64_t> retained;
                     bool finished=false;
-                    for(std::size_t at=0;at<verified.tokens.size();) {
+                    std::size_t first_unpublished=0;
+                    if(!early_published.empty()) {
+                        if(verified.tokens.size()<early_published.size() ||
+                           !std::equal(early_published.begin(),early_published.end(),verified.tokens.begin()))
+                            throw std::logic_error("coherent-device early token not kept by verification");
+                        committed.insert(committed.end(),early_published.begin(),early_published.end());
+                        retained.insert(retained.end(),early_published.begin(),early_published.end());
+                        first_unpublished=early_published.size();
+                        early_published.clear();
+                    }
+                    for(std::size_t at=first_unpublished;at<verified.tokens.size();) {
                         const auto chunk=std::span<const std::int64_t>(verified.tokens).subspan(
                             at,std::min<std::size_t>(16,verified.tokens.size()-at));
                         const auto boundary=request.publication_boundary.begin(
@@ -2201,16 +3588,31 @@ struct Exl3EngineCore::Impl {
                         if(decision.finished()) {result.finish_reason=decision.finish_reason;finished=true;break;}
                         if(selected.size()<chunk.size())break;
                     }
-                    round->commit_verification(retained);
+                    if(ordered_line && !committed.empty())round->set_pass_order(&line_pass_order);
+                    if(async_verify)round->commit_async(retained.size());
+                    else if(fold_line)round->commit_fold(retained.size());
+                    else round->commit_verification(retained);
+                    // A commit that kept only part of the block rewound drafting.
+                    if(round->frontier()!=round->verified_frontier()+static_cast<int>(unverified.size())) {
+                        unverified.clear();
+                        terminal_seen=false;
+                    }
+                    presence.sync(committed,unverified,round->frontier(),stream);
                     if(finished)break;
+                    draft_mark=Clock::now();
                 }
                 // Unverified drafted tokens (cancellation) are never published: rewind.
-                if(round->frontier()!=round->verified_frontier())round->commit_verification({});
-                if(std::getenv("NINFER_EXL3_VERICACHE_STATS")) {
+                if(fold_line)round->end_fold();
+                else if(round->frontier()!=round->verified_frontier()) {
+                    const BatchedInactive rewind_inactive(lane_batched_verify[lane_index]);
+                    const PromptPass rewind_pass(*this,stream,kVerifyPass);
+                    round->commit_verification({});
+                }
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) {
                     const auto& t=round->totals();
                     std::fprintf(stderr,"VERICACHE blocks=%llu corrected=%llu verify_ms=%.1f block=%d delta=%.3f "
                         "checked=%llu off_greedy=%llu mean_gap=%.5f max_gap=%.4f "
-                        "restore_ms=%.1f forward_ms=%.1f scores_ms=%.1f fix_ms=%.1f commit_ms=%.1f\n",
+                        "restore_ms=%.1f forward_ms=%.1f scores_ms=%.1f fix_ms=%.1f commit_ms=%.1f unrescored=%llu\n",
                         static_cast<unsigned long long>(t.verified_blocks),
                         static_cast<unsigned long long>(t.corrected_blocks),t.verify_ms,
                         vericache.block,vericache.delta,
@@ -2218,10 +3620,24 @@ struct Exl3EngineCore::Impl {
                         static_cast<unsigned long long>(t.accepted_off_greedy),
                         t.accepted_checked?t.accepted_gap_sum/static_cast<double>(t.accepted_checked):0.0,
                         static_cast<double>(t.max_accepted_gap),t.restore_ms,t.forward_ms,t.scores_ms,
-                        t.fix_ms,t.commit_ms);
+                        t.fix_ms,t.commit_ms,static_cast<unsigned long long>(t.line_rows_unrescored));
+                    std::fprintf(stderr,"VERICACHE_GAPS over>0=%llu >0.125=%llu >0.25=%llu >0.5=%llu >1=%llu >2=%llu\n",
+                        static_cast<unsigned long long>(t.accepted_gap_over[0]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[1]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[2]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[3]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[4]),
+                        static_cast<unsigned long long>(t.accepted_gap_over[5]));
+                    std::fprintf(stderr,"ROUND_TIMING rounds=%llu verified_rows=%llu seed_ms=%.1f draft_ms=%.1f "
+                        "proposal_ms=%.1f verifier_ms=%.1f ring_commit_ms=%.1f prefill_s=%.3f decode_s=%.3f\n",
+                        static_cast<unsigned long long>(t.rounds),static_cast<unsigned long long>(t.verified_rows),
+                        t.target_seed_ms,t.draft_api_ms,t.proposal_ms,t.verifier_ms,t.ring_commit_ms,
+                        result.timings.prefill_seconds,seconds(decode));
                 }
             } else
             while(remaining && !request.cancelled) {
+                std::shared_lock round_lock(coherent_prefill_mutex,std::defer_lock);
+                if(!prompt_pass_overlap)lock_round(round_lock);
                 if(round_phases)phase_mark=Clock::now();
                 if(!output.pending_control_tokens().empty())
                     throw std::invalid_argument(
@@ -2229,7 +3645,7 @@ struct Exl3EngineCore::Impl {
                 const auto budget=output.model_token_budget_remaining(remaining);
                 if(!budget)throw std::logic_error(
                     "coherent-device output has no model budget or control path");
-                const auto width=static_cast<int>(std::min<std::uint32_t>(8,budget));
+                const auto width=static_cast<int>(std::min<std::size_t>(round_width_limit(),budget));
                 const auto boundary=request.publication_boundary.begin(
                     device_lease->acquisition,epoch,
                     Exl3ControlPublicationBoundary::Kind::model);
@@ -2277,7 +3693,7 @@ struct Exl3EngineCore::Impl {
                         throw std::logic_error("coherent-device empty preview ordering");
                     if(request.cancelled) {output.discard_preview();break;}
                     publish_preview(request);
-                    ++result.speculative.rounds;
+                    ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                     if(decision.finished()) {
                         result.finish_reason=decision.finish_reason;
                         break;
@@ -2317,6 +3733,7 @@ struct Exl3EngineCore::Impl {
                 if(!request.publication_boundary.resident_committed(boundary))
                     throw std::logic_error("coherent-device logical commit ordering");
                 committed.insert(committed.end(),selected.begin(),selected.end());
+                presence.sync(committed,{},round->frontier(),stream);
                 result.generated_token_ids.insert(
                     result.generated_token_ids.end(),tokens.begin(),tokens.end());
                 remaining-=static_cast<std::uint32_t>(selected.size());
@@ -2331,7 +3748,7 @@ struct Exl3EngineCore::Impl {
                     result.timings.first_token_seconds=
                         seconds(request.submitted)+result.timings.prepare_seconds;
                 publish_preview(request,boundary);
-                ++result.speculative.rounds;
+                ++result.speculative.rounds;lane_rounds[lane_index].fetch_add(1,std::memory_order_relaxed);
                 result.speculative.accepted_tokens+=settled.verification.accepted;
                 result.speculative.accepted_prefix_per_round.push_back(
                     static_cast<std::uint8_t>(settled.verification.accepted));
@@ -2380,13 +3797,18 @@ struct Exl3EngineCore::Impl {
                     std::move(child));
                 device_lease.reset();
                 if(terminal_root_observer)terminal_root_observer(host_lease->root);
-                if(options.context_cache.enabled &&
+                if(options.context_cache.enabled && !media &&
                    request.options.execution.allow_prefix_reuse &&
                    !request.cancelled && prepared.identity.reusable &&
                    output.completed_chat_turn() &&
                    host_lease->root->state()->position()>=64) {
                     const auto admitted=cache.admit_completed_authority(
                         host_lease->root,available());
+                    if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS"))
+                        std::fprintf(stderr,"PREFIX_ADMIT kind=completed tokens=%zu admitted=%d evicted=%zu entries=%zu "
+                            "accounted_mib=%.0f effective_mib=%.0f%c",host_lease->root->token_count(),
+                            admitted.admitted?1:0,admitted.evicted,admitted.storage.entries,
+                            admitted.storage.accounted_bytes/1048576.0,admitted.effective_budget_bytes/1048576.0,10);
                     if(admitted.admitted) {
                         std::lock_guard lock(mutex);
                         ++stats.completed_prefix_admissions;
@@ -2394,13 +3816,23 @@ struct Exl3EngineCore::Impl {
                 }
                 coordinator.complete(*host_lease);
                 host_lease.reset();
+                // Idle lanes hold no INT4 code VRAM: active agents' contexts
+                // grow into it (VOIDINFER_EXL3_PARK_IDLE_CODES=0 keeps them).
+                static const bool park_idle_codes=[] {
+                    const auto* value=std::getenv("VOIDINFER_EXL3_PARK_IDLE_CODES");
+                    return !value || std::string_view(value)!="0";
+                }();
+                if(park_idle_codes) {
+                    (void)cudaStreamSynchronize(stream);
+                    context->park_l0_codes();
+                }
             } else {
                 coordinator.cancel_device_logical(*device_lease,true);
                 device_lease.reset();
             }
             // Test-only semantic final-state witness, observed after all timed
             // work and publication so graph and eager policies can be compared.
-            if(const auto* value=std::getenv("NINFER_EXL3_TEST_ENGINE_FINAL_STATE_HASH");
+            if(const auto* value=std::getenv("VOIDINFER_EXL3_TEST_ENGINE_FINAL_STATE_HASH");
                value && std::string_view(value)=="1")
                 std::fprintf(stderr,"COHERENT_DEVICE_ENGINE_FINAL_STATE output=%zu hash=%llu\n",
                     result.generated_token_ids.size(),static_cast<unsigned long long>(
@@ -2430,497 +3862,21 @@ struct Exl3EngineCore::Impl {
                 lane->poison_shared_completion();
                 std::lock_guard lock(mutex);
                 failed=true;
+                throw;
             }
-            throw;
+            // Host memory pressure after a clean cancellation refuses this
+            // request only; the lane and its peers stay usable.
+            try {throw;}
+            catch(const Exl3HostResidentReserveExhausted&) {
+                if(std::getenv("VOIDINFER_EXL3_VERICACHE_STATS")) Exl3HostMemoryLedger::print("refused");
+                throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available host memory");
+            } catch(const Exl3HostResidentBudgetExhausted&) {
+                throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds the resident page budget");
+            }
         }
     }
     void execute(Request& request,std::size_t lane_index){
-        if(coherent_device) {
-            execute_coherent_device(request,lane_index);
-            return;
-        }
-        auto& lane=lanes[lane_index];auto& draft=drafts[lane_index];auto& staging=staging_owners[lane_index]->pointers;
-        auto& result=request.result;
-        if(request.cancelled){result.finish_reason=FinishReason::Cancelled;return;}
-        if(Clock::now()>=request.deadline)throw RequestError(RequestErrorKind::QueueTimeout,"EXL3 request queue deadline expired");
-        auto& output=request.output;
-        const auto& prepared=targets::qwen3_6::PreparedPromptAccess::view(request.prompt);
-        Exl3PublicMediaQualification::require_current_request(
-            public_media_modality(prepared));
-        const auto ids=request.ready_work.input_tokens();
-        const auto fingerprint=request.ready_work.input_fingerprint();
-        const auto host_ticket=request.host_preparation.begin(
-            request.host_preparation_generation);
-        if(!host_ticket) {
-            if(request.cancelled)
-                throw RequestError(RequestErrorKind::Cancelled,
-                    "EXL3 host preparation cancelled");
-            throw std::logic_error("Engine host preparation generation unavailable");
-        }
-        std::size_t cacheable=0;bool declared_frontier=false;
-        try {
-            if(options.context_cache.enabled && request.options.execution.allow_prefix_reuse &&
-               prepared.identity.reusable)
-                cacheable=ids.size(); // Supplied input only; never generated text.
-            if(cacheable && prepared.identity.rewrite_checkpoint)
-                cacheable=std::min<std::size_t>(cacheable,
-                    prepared.identity.rewrite_checkpoint->frontier);
-            if(cacheable<64)cacheable=0;
-            if(cacheable && declared_prefix_preparation) {
-                const auto frontier=exl3_declared_prefix_frontier(prepared,cacheable);
-                if(frontier){cacheable=frontier;declared_frontier=true;}
-            }
-            const Exl3HostPreparationCompletion::Plan plan{
-                fingerprint,ids.size(),cacheable,declared_frontier};
-            if(!request.host_preparation.complete(*host_ticket,plan)) {
-                if(request.cancelled)
-                    throw RequestError(RequestErrorKind::Cancelled,
-                        "EXL3 host preparation cancelled");
-                throw std::logic_error("Engine host preparation completion identity");
-            }
-            const bool peer_numerical=options.max_concurrency==2 &&
-                numerical_active[1-lane_index].load(std::memory_order_acquire);
-            if(host_preparation_observer)
-                host_preparation_observer(lane_index,host_ticket->generation,
-                    peer_numerical);
-            if(request.cancelled) {
-                request.host_preparation.cancel(host_ticket->generation);
-                std::lock_guard lock(mutex);
-                ++stats.host_preparation_cancelled_before_accept;
-                throw RequestError(RequestErrorKind::Cancelled,
-                    "EXL3 host preparation cancelled");
-            }
-            const auto accepted=request.host_preparation.accept(*host_ticket,
-                fingerprint,ids.size());
-            if(!accepted)throw std::logic_error(
-                "Engine host preparation acceptance identity");
-            cacheable=accepted->cacheable_tokens;
-            std::lock_guard lock(mutex);
-            ++stats.host_preparation_returns;
-            if(peer_numerical)++stats.host_preparation_peer_numeric_overlaps;
-        } catch(...) {
-            const auto failure=std::current_exception();
-            try {request.host_preparation.fail(*host_ticket);}catch(...) {}
-            std::rethrow_exception(failure);
-        }
-        struct NumericalOwner {
-            std::atomic<bool>& active;
-            explicit NumericalOwner(std::atomic<bool>& value):active(value) {
-                if(active.exchange(true,std::memory_order_acq_rel))
-                    throw std::logic_error("Engine lane numerical ownership overlap");
-            }
-            ~NumericalOwner(){active.store(false,std::memory_order_release);}
-        } numerical_owner(numerical_active[lane_index]);
-        const auto prefill=Clock::now();
-        const auto preparation_progress=[&](int position){
-            if(prefix_preparation_observer)prefix_preparation_observer(lane_index,position);
-            if(request.cancelled)
-                throw RequestError(RequestErrorKind::Cancelled,"EXL3 prefill cancelled");
-        };
-        const bool media=prepared.has_media();
-        auto root=media?cache.prepare_media(lane->context(),*vision,request.prompt,
-                cacheable==ids.size(),available(),[&]{return request.cancelled.load();},
-                [&](std::uint64_t replay_bytes,std::uint64_t output_bytes) {
-                    Exl3EncodedMediaRetentionCredits credits;
-                    credits.replay.emplace(coordinator.reserve_preparation_payload(
-                        request.result_owner,replay_bytes));
-                    credits.output.emplace(coordinator.reserve_preparation_payload(
-                        request.result_owner,output_bytes));
-                    return credits;
-                }):
-            (concurrent_prefix_preparation?
-                cache.prepare_concurrent(lane->context(),ids,cacheable,available(),options.prefill_chunk,
-                    preparation_progress,draft.get(),&staging,true):
-                cache.prepare(lane->context(),ids,cacheable,available(),options.prefill_chunk,
-                    preparation_progress,draft.get(),&staging,true));
-        {
-            // Preparation has released cache locks. Publish only successful
-            // returns here; later cancellation does not erase completed work.
-            std::lock_guard lock(mutex);
-            ++stats.prefix_preparation_returns;
-            if(concurrent_prefix_preparation)++stats.concurrent_prefix_preparation_returns;
-            if(root.metrics.preparation_reused)++stats.prefix_preparation_joins;
-            if(root.metrics.cache_hit)++stats.prefix_preparation_cache_hits;
-        }
-        result.reused_prompt_tokens=static_cast<std::uint32_t>(root.metrics.reused_prompt_tokens);
-        result.prefix_reuse_path=(root.metrics.cache_hit || root.metrics.preparation_reused)?
-            PrefixReusePath::SharedStablePrefix:PrefixReusePath::Root;
-        {
-            // Preparation has already evaluated every non-reused prompt token.
-            // Attribute that work and the selected frontier here so a later
-            // cancellation, output failure or max-context return cannot erase
-            // work that actually happened. This is a count, never a latency or
-            // avoided-time estimate.
-            std::lock_guard lock(mutex);
-            stats.computed_prefill_tokens+=ids.size()-result.reused_prompt_tokens;
-            stats.reused_prompt_tokens+=result.reused_prompt_tokens;
-            stats.last_selected_frontier_tokens=result.reused_prompt_tokens;
-            if(result.prefix_reuse_path==PrefixReusePath::SharedStablePrefix)
-                ++stats.shared_stable_prefix_selections;
-            else
-                ++stats.root_selections;
-        }
-        // wait() may set cancellation as preparation returns (including an
-        // immediate cache hit with no progress callback). Retain shared cache
-        // authority, but do not compact or admit this cancelled consumer.
-        if(request.cancelled)
-            throw RequestError(RequestErrorKind::Cancelled,"EXL3 prefill cancelled");
-        auto compact=root.request->compact_draft(*draft,staging,lane->context().request_metadata_reservation());root.request.reset();
-        if(!media && cacheable && ids.size()>=64) {
-            std::optional<std::uint64_t> cold_preparation;
-            if(!root.metrics.cache_hit && !root.metrics.preparation_reused) {
-                const auto elapsed=std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-prefill).count();
-                if(elapsed>=0)cold_preparation=static_cast<std::uint64_t>(elapsed);
-            }
-            cache.admit_input_authority(compact,ids,available(),std::nullopt,cold_preparation);
-        }
-        result.timings.prefill_seconds=seconds(prefill);
-        if(ids.size()==options.max_context){result.finish_reason=FinishReason::ContextCapacity;output.preview_terminal(result.finish_reason);publish_preview(request);return;}
-        std::optional<Exl3VeriCacheServingCoordinator::Lease> lease;
-        {
-            // Each frontend request already owns one physical worker. Keep its
-            // admission/acquisition atomic so another worker cannot take its root.
-            std::lock_guard admission(admission_mutex);
-            Exl3VeriCacheServingCoordinator::Ticket ticket;
-            try {ticket=coordinator.admit(compact);}
-            catch(const Exl3HostResidentBudgetExhausted&) {
-                // No lease or physical lane attachment exists yet. A declared
-                // residency limit rejects this request without poisoning peers.
-                throw RequestError(RequestErrorKind::Overloaded,"EXL3 request exceeds available resident page budget");
-            }
-            lease=coordinator.acquire();
-            if(!lease || lease->ticket.request_id!=ticket.request_id)
-                throw std::logic_error("EXL3 physical request/coordinator binding");
-        }
-        bool acquired=false;
-        const auto collect_conditional=[&] {
-            if(lane->has_conditional_retention() && !lane->collect_conditional_retention(coordinator))
-                throw std::logic_error("Engine conditional retention still has live owners");
-        };
-        try {
-            const auto cancel_attachment=[&](unsigned phase) {
-                auto expected=phase;
-                if(phase && attachment_cancel_phase.compare_exchange_strong(expected,0)) {
-                    attachment_cancel_hit.store(phase,std::memory_order_release);
-                    request.cancelled.store(true,std::memory_order_release);
-                }
-                return request.cancelled.load(std::memory_order_acquire);
-            };
-            const auto restore_cancel_layer=
-                attachment_restore_cancel_layer.exchange(0,std::memory_order_acq_rel);
-            Exl3Dflash2Execution::AttachmentRestoreProgress restore_progress;
-            if(restore_cancel_layer)restore_progress=[&](int completed_layer) {
-                if(static_cast<unsigned>(completed_layer+1)==restore_cancel_layer) {
-                    attachment_restore_cancel_hit.store(
-                        static_cast<unsigned>(completed_layer),std::memory_order_release);
-                    request.cancelled.store(true,std::memory_order_release);
-                }
-            };
-            if(!lane->acquire(*lease,&coordinator,cancel_attachment,restore_progress))
-                throw RequestError(RequestErrorKind::Cancelled,
-                    "EXL3 request cancelled during physical prefix attachment");
-            acquired=true;compact.reset();
-            if(request.sampling)request.sampling->bind_acquisition(
-                lease->acquisition,lane->lease().root->revision_owner(),
-                static_cast<std::size_t>(lane->lease().root->state()->position()));
-            if(acquired_root_observer)acquired_root_observer(lane->lease().root);
-            if(verifier_cost_menu)lane->set_horizon_cost_menu(*verifier_cost_menu,lane->execution_epoch(),lease->acquisition);
-            if(suffix_selection_limits)lane->set_suffix_selection_limits(*suffix_selection_limits,lane->execution_epoch(),lease->acquisition);
-            auto remaining=std::min<std::uint32_t>(request.options.execution.requested_output_tokens,options.max_context-static_cast<std::uint32_t>(ids.size()));
-            const auto limit=remaining<request.options.execution.requested_output_tokens?FinishReason::ContextCapacity:FinishReason::OutputLimit;
-            output.validate_generation_capacity(remaining);
-            const auto decode=Clock::now();const auto stats0=lane->stats();
-            const auto oscar0=lane->context().oscar_telemetry();
-            Exl3CompleteRouteCounters complete_route;
-            result.speculative.enabled=true;result.speculative.backend=SpeculativeBackend::DFlash2;result.speculative.draft_window=7;
-            const auto abort_round=[&](Exl3ControlPublicationBoundary::Ticket boundary) {
-                if(request.publication_boundary.snapshot().phase!=
-                        Exl3ControlPublicationBoundary::Phase::numerical_pending &&
-                   !request.publication_boundary.resume_numerical(boundary))
-                    throw std::logic_error("Engine rollback numerical ordering");
-                lane->abort();
-                if(!request.publication_boundary.numerical_ready(boundary) ||
-                   !request.publication_boundary.abandon_private(boundary))
-                    throw std::logic_error("Engine rollback completion ordering");
-            };
-            const auto arm_publication_fault=[&] {
-                if(request.window_publication_fault.exchange(false,std::memory_order_acq_rel))
-                    coordinator.fail_next_residency_for_test(
-                        Exl3VeriCacheServingCoordinator::ResidencyFault::before_commit);
-            };
-            while(remaining && !request.cancelled){
-                collect_conditional();
-                const auto control=output.pending_control_tokens();
-                if(!control.empty()) {
-                    request.require_result_slots(control.size());
-                    if(control.size()>remaining)throw std::logic_error("Engine control exceeds remaining output allowance");
-                    const auto tokens=request.control_ids;
-                    if(control.size()!=tokens.size() || !std::equal(control.begin(),control.end(),tokens.begin()))
-                        throw std::logic_error("Engine pending control differs from reserved suffix");
-                    const auto boundary=request.publication_boundary.begin(
-                        lease->acquisition,lane->execution_epoch(),
-                        Exl3ControlPublicationBoundary::Kind::control);
-                    auto pending=lane->apply_control_owned(tokens);
-                    if(!request.publication_boundary.numerical_ready(boundary))
-                        throw std::logic_error("Engine control completion ordering");
-                    output.preview_control(control,remaining);
-                    if(!request.publication_boundary.prepare_output(boundary))
-                        throw std::logic_error("Engine control output preparation ordering");
-                    request.require_output_storage();
-                    if(request.cancelled){
-                        abort_round(boundary);output.discard_preview();
-                        break;
-                    }
-                    if(!request.publication_boundary.begin_publication(boundary))
-                        throw std::logic_error("Engine control publication ordering");
-                    arm_publication_fault();
-                    lane->publish(coordinator,*pending);remaining-=static_cast<std::uint32_t>(tokens.size());
-                    if(!request.publication_boundary.resident_committed(boundary))
-                        throw std::logic_error("Engine control resident commit ordering");
-                    if(request.sampling)
-                        Exl3SamplingControlStopSemantics::commit_forced_control_after_resident(
-                            *request.sampling,tokens.size(),lane->lease().root->revision_owner());
-                    result.generated_token_ids.insert(result.generated_token_ids.end(),control.begin(),control.end());
-                    result.token_accounting.injected_control_tokens+=control.size();
-                    publish_preview(request,boundary);continue;
-                }
-                const auto boundary=request.publication_boundary.begin(
-                    lease->acquisition,lane->execution_epoch(),
-                    Exl3ControlPublicationBoundary::Kind::model);
-                auto proposed=lane->propose(std::min<std::uint32_t>(8,output.model_token_budget_remaining(remaining)));
-                if(result.speculative.first_proposed_tokens.empty())
-                    result.speculative.first_proposed_tokens.assign(
-                        proposed.begin(),proposed.end());
-                complete_route.record_attempt(proposed.size(),0,0);
-                if(!request.publication_boundary.numerical_ready(boundary))
-                    throw std::logic_error("Engine proposal completion ordering");
-                if(request.cancelled){abort_round(boundary);break;}
-                if(!request.publication_boundary.resume_numerical(boundary))
-                    throw std::logic_error("Engine verification numerical ordering");
-                auto pending=lane->verify_owned(proposed);
-                complete_route.record_target_work(
-                    pending->verification.verification_rows,pending->verification.replay_rows);
-                if(!request.publication_boundary.numerical_ready(boundary))
-                    throw std::logic_error("Engine model completion ordering");
-                if(request.cancelled){
-                    abort_round(boundary);
-                    break;
-                }
-                auto tokens=request.round_tokens.assign(pending->verification.committed_tokens);
-                auto decision=output.preview_model(tokens.span(),remaining,limit);
-                if(!request.publication_boundary.prepare_output(boundary))
-                    throw std::logic_error("Engine model output preparation ordering");
-                if(conditional_b8 && output.model_token_budget_remaining(remaining)>=16 &&
-                    pending->proposed_rows==8 && pending->costs.neural_rows==8 &&
-                    pending->verification.accepted==8 && !pending->verification.rejected &&
-                    !pending->verification.stopped && tokens.size()==8 &&
-                    decision.accepted_tokens==8 && !decision.finished() &&
-                    decision.continuation==runtime::ContinuationAction::Decode) {
-                    // First preview proves no stop/control boundary before
-                    // the dependent block; nothing has been published yet.
-                    output.discard_preview();
-                    if(!request.publication_boundary.resume_numerical(boundary))
-                        throw std::logic_error("Engine conditional numerical ordering");
-                    const auto cancel_at=[&](unsigned stage) {
-                        auto expected=stage;
-                        if(conditional_cancel_stage.compare_exchange_strong(expected,0)) {
-                            conditional_cancel_hit.store(stage);request.cancelled=true;
-                        }
-                    };
-                    cancel_at(1);
-                    if(request.cancelled){
-                        abort_round(boundary);
-                        break;
-                    }
-                    const auto second=lane->try_propose_conditional_second(*pending,16,coordinator);
-                    if(second)complete_route.record_attempt(second->tokens.size(),0,0);
-                    if(second)cancel_at(2);
-                    if(request.cancelled){
-                        abort_round(boundary);
-                        break;
-                    }
-                    if(second) {
-                        const auto verified=pending->verification.verification_rows;
-                        const auto replayed=pending->verification.replay_rows;
-                        pending=lane->verify_conditional_second_owned(*pending,*second);
-                        if(pending->verification.verification_rows<verified ||
-                           pending->verification.replay_rows<replayed)
-                            throw std::logic_error("Engine conditional route counters regressed");
-                        complete_route.record_target_work(
-                            pending->verification.verification_rows-verified,
-                            pending->verification.replay_rows-replayed);
-                    }
-                    if(second)cancel_at(3);
-                    if(!request.publication_boundary.numerical_ready(boundary))
-                        throw std::logic_error("Engine conditional completion ordering");
-                    if(request.cancelled){
-                        abort_round(boundary);
-                        break;
-                    }
-                    tokens=request.round_tokens.assign(pending->verification.committed_tokens);
-                    decision=output.preview_model(tokens.span(),remaining,limit);
-                    if(!request.publication_boundary.prepare_output(boundary))
-                        throw std::logic_error("Engine conditional output preparation ordering");
-                }
-                request.require_output_storage();
-                if(decision.accepted_tokens!=tokens.size()){
-                    tokens=request.round_tokens.truncate(decision.accepted_tokens);
-                    if(!tokens.empty()) {
-                        if(!request.publication_boundary.resume_numerical(boundary))
-                            throw std::logic_error("Engine repair numerical ordering");
-                        pending=lane->repair_verified_prefix_owned(*pending,tokens.size());
-                        complete_route.record_target_work(pending->verification.verification_rows,
-                            pending->verification.replay_rows);
-                        if(!request.publication_boundary.numerical_ready(boundary) ||
-                           !request.publication_boundary.prepare_output(boundary))
-                            throw std::logic_error("Engine repair completion ordering");
-                    } else {
-                        abort_round(boundary);
-                    }
-                }
-                if(!tokens.empty()){
-                    request.require_result_slots(tokens.size());
-                    if(tokens.size()>remaining)throw std::logic_error("Engine verification exceeds remaining output allowance");
-                    if(request.cancelled){
-                        abort_round(boundary);output.discard_preview();
-                        break;
-                    }
-                    if(!request.publication_boundary.begin_publication(boundary))
-                        throw std::logic_error("Engine model publication ordering");
-                    arm_publication_fault();
-                    lane->publish(coordinator,*pending);
-                    if(!request.publication_boundary.resident_committed(boundary))
-                        throw std::logic_error("Engine model resident commit ordering");
-                    result.generated_token_ids.insert(result.generated_token_ids.end(),tokens.begin(),tokens.end());remaining-=static_cast<std::uint32_t>(tokens.size());
-                    const bool hidden_terminal=decision.finish_reason==FinishReason::StopToken &&
-                        !request.options.stop.publish_stop_token;
-                    if(hidden_terminal)++result.token_accounting.hidden_terminal_tokens;
-                    result.token_accounting.visible_model_tokens+=tokens.size()-(hidden_terminal?1u:0u);
-                    complete_route.record_publication(tokens.size(),
-                        tokens.size()-(hidden_terminal?1u:0u),hidden_terminal?1u:0u);
-                    if(result.timings.first_token_seconds==0)result.timings.first_token_seconds=seconds(request.submitted)+result.timings.prepare_seconds;
-                }
-                // No sink sees data until L2 repair + resident ownership commit.
-                if(tokens.empty())publish_preview(request);
-                else publish_preview(request,boundary);
-                ++result.speculative.rounds;
-                result.speculative.accepted_tokens+=tokens.empty()?0:pending->accepted_draft_rows();
-                result.speculative.accepted_prefix_per_round.push_back(
-                    static_cast<std::uint8_t>(pending->accepted_draft_rows()));
-                if(decision.finished()){result.finish_reason=decision.finish_reason;break;}
-            }
-            if(request.cancelled && result.finish_reason==FinishReason::None){result.finish_reason=FinishReason::Cancelled;output.preview_terminal(FinishReason::Cancelled);publish_preview(request);}
-            else if(result.finish_reason==FinishReason::None){result.finish_reason=limit;output.preview_terminal(limit);publish_preview(request);}
-            if(!result.token_accounting.conserves_result_tokens(result.generated_token_ids.size()))
-                throw std::logic_error("Engine semantic/result token accounting mismatch");
-            result.timings.decode_seconds=seconds(decode);result.reasoning_tokens=output.reasoning_tokens();result.thinking=output.thinking_stats();
-            result.speculative.drafted_tokens=lane->stats().proposed_rows-stats0.proposed_rows;
-            // Includes completed unpublished/cancelled work and frontend repair.
-            result.speculative.verifier_calls=lane->stats().completed_native_verifier_calls-stats0.completed_native_verifier_calls;
-            result.speculative.repair_checkpoint_captured_bytes=
-                lane->stats().repair_checkpoint_captured_bytes-stats0.repair_checkpoint_captured_bytes;
-            result.speculative.repair_checkpoint_restores=
-                lane->stats().repair_checkpoint_restores-stats0.repair_checkpoint_restores;
-            result.speculative.repair_checkpoint_reconstructed_rows=
-                lane->stats().repair_checkpoint_reconstructed_rows-stats0.repair_checkpoint_reconstructed_rows;
-            result.speculative.repair_checkpoint_fallback_rows=
-                lane->stats().repair_checkpoint_fallback_rows-stats0.repair_checkpoint_fallback_rows;
-            result.speculative.device_seed_handoffs=
-                lane->stats().device_seed_handoffs-stats0.device_seed_handoffs;
-            result.speculative.device_seed_host_fallbacks=
-                lane->stats().device_seed_host_fallbacks-stats0.device_seed_host_fallbacks;
-            result.speculative.draft_local_topk_calls=
-                lane->stats().draft_local_topk_calls-stats0.draft_local_topk_calls;
-            result.speculative.draft_dense_kmajor_launches=
-                lane->stats().draft_dense_kmajor_launches-stats0.draft_dense_kmajor_launches;
-            const auto oscar1=lane->context().oscar_telemetry();
-            result.speculative.oscar_eager_cohort_attempts=
-                oscar1.continuation_cohort_eager_attempts-
-                    oscar0.continuation_cohort_eager_attempts;
-            result.speculative.oscar_eager_cohort_dispatches=
-                oscar1.continuation_cohort_eager_dispatches-
-                    oscar0.continuation_cohort_eager_dispatches;
-            result.speculative.oscar_eager_cohort_latch_misses=
-                oscar1.continuation_cohort_eager_latch_misses-
-                    oscar0.continuation_cohort_eager_latch_misses;
-            result.speculative.oscar_eager_cohort_boundary_fallbacks=
-                oscar1.continuation_cohort_eager_boundary_fallbacks-
-                    oscar0.continuation_cohort_eager_boundary_fallbacks;
-            result.speculative.oscar_eager_cohort_malformed=
-                oscar1.continuation_cohort_eager_malformed-
-                    oscar0.continuation_cohort_eager_malformed;
-            result.speculative.staged_b8_verifier_calls=
-                lane->stats().staged_b8_verifier_calls-stats0.staged_b8_verifier_calls;
-            result.speculative.staged_b8_first_half_exits=
-                lane->stats().staged_b8_first_half_exits-stats0.staged_b8_first_half_exits;
-            result.speculative.staged_b8_second_half_calls=
-                lane->stats().staged_b8_second_half_calls-stats0.staged_b8_second_half_calls;
-            result.speculative.staged_b8_skipped_verification_rows=
-                lane->stats().staged_b8_skipped_verification_rows-
-                    stats0.staged_b8_skipped_verification_rows;
-            result.speculative.committed_tap_device_bytes=
-                lane->stats().committed_tap_device_bytes-stats0.committed_tap_device_bytes;
-            result.speculative.committed_tap_host_export_rows_avoided=
-                lane->stats().committed_tap_host_export_rows_avoided-
-                    stats0.committed_tap_host_export_rows_avoided;
-            result.speculative.neural_input_rows=lane->stats().neural_input_rows-stats0.neural_input_rows;
-            result.speculative.returned_suffix_rows=lane->stats().neural_returned_suffix_rows-stats0.neural_returned_suffix_rows;
-            result.speculative.discarded_suffix_rows=lane->stats().neural_discarded_suffix_rows-stats0.neural_discarded_suffix_rows;
-            const auto route=complete_route.snapshot();
-            result.speculative.proposed_rows=route.proposed_rows;
-            result.speculative.verified_rows=route.verified_rows;
-            result.speculative.replayed_rows=route.replayed_rows;
-            result.speculative.committed_model_rows=route.committed_model_rows;
-            result.speculative.externally_visible_model_rows=route.externally_visible_model_rows;
-            result.speculative.hidden_terminal_rows=route.hidden_terminal_rows;
-            result.speculative.diagnostic_rows=result.token_accounting.diagnostic_state_rows;
-            result.speculative.shared_projection_rows=std::nullopt;
-            const auto final=lane->lease();
-            // Diagnostic-only immutable host snapshot, outside coordinator and
-            // queue locks. Disabled Engine execution pays no snapshot copy.
-            if(terminal_root_observer)terminal_root_observer(final.root);
-            // Consume the committed frontend semantic boundary. Custom stop
-            // strings/tokens, discarded previews and output limits do not close
-            // a conversational turn even if they end generation.
-            if(options.context_cache.enabled && request.options.execution.allow_prefix_reuse &&
-                !request.cancelled && prepared.identity.reusable && output.completed_chat_turn() &&
-                final.root->state()->position()>=64) {
-                const auto admission=cache.admit_completed_authority(final.root,available());
-                if(admission.admitted) {
-                    std::lock_guard lock(mutex);++stats.completed_prefix_admissions;
-                }
-            }
-            collect_conditional();
-            const auto retired=lane->release();
-            coordinator.complete_retired(final,retired);acquired=false;
-            if(request_affinity) {
-                std::lock_guard lock(mutex);
-                Exl3ReadyLocalityCost locality;
-                locality.root_attachment_microseconds=measured_microseconds(root.metrics.attach_ms);
-                if(root.metrics.cache_hit || root.metrics.preparation_reused)
-                    locality.history_restore_microseconds=measured_microseconds(
-                        root.metrics.prefill_ms-root.metrics.attach_ms);
-                lane_frontiers[lane_index]={final.root,lane->context().request_generation(),locality};
-            }
-        }catch(...){
-            const auto failure=std::current_exception();
-            request.publication_boundary.fail_active();
-            try {
-                if(acquired && lane->execution_active()) {
-                    lane->abort();collect_conditional();auto final=lane->lease();
-                    const auto retired=lane->release();
-                    coordinator.cancel_retired(final,retired);acquired=false;
-                } else if(!acquired)coordinator.cancel(lease->ticket,true);
-                // A poisoned active lease stays retained until Engine drains.
-            } catch(...) {lane->poison_shared_completion();}
-            std::rethrow_exception(failure);
-        }
-        std::lock_guard lock(mutex);
-        stats.committed_decode_tokens+=result.generated_token_ids.size();
-        stats.visible_model_tokens+=result.token_accounting.visible_model_tokens;
-        stats.injected_control_tokens+=result.token_accounting.injected_control_tokens;
-        stats.hidden_terminal_tokens+=result.token_accounting.hidden_terminal_tokens;
-        stats.decode_rounds+=result.speculative.rounds;
+        execute_coherent_device(request,lane_index);
     }
     void retire_result(Request& request) {
         if(request.result_lease && coordinator.retire_logical_host_to_lifetime(*request.result_lease,
@@ -2942,7 +3898,7 @@ struct Exl3EngineCore::Impl {
             request.result.timings.total_seconds=seconds(request.submitted)+request.result.timings.prepare_seconds;
             request.done=true;
         }
-        queue.erase(found);--outstanding;
+        queue.erase(found);--outstanding;publish_demand_locked();
         ready_work_authority.revise();
         stats.waiting_requests=static_cast<std::uint32_t>(queue.size());
         request.changed.notify_all();changed.notify_all();
@@ -2955,7 +3911,9 @@ struct Exl3EngineCore::Impl {
             bool affine=false,copy_deferred=false,copy_unknown=false,copy_fairness=false;
             {
                 std::unique_lock lock(mutex);
-                changed.wait(lock,[&] {
+                // Timed: a request deferred for L0 code memory becomes eligible
+                // shortly before its queue deadline without another event.
+                changed.wait_for(lock,std::chrono::milliseconds(250),[&] {
                     if(stopping)return true;
                     if(queue.empty())return false;
                     return ready_request_locked(lane_index).has_value();
@@ -3006,7 +3964,11 @@ struct Exl3EngineCore::Impl {
                         .locality_costs_complete=selected->locality_costs_complete,
                         .reason=reason});
                 }
-                queue.erase(position);active[lane_index]=request;
+                queue.erase(position);active[lane_index]=request;publish_demand_locked();
+                lane_admission[lane_index]=next_lane_admission++;
+                lane_code_projection[lane_index]=l0_code_admission_enabled()?
+                    request_code_projection(*request):0;
+                publish_l0_code_growth_locked();
                 lane_frontiers[lane_index]={};
                 if(request_affinity) {
                     if(affine)++stats.request_affinity_assignments;
@@ -3165,8 +4127,26 @@ struct Exl3EngineCore::Impl {
                 // obligations until the owning shutdown drain completes.
                 for(auto& peer:active)if(peer && peer!=request && !peer->cancelled.exchange(true))
                     ++stats.failure_cancelled_active_requests;
-                for(auto& queued:queue)if(!queued->cancelled.exchange(true))
-                    ++stats.failure_cancelled_queued_requests;
+                // Queued requests never reached a worker: complete them now
+                // (workers skip cancelled entries and submissions are refused
+                // after a failure, so nothing else would release them).
+                for(auto& queued:queue) {
+                    if(!queued->cancelled.exchange(true))++stats.failure_cancelled_queued_requests;
+                    {
+                        std::lock_guard request_lock(queued->mutex);
+                        queued->failure=std::make_exception_ptr(
+                            RequestError(RequestErrorKind::Unavailable,"EXL3 engine unavailable"));
+                        queued->result.timings.total_seconds=seconds(queued->submitted)+
+                            queued->result.timings.prepare_seconds;
+                        queued->done=true;
+                    }
+                    queued->changed.notify_all();
+                    --outstanding;
+                }
+                while(!queue.empty())queue.pop_front();
+                publish_demand_locked();
+                ready_work_authority.revise();
+                stats.waiting_requests=0;
             }
             // Transfer work happened even if the request was cancelled or later
             // failed. Publish once, before notifying completion, on every exit.
@@ -3625,7 +4605,8 @@ struct Exl3EngineCore::Impl {
             }
             request->result.timings.total_seconds=seconds(request->submitted)+request->result.timings.prepare_seconds;
             {std::lock_guard lock(request->mutex);request->done=true;}request->changed.notify_all();
-            {std::lock_guard lock(mutex);active[lane_index].reset();--outstanding;
+            {std::lock_guard lock(mutex);active[lane_index].reset();lane_code_projection[lane_index]=0;--outstanding;
+                publish_l0_code_growth_locked();
                 ready_work_authority.revise();--stats.running_requests;}
             changed.notify_all();
         }
@@ -3709,6 +4690,25 @@ void Exl3EngineCore::require_startup_retirement_available(const EngineOptions& o
 }
 Exl3EngineCore::Exl3EngineCore(const EngineOptions& options,unsigned shared_allocation_fault_for_test,unsigned draft_clone_fault_for_test,unsigned first_draft_fault_for_test,unsigned context_startup_fault_for_test,
     Exl3DeviceAvailability::Provider device_availability_provider_for_test) {
+    apply_engine_profile();
+    // Exact hot-row budget sized by lane count (VOIDINFER_EXL3_L0_HOT unset):
+    // published tokens are verified against exact history either way, so hot
+    // rows only change how often VeriCache corrects a drafted block. The
+    // Oct 15 sweep (sampled LCB, decay 0.12) measured 1024 rows against 512
+    // at C1 / C4 / C8: 175 / 358 / 381 vs 173 / 344 / 339 tok/s; the Oct 20
+    // recheck (sampled LCB, 32K, 2 reps) halved C4 corrections (5 vs 11 of
+    // ~1190 blocks) at equal ms/round (41.7 vs 41.9; C1 22.2 vs 22.1). 1024
+    // rows cost 32 MiB more per context (C4 free 6.16 vs 6.30 GiB), so they
+    // are taken where that memory is a small share of the resident context
+    // (one to four lanes); five to eight lanes keep 512 rows for code capacity.
+    if(const char* set=std::getenv("VOIDINFER_EXL3_L0_HOT"); set==nullptr || *set=='\0') {
+        const char* slots=options.max_concurrency<=4?"1024":"512";
+#ifdef _WIN32
+        _putenv_s("VOIDINFER_EXL3_L0_HOT",slots);
+#else
+        setenv("VOIDINFER_EXL3_L0_HOT",slots,0);
+#endif
+    }
     if(!options.prefill_chunk)
         throw std::invalid_argument("EXL3 Engine prefill_chunk must be nonzero");
     require_startup_retirement_available(options);
@@ -4022,7 +5022,7 @@ void Exl3EngineCore::cancel_next_attachment_during_restore_for_test(
     std::lock_guard lock(impl_->mutex);
     if(!impl_->lanes[0] || impl_->outstanding || impl_->failed || impl_->stopping)
         throw std::logic_error("mid-restore cancellation requires idle live Engine");
-    const auto* preserve=std::getenv("NINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
+    const auto* preserve=std::getenv("VOIDINFER_EXL3_PRESERVE_ACQUIRED_ROOT");
     if(completed_layer>=64 || (preserve && std::string_view(preserve)=="1"))
         throw std::invalid_argument("mid-restore cancellation requires layer0..63 and full restore");
     impl_->attachment_restore_cancel_hit.store(64,std::memory_order_release);
@@ -4043,7 +5043,7 @@ void Exl3EngineCore::fail_request_host_payload_for_test(unsigned phase) {
     if(!impl_->lanes[0] || impl_->lanes[1] || impl_->outstanding || impl_->failed || impl_->stopping)
         throw std::logic_error("host payload fixture requires idle live C1 Engine");
     if(phase<1 || phase>2)throw std::invalid_argument("host payload fault phase");
-    const auto* direct=std::getenv("NINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
+    const auto* direct=std::getenv("VOIDINFER_EXL3_COMPACT_DIRECT_TAP_STAGING");
     if(direct && std::string_view(direct)=="1")throw std::logic_error("host payload fixture requires copied taps");
     impl_->request_host_payload_fault_hit.store(0);impl_->request_host_payload_fault.store(phase);
 }
@@ -4409,7 +5409,11 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
     const auto sampling_policy=Exl3SamplingPolicy::normalize(options.execution.sampling);
     const auto sampled_admission=Exl3SampledAuthorityBoundary::decide({
         sampling_policy,impl_->drafts[0]->sampled_distribution_availability()});
-    if(!sampled_admission.greedy())
+    // The coherent-device route samples on device with VeriCache-coupled
+    // selection (temperature, top_k, top_p, min_p, presence penalty; no
+    // frequency penalty).
+    const bool coupled_sampling=options.execution.sampling.frequency_penalty==0;
+    if(!sampled_admission.greedy() && !coupled_sampling)
         throw RequestError(RequestErrorKind::UnsupportedSampling,
             std::string(Exl3SampledAuthorityBoundary::message(
                 sampled_admission.disposition)));
@@ -4590,6 +5594,7 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
             }
             queued->changed.notify_all();
             pending=impl_->queue.erase(pending);
+            impl_->publish_demand_locked();
             impl_->ready_work_authority.revise();
             --impl_->outstanding;
         }
@@ -4597,7 +5602,7 @@ Exl3EngineCore::Submission Exl3EngineCore::submit(targets::qwen3_6::PreparedProm
         if(impl_->outstanding>=impl_->queue.capacity())
             throw RequestError(RequestErrorKind::Overloaded,"EXL3 request queue full");
         r->host_preparation_generation=ready_generation;
-        impl_->queue.push_back(r);++impl_->outstanding;
+        impl_->queue.push_back(r);++impl_->outstanding;impl_->publish_demand_locked();
         r->window_publication_fault.store(
             impl_->window_publication_fault.exchange(false,std::memory_order_acq_rel),
             std::memory_order_release);

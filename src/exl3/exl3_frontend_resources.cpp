@@ -9,7 +9,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 namespace {
 
 using Resources = targets::qwen3_6::FrontendResources;
@@ -19,14 +19,19 @@ struct PinnedFile {
     std::size_t bytes;
     const char* sha256;
     std::string Resources::* destination;
+    // Weights-specific metadata of the SC_5.00bpw_H6_V6 revision (nullptr:
+    // byte-identical across the pinned revisions).
+    const char* sha256_5bpw = nullptr;
 };
 
 // Exact byte counts bound allocation and are part of this one pinned identity.
 constexpr std::array<PinnedFile, 8> files{{
     {"config.json", 4647,
-     "08f73b0d24188776fa278306031a93b863bc6d2b0ac837e24c6ed792b30b3081", nullptr},
+     "08f73b0d24188776fa278306031a93b863bc6d2b0ac837e24c6ed792b30b3081", nullptr,
+     "061923b83b7b3289f3f647a823c75df549fff05d9bf35b84c753a9e4c01d4d84"},
     {"model.safetensors.index.json", 295620,
-     "d5bc6446c36d53525403d22002bd67aa735bfc2d0eae7cab1f498a78d406b110", nullptr},
+     "d5bc6446c36d53525403d22002bd67aa735bfc2d0eae7cab1f498a78d406b110", nullptr,
+     "62e4c2fcd6d1a4c08f4eef1780c40f0e4370664e2a095a357dc56741c64a5dc1"},
     {"tokenizer.json", 12809320,
      "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
      &Resources::tokenizer_json},
@@ -47,7 +52,9 @@ constexpr std::array<PinnedFile, 8> files{{
      &Resources::video_preprocessor_config_json},
 }};
 
-std::string read_pinned(const std::filesystem::path& directory, const PinnedFile& pin) {
+// Revision: 0 = SC_6.00bpw_H6_V6, 1 = SC_5.00bpw_H6_V6, -1 = undecided.
+std::string read_pinned(const std::filesystem::path& directory, const PinnedFile& pin,
+                        int& revision) {
     const auto path = directory / pin.name;
     const auto fail = [&](std::string_view reason) -> void {
         throw std::runtime_error("Pinned EXL3 frontend " + std::string(pin.name) + ": " +
@@ -67,8 +74,14 @@ std::string read_pinned(const std::filesystem::path& directory, const PinnedFile
         fail("trailing bytes or read failure");
     }
     namespace digest = targets::qwen3_6::frontend_internal;
-    if (digest::sha256_hex(digest::sha256(std::string_view(bytes))) != pin.sha256) {
-        fail("SHA256 differs");
+    const auto hex = digest::sha256_hex(digest::sha256(std::string_view(bytes)));
+    if (pin.sha256_5bpw == nullptr) {
+        if (hex != pin.sha256) { fail("SHA256 differs"); }
+    } else {
+        const int matched = hex == pin.sha256 ? 0 : hex == pin.sha256_5bpw ? 1 : -1;
+        if (matched < 0) { fail("SHA256 differs"); }
+        if (revision >= 0 && revision != matched) { fail("mixed pinned revisions"); }
+        revision = matched;
     }
     return bytes;
 }
@@ -80,11 +93,18 @@ Resources load_pinned_frontend_resources(const std::filesystem::path& target_dir
         throw std::invalid_argument("Pinned EXL3 frontend requires a target directory");
     }
     Resources resources;
+    int revision = -1;
     for (const auto& pin : files) {
-        auto bytes = read_pinned(target_directory, pin);
+        auto bytes = read_pinned(target_directory, pin, revision);
         if (pin.destination != nullptr) { resources.*(pin.destination) = std::move(bytes); }
     }
     return resources;
 }
 
-} // namespace ninfer::exl3
+const char* pinned_weights_id(const std::filesystem::path& target_directory) {
+    int revision = -1;
+    (void)read_pinned(target_directory, files[0], revision);
+    return revision == 1 ? "SC_5.00bpw_H6_V6" : "SC_6.00bpw_H6_V6";
+}
+
+} // namespace voidinfer::exl3

@@ -5,7 +5,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Eager oscar_fast reference, not vericache_exact. Parent -1 names the
 // committed context. Position is root.position()+depth-1; equal token IDs
@@ -110,4 +110,4 @@ Exl3BranchReferenceResult verify_exl3_branch_reference(
     return result;
 }
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

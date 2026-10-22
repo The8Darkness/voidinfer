@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "voidinfer/types.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -8,26 +8,19 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::cli {
+namespace voidinfer::cli {
 
 struct Options {
     bool help_requested = false;
 
-    std::filesystem::path artifact_path;
+    ModelPackageOptions model;
     std::string prompt;
     std::filesystem::path messages_path;
 
     std::uint32_t max_new        = 128;
-    std::uint32_t max_context    = 2048;
-    KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    std::uint32_t max_context    = 32768;
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
-
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
-    SpeculativeOptions speculative;
-    bool enable_vision  = false;
-    bool use_cuda_graph = true;
-    bool disable_dual_artifact_loading = false;
 
     bool raw_output      = false;
     bool print_token_ids = false;
@@ -46,4 +39,4 @@ struct Options {
 [[nodiscard]] Options parse_options(int argc, char** argv);
 [[nodiscard]] std::string usage_text(const char* argv0);
 
-} // namespace ninfer::cli
+} // namespace voidinfer::cli

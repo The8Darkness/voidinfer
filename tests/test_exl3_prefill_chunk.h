@@ -1,13 +1,13 @@
 #pragma once
 
 void run_prefill_chunk_qualification(Exl3TextModel& target, Exl3Dflash2DraftModel& draft) {
-    const auto directory=std::filesystem::path(env("NINFER_E5A4_OUT"));
+    const auto directory=std::filesystem::path(env("VOIDINFER_E5A4_OUT"));
     require(!directory.empty() && !std::filesystem::exists(directory),"chunk qualification output must be new");
     std::filesystem::create_directories(directory);
     std::ofstream out(directory/"boundaries.csv");
     out << "position,rows,taps_exact,full_state_checked,continuation_bytes\n";
-    auto source=load_ids(env("NINFER_E5A4_PROMPT_FILE"));
-    const int total=env_int("NINFER_E5A4_CONTEXTS",512);
+    auto source=load_ids(env("VOIDINFER_E5A4_PROMPT_FILE"));
+    const int total=env_int("VOIDINFER_E5A4_CONTEXTS",512);
     require((total==512 || total==2080) && target.max_context()>=total+16,"chunk qualification extent");
     std::vector<std::int64_t> ids(total+16);
     for(std::size_t i=0;i<ids.size();++i) ids[i]=source[i%source.size()];

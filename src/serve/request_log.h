@@ -15,15 +15,14 @@
 #include <optional>
 #include <string>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 
 inline constexpr int kRequestLogSchemaVersion        = 18;
-inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
+inline constexpr const char* kRequestLogArtifactType = "voidinfer_serve_request_log";
 
 struct RequestLogContext {
     std::uint64_t id = 0;
     // Selected package configuration, not proof that a round dispatched.
-    std::optional<Exl3RoundImplementation> selected_exl3_round;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -38,9 +37,9 @@ struct RequestLogContext {
     std::optional<std::uint32_t> thinking_budget;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
-    ninfer::ResolvedSamplingParameters sampling;
+    voidinfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
-    ninfer::PromptPreparationStats preparation;
+    voidinfer::PromptPreparationStats preparation;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -48,7 +47,6 @@ struct RequestLogContext {
 // resolved when preparation rejects the request.
 struct RequestRejectionLogContext {
     std::uint64_t id = 0;
-    std::optional<Exl3RoundImplementation> selected_exl3_round;
     std::string protocol;
     std::string model;
     bool stream                             = false;
@@ -79,23 +77,18 @@ struct ThroughputReport {
     std::uint64_t computed_prefill_tokens = 0;
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
-    std::uint64_t decode_row_rounds       = 0;
-    ninfer::RuntimeStats previous;
-    ninfer::RuntimeStats current;
+    voidinfer::RuntimeStats previous;
+    voidinfer::RuntimeStats current;
 };
 
-[[nodiscard]] std::optional<Exl3RoundImplementation>
-selected_exl3_round(const ninfer::EngineOptions& engine_options) noexcept;
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
                                            const GenerationRequest& request,
-                                           const PreparedRequest& prepared,
-                                           std::optional<Exl3RoundImplementation> selected_round = std::nullopt);
+                                           const PreparedRequest& prepared);
 RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               std::string protocol,
                                                               const GenerationRequest& request,
-                                                              ApiError error,
-                                                              std::optional<Exl3RoundImplementation> selected_round = std::nullopt);
+                                                              ApiError error);
 
 // Compact console records retained for operator visibility.
 std::string format_request_start(const RequestLogContext& context);
@@ -108,10 +101,10 @@ std::string format_throughput(const ThroughputReport& report);
 // object without a trailing newline.
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
-    const ServeOptions& options, const ninfer::EngineOptions& engine_options,
-    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
-    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes);
+    const ServeOptions& options, const voidinfer::EngineOptions& engine_options,
+    const voidinfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
+    const voidinfer::LoadSummary& load, const voidinfer::MemorySummary& memory,
+    const ServerLogEnvironment& environment);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
@@ -134,8 +127,7 @@ ServerLogEnvironment query_server_log_environment(int device);
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
 class JsonlRequestLog {
 public:
-    explicit JsonlRequestLog(const std::string& path,
-                             const std::string& protected_artifact_path = {});
+    explicit JsonlRequestLog(const std::string& path);
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
@@ -147,10 +139,10 @@ public:
     }
 
     void write_server_start(const ServeOptions& options,
-                            const ninfer::EngineOptions& engine_options,
-                            const ninfer::ModelSamplingDefaults& sampling_defaults,
-                            const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+                            const voidinfer::EngineOptions& engine_options,
+                            const voidinfer::ModelSamplingDefaults& sampling_defaults,
+                            const std::string& public_model_id, const voidinfer::LoadSummary& load,
+                            const voidinfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
@@ -167,4 +159,4 @@ private:
     bool failed_ = false;
 };
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

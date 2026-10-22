@@ -1,8 +1,19 @@
 #pragma once
-// Per-layer device storage of the L0 OSCAR INT2 KV history (l0_oscar.cuh).
+// Per-layer device storage of the L0 OSCAR INT4 KV history (l0_oscar.cuh).
 #include <cstdint>
 
-namespace ninfer::exl3::l0_oscar {
+namespace voidinfer::exl3::l0_oscar {
+
+// Device OSCAR rotations (l0_oscar.cuh assets()) for code outside the L0
+// attention translation unit (l0_kv_pack.cuh); defined there.
+struct RotationView {
+    const float* rk = nullptr;   // [16][4][256][256]   x' = x R
+    const float* rv = nullptr;
+    const float* mu = nullptr;   // [16][4][256]
+};
+RotationView rotation_view();
+// Rows below kSink are never encoded (exact sink).
+constexpr int kSinkRows = 64;
 
 // Codes [capacity][4 KV heads][64] bytes and meta [capacity][4][scale0, zero0,
 // scale1, zero1] FP16 per K and V; state[0] encoded watermark, state[1] last
@@ -35,7 +46,7 @@ struct LayerStorage {
     std::uint16_t* prefill_numer = nullptr;  // FP16 [prefill_rows][24][256] merged history
     int capacity = 0, rows = 0, prefill_rows = 0, segment_keys = 0, segments = 0, bank = 0;
     // Exact hot rows (l0_hot.cuh), per layer: the history rows the verifier
-    // attends to most are served from exact FP16 copies instead of their INT2 codes.
+    // attends to most are served from exact FP16 copies instead of their INT4 codes.
     std::uint16_t* hot_k = nullptr;   // FP16 [4][hot_slots][256] exact copies of L2 rows
     std::uint16_t* hot_v = nullptr;   // FP16 [4][hot_slots][256]
     int* hot_row = nullptr;           // [4][hot_slots] absolute row, -1 empty
@@ -49,4 +60,4 @@ struct LayerStorage {
     int hot_slots = 0, hot_words = 0;
 };
 
-}  // namespace ninfer::exl3::l0_oscar
+}  // namespace voidinfer::exl3::l0_oscar

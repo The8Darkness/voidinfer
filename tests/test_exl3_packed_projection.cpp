@@ -1,7 +1,7 @@
 #include "exl3/packed_projection.h"
 #include <array>
 #include <iostream>
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 static void need(bool x){if(!x)throw std::runtime_error("packed descriptor assertion");}
 int main() {
     try {

@@ -90,7 +90,7 @@ Fixture make_fixture(int history) {
             for (int dimension = 0; dimension < kHeadDim; ++dimension) {
                 row[dimension] = fixture_value(0x4B4B4B4BU, token, kv_head, dimension);
             }
-            const auto encoded_k = ninfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.96F);
+            const auto encoded_k = voidinfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.96F);
             const std::size_t row_index = static_cast<std::size_t>(token) * kKVHeads + kv_head;
             std::copy(encoded_k.packed.begin(), encoded_k.packed.end(),
                       fixture.k_packed.begin() + row_index * kCodeBytes);
@@ -100,7 +100,7 @@ Fixture make_fixture(int history) {
             for (int dimension = 0; dimension < kHeadDim; ++dimension) {
                 row[dimension] = fixture_value(0x56565656U, token, kv_head, dimension);
             }
-            const auto encoded_v = ninfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.92F);
+            const auto encoded_v = voidinfer::ops::oscar_int2_g128_encode(row.data(), kHeadDim, 0.92F);
             std::copy(encoded_v.packed.begin(), encoded_v.packed.end(),
                       fixture.v_packed.begin() + row_index * kCodeBytes);
             std::copy(encoded_v.scales_zeros.begin(), encoded_v.scales_zeros.end(),
@@ -253,7 +253,7 @@ struct DeviceFixture {
 };
 
 void launch(const Fixture& fixture, DeviceFixture& device) {
-    ninfer::ops::detail::oscar_int2_g128_history_attention_launch(
+    voidinfer::ops::detail::oscar_int2_g128_history_attention_launch(
         device.q.data, device.k_packed.data, device.k_metadata.data, device.v_packed.data,
         device.v_metadata.data, fixture.history, kAttentionScale, device.scores.data,
         device.softmax.data, device.output.data, nullptr);
@@ -288,7 +288,7 @@ double benchmark_gpu(const Fixture& fixture, DeviceFixture& device, int repetiti
     launch(fixture, device);
     CUDA_CHECK(cudaEventRecord(begin));
     for (int iteration = 0; iteration < repetitions; ++iteration) {
-        ninfer::ops::detail::oscar_int2_g128_history_attention_launch(
+        voidinfer::ops::detail::oscar_int2_g128_history_attention_launch(
             device.q.data, device.k_packed.data, device.k_metadata.data, device.v_packed.data,
             device.v_metadata.data, fixture.history, kAttentionScale, device.scores.data,
             device.softmax.data, device.output.data, nullptr);
@@ -344,7 +344,7 @@ int main() {
         CUDA_CHECK(cudaGetDeviceProperties(&properties, 0));
         require(properties.major == 12, "D4.2a requires the SM120a test target");
 
-        const auto resources = ninfer::ops::detail::oscar_int2_g128_history_kernel_resources();
+        const auto resources = voidinfer::ops::detail::oscar_int2_g128_history_kernel_resources();
         std::cout << "Oscar historical INT2 fused kernel: GPU=" << properties.name
                   << " compute=" << properties.major << '.' << properties.minor
                   << " q_heads=24 kv_heads=4 gqa=6 D=256 group=128\n";

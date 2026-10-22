@@ -25,14 +25,14 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::exl3::Exl3CudaLinearMetadata;
-using ninfer::exl3::Exl3CudaLinearWeights;
-using ninfer::exl3::Exl3CudaLinearWorkspace;
-using ninfer::exl3::Exl3LinearMetadata;
-using ninfer::exl3::Exl3LinearTensors;
-using ninfer::exl3::Exl3ReferenceOutput;
-using ninfer::exl3::SafetensorsHeader;
-using ninfer::exl3::TensorPayload;
+using voidinfer::exl3::Exl3CudaLinearMetadata;
+using voidinfer::exl3::Exl3CudaLinearWeights;
+using voidinfer::exl3::Exl3CudaLinearWorkspace;
+using voidinfer::exl3::Exl3LinearMetadata;
+using voidinfer::exl3::Exl3LinearTensors;
+using voidinfer::exl3::Exl3ReferenceOutput;
+using voidinfer::exl3::SafetensorsHeader;
+using voidinfer::exl3::TensorPayload;
 
 constexpr const char* kTrellisName =
     "model.language_model.layers.5.mlp.gate_proj.trellis";
@@ -78,11 +78,11 @@ T* allocate_device(DeviceBuffer& owner, std::size_t count, const char* label) {
     return static_cast<T*>(owner.pointer);
 }
 
-TensorPayload load_indexed_tensor(const ninfer::exl3::IndexedSafetensors& collection,
+TensorPayload load_indexed_tensor(const voidinfer::exl3::IndexedSafetensors& collection,
                                   const char* name) {
     for (const auto& shard : collection.shards) {
         if (shard.header.find(name) != nullptr) {
-            return ninfer::exl3::read_tensor(shard.path, shard.header, name);
+            return voidinfer::exl3::read_tensor(shard.path, shard.header, name);
         }
     }
     throw std::runtime_error(std::string("indexed tensor is absent: ") + name);
@@ -268,10 +268,10 @@ double benchmark(Exl3CudaLinearWorkspace& workspace,
                  const std::uint16_t* input,
                  std::uint16_t* output,
                  int rows) {
-    const int warmup = env_or_empty("NINFER_EXL3_WARMUP").empty()
-        ? 10 : std::stoi(env_or_empty("NINFER_EXL3_WARMUP"));
-    const int iterations = env_or_empty("NINFER_EXL3_ITERATIONS").empty()
-        ? 40 : std::stoi(env_or_empty("NINFER_EXL3_ITERATIONS"));
+    const int warmup = env_or_empty("VOIDINFER_EXL3_WARMUP").empty()
+        ? 10 : std::stoi(env_or_empty("VOIDINFER_EXL3_WARMUP"));
+    const int iterations = env_or_empty("VOIDINFER_EXL3_ITERATIONS").empty()
+        ? 40 : std::stoi(env_or_empty("VOIDINFER_EXL3_ITERATIONS"));
     require(warmup >= 0 && iterations > 0, "invalid EXL3 benchmark iteration settings");
     for (int i = 0; i < warmup; ++i) {
         workspace.forward(weights, metadata, input, output, rows);
@@ -298,8 +298,8 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
     constexpr int input_features = 17408;
     constexpr int output_features = 5120;
     const bool coherent =
-        env_or_empty("NINFER_EXL3_TEST_COHERENT_DOWN_K6") == "1";
-    const auto collection = ninfer::exl3::inspect_indexed_directory(model_dir);
+        env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_DOWN_K6") == "1";
+    const auto collection = voidinfer::exl3::inspect_indexed_directory(model_dir);
     std::vector<TensorPayload> host;
     for (const char* suffix : {"trellis", "suh", "svh", "mul1"}) {
         host.push_back(load_indexed_tensor(collection,
@@ -322,13 +322,13 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
         reinterpret_cast<const std::uint16_t*>(upload(d_suh, host[1], "down suh")),
         reinterpret_cast<const std::uint16_t*>(upload(d_svh, host[2], "down svh")),
         reinterpret_cast<const std::int32_t*>(upload(d_mul1, host[3], "down mul1"))};
-    auto* input = allocate_device<std::uint16_t>(d_input, 8u * input_features, "down input");
+    auto* input = allocate_device<std::uint16_t>(d_input, 16u * input_features, "down input");
     auto* control_output = allocate_device<std::uint16_t>(
-        d_control, 8u * output_features, "down control output");
+        d_control, 16u * output_features, "down control output");
     constexpr std::size_t guard_elements = 32;
     auto* candidate_output = allocate_device<std::uint16_t>(
-        d_candidate, 8u * output_features + guard_elements, "down candidate output");
-    std::vector<std::uint16_t> input_bits(8u * input_features);
+        d_candidate, 16u * output_features + guard_elements, "down candidate output");
+    std::vector<std::uint16_t> input_bits(16u * input_features);
     for (std::size_t index = 0; index < input_bits.size(); ++index) {
         const std::uint16_t magnitude = static_cast<std::uint16_t>(
             0x2800u + ((index * 73u + index / input_features * 31u) % 0x800u));
@@ -352,24 +352,24 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
                           cudaMemcpyHostToDevice), "down input upload");
     const Exl3CudaLinearMetadata metadata{
         input_features, output_features, 6, false, true, false};
-    _putenv_s("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1", coherent ? "0" : "1");
-    _putenv_s("NINFER_EXL3_FAST_FP16_M2_8", "0");
-    _putenv_s("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6", "0");
-    _putenv_s("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6", "0");
-    _putenv_s("NINFER_EXL3_COHERENT_DOWN_K6", "0");
-    Exl3CudaLinearWorkspace control(input_features, output_features, 8,
+    _putenv_s("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16_M1", coherent ? "0" : "1");
+    _putenv_s("VOIDINFER_EXL3_FAST_FP16_M2_8", "0");
+    _putenv_s("VOIDINFER_EXL3_FAST_FP16_M2_8_DOWN_K6", "0");
+    _putenv_s("VOIDINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6", "0");
+    _putenv_s("VOIDINFER_EXL3_COHERENT_DOWN_K6", "0");
+    Exl3CudaLinearWorkspace control(input_features, output_features, 16,
                                     false, false, true);
     const bool fused_down =
-        !coherent && env_or_empty("NINFER_EXL3_TEST_FAST_SMALL_M_FUSED_DOWN") == "1";
+        !coherent && env_or_empty("VOIDINFER_EXL3_TEST_FAST_SMALL_M_FUSED_DOWN") == "1";
     if (coherent)
-        _putenv_s("NINFER_EXL3_COHERENT_DOWN_K6", "1");
+        _putenv_s("VOIDINFER_EXL3_COHERENT_DOWN_K6", "1");
     else if (fused_down)
-        _putenv_s("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6", "1");
+        _putenv_s("VOIDINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6", "1");
     else
-        _putenv_s("NINFER_EXL3_FAST_FP16_M2_8", "1");
-    Exl3CudaLinearWorkspace candidate(input_features, output_features, 8,
+        _putenv_s("VOIDINFER_EXL3_FAST_FP16_M2_8", "1");
+    Exl3CudaLinearWorkspace candidate(input_features, output_features, 16,
                                       false, false, true);
-    using Admission = ninfer::exl3::Exl3CudaLinearAdmission;
+    using Admission = voidinfer::exl3::Exl3CudaLinearAdmission;
     const auto calls = [&]() {
         return coherent
             ? Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test()
@@ -384,7 +384,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
     if (coherent) {
         require(candidate.coherent_down_k6_resident_capacity_for_test() > 0,
                 "coherent K6 down has no resident block capacity");
-        for (int row = 0; row < 8; ++row)
+        for (int row = 0; row < 16; ++row)
             row_oracles.push_back(coherent_down_witness::evaluate(
                 input_bits, host[1].typed<std::uint16_t>("F16"),
                 host[2].typed<std::uint16_t>("F16"),
@@ -397,14 +397,14 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
                 "coherent correction M1 admission did not select shared core");
     }
     const std::vector<int> row_counts = coherent
-        ? std::vector<int>{1, 2, 3, 4, 7, 8}
+        ? std::vector<int>{1, 2, 3, 4, 7, 8, 9, 12, 16}
         : std::vector<int>{2, 4, 8};
-    std::array<std::vector<std::uint16_t>, 8> coherent_row_snapshots;
+    std::array<std::vector<std::uint16_t>, 16> coherent_row_snapshots;
     for (int rows : row_counts) {
         const auto admission = rows == 1 ? Admission::ordinary
                                          : Admission::target_continuation_down;
         cuda_check(cudaMemset(candidate_output, 0xa5,
-            (8u * output_features + guard_elements) * sizeof(std::uint16_t)),
+            (16u * output_features + guard_elements) * sizeof(std::uint16_t)),
             "initialize coherent down output and tail guard");
         control.forward(weights, metadata, input, control_output, rows,
                         nullptr, admission);
@@ -447,7 +447,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
                         "coherent_down_k6_shared_rows_n8_split5",
                     "coherent K6 down dispatch admission/fallback mismatch");
             std::vector<std::uint16_t> guard(
-                8u * output_features + guard_elements - expected.size());
+                16u * output_features + guard_elements - expected.size());
             cuda_check(cudaMemcpy(guard.data(), candidate_output + expected.size(),
                                   guard.size() * sizeof(std::uint16_t),
                                   cudaMemcpyDeviceToHost),
@@ -526,7 +526,7 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
             "selected down path was not dispatched for each row count");
     if (coherent)
         require(Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test() -
-                    before_rows == 27,
+                    before_rows == 64,
                 "coherent K6 down dispatched row count mismatch");
     if (fused_down) {
         const auto control_us = benchmark(control, weights, metadata, input,
@@ -542,8 +542,8 @@ void run_fast_small_m_down_operator(const std::filesystem::path& model_dir) {
 void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
     constexpr int in_features=6144,out_features=5120;
     constexpr std::size_t guard=64;
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
-    const auto collection=ninfer::exl3::inspect_indexed_directory(model_dir);
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
+    const auto collection=voidinfer::exl3::inspect_indexed_directory(model_dir);
     std::vector<TensorPayload> host;
     for(const char* suffix:{"trellis","suh","svh","mul1"})
         host.push_back(load_indexed_tensor(collection,
@@ -567,11 +567,11 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
         reinterpret_cast<const std::uint16_t*>(upload(d_suh,host[1],"K7 O suh")),
         reinterpret_cast<const std::uint16_t*>(upload(d_svh,host[2],"K7 O svh")),
         reinterpret_cast<const std::int32_t*>(upload(d_mul1,host[3],"K7 O mul1"))};
-    auto* input=allocate_device<std::uint16_t>(d_input,8u*in_features,"K7 O input");
-    auto* control=allocate_device<std::uint16_t>(d_control,8u*out_features,"K7 O control");
+    auto* input=allocate_device<std::uint16_t>(d_input,16u*in_features,"K7 O input");
+    auto* control=allocate_device<std::uint16_t>(d_control,16u*out_features,"K7 O control");
     auto* candidate=allocate_device<std::uint16_t>(d_candidate,
-        8u*out_features+guard,"K7 O candidate");
-    std::vector<std::uint16_t> input_bits(8u*in_features);
+        16u*out_features+guard,"K7 O candidate");
+    std::vector<std::uint16_t> input_bits(16u*in_features);
     for(std::size_t i=0;i<input_bits.size();++i) {
         const auto magnitude=static_cast<std::uint16_t>(
             0x2800u+((i*73u+i/in_features*31u)%0x800u));
@@ -581,11 +581,11 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
     cuda_check(cudaMemcpy(input,input_bits.data(),input_bits.size()*sizeof(std::uint16_t),
                           cudaMemcpyHostToDevice),"K7 O input upload");
     const Exl3CudaLinearMetadata metadata{in_features,out_features,7,false,true,false};
-    _putenv_s("NINFER_EXL3_COHERENT_O_K7","0");
-    Exl3CudaLinearWorkspace old(in_features,out_features,8,
+    _putenv_s("VOIDINFER_EXL3_COHERENT_O_K7","0");
+    Exl3CudaLinearWorkspace old(in_features,out_features,16,
         false,false,false,true);
-    _putenv_s("NINFER_EXL3_COHERENT_O_K7","1");
-    Exl3CudaLinearWorkspace shared(in_features,out_features,8,
+    _putenv_s("VOIDINFER_EXL3_COHERENT_O_K7","1");
+    Exl3CudaLinearWorkspace shared(in_features,out_features,16,
         false,false,false,true);
     require(shared.coherent_o_k7_resident_capacity_for_test()>0,
         "coherent K7 O has no resident block capacity");
@@ -594,14 +594,14 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
     const auto before_rows=Exl3CudaLinearWorkspace::
         process_coherent_o_k7_rows_for_test();
     std::vector<coherent_down_witness::Result> oracle;
-    for(int row=0;row<8;++row)
+    for(int row=0;row<16;++row)
         oracle.push_back(coherent_down_witness::evaluate_o_k7(
             input_bits,host[1].typed<std::uint16_t>("F16"),
             host[2].typed<std::uint16_t>("F16"),
             host[0].typed<std::uint16_t>("I16"),
             static_cast<std::uint32_t>(host[3].typed<std::int32_t>("I32")[0]),row));
-    std::array<std::vector<std::uint16_t>,8> row_snapshots;
-    for(int rows:{1,2,3,4,7,8}) {
+    std::array<std::vector<std::uint16_t>,16> row_snapshots;
+    for(int rows:{1,2,3,4,7,8,9,12,16}) {
         const auto admission=rows==1?Admission::ordinary:
             Admission::target_continuation_o;
         require(std::string(shared.dispatch_name(metadata,rows,admission))==
@@ -610,7 +610,7 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
                     "coherent_o_k7_shared_rows_n8_split5",
             "coherent K7 O dispatch or fallback mismatch");
         cuda_check(cudaMemset(candidate,0xa5,
-            (8u*out_features+guard)*sizeof(std::uint16_t)),
+            (16u*out_features+guard)*sizeof(std::uint16_t)),
             "K7 O tail canary");
         old.forward(weights,metadata,input,control,rows,nullptr,admission);
         shared.forward(weights,metadata,input,candidate,rows,nullptr,admission);
@@ -620,7 +620,7 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
                               cudaMemcpyDeviceToHost),"K7 O control download");
         cuda_check(cudaMemcpy(actual.data(),candidate,actual.size()*sizeof(std::uint16_t),
                               cudaMemcpyDeviceToHost),"K7 O shared download");
-        std::vector<std::uint16_t> tail(8u*out_features+guard-actual.size());
+        std::vector<std::uint16_t> tail(16u*out_features+guard-actual.size());
         cuda_check(cudaMemcpy(tail.data(),candidate+actual.size(),
             tail.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost),
             "K7 O tail download");
@@ -669,18 +669,18 @@ void run_coherent_o_k7_operator(const std::filesystem::path& model_dir) {
         "K7 O correction download");
     require(scalar==correction,"coherent K7 O scalar/correction M1 mismatch");
     require(Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test()-
-                before_calls==8 &&
+                before_calls==11 &&
             Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test()-
-                before_rows==27,
+                before_rows==64,
         "coherent K7 O dispatch counts or rows mismatch");
-    std::cout<<"COHERENT_O_K7_OPERATOR PASS calls=8 rows=27\n";
+    std::cout<<"COHERENT_O_K7_OPERATOR PASS calls=11 rows=64\n";
 }
 
 void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
     constexpr int in_features=17408,out_features=5120;
     constexpr std::size_t guard=64;
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
-    const auto collection=ninfer::exl3::inspect_indexed_directory(model_dir);
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
+    const auto collection=voidinfer::exl3::inspect_indexed_directory(model_dir);
     std::vector<TensorPayload> host;
     for(const char* suffix:{"trellis","suh","svh","mul1"})
         host.push_back(load_indexed_tensor(collection,
@@ -704,11 +704,11 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
         reinterpret_cast<const std::uint16_t*>(upload(d_suh,host[1],"K7 down suh")),
         reinterpret_cast<const std::uint16_t*>(upload(d_svh,host[2],"K7 down svh")),
         reinterpret_cast<const std::int32_t*>(upload(d_mul1,host[3],"K7 down mul1"))};
-    auto* input=allocate_device<std::uint16_t>(d_input,8u*in_features,"K7 down input");
-    auto* control=allocate_device<std::uint16_t>(d_control,8u*out_features,"K7 down control");
+    auto* input=allocate_device<std::uint16_t>(d_input,16u*in_features,"K7 down input");
+    auto* control=allocate_device<std::uint16_t>(d_control,16u*out_features,"K7 down control");
     auto* candidate=allocate_device<std::uint16_t>(d_candidate,
-        8u*out_features+guard,"K7 down candidate");
-    std::vector<std::uint16_t> input_bits(8u*in_features);
+        16u*out_features+guard,"K7 down candidate");
+    std::vector<std::uint16_t> input_bits(16u*in_features);
     for(std::size_t i=0;i<input_bits.size();++i) {
         const auto magnitude=static_cast<std::uint16_t>(
             0x2800u+((i*73u+i/in_features*31u)%0x800u));
@@ -718,11 +718,11 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
     cuda_check(cudaMemcpy(input,input_bits.data(),input_bits.size()*sizeof(std::uint16_t),
                           cudaMemcpyHostToDevice),"K7 down input upload");
     const Exl3CudaLinearMetadata metadata{in_features,out_features,7,false,true,false};
-    _putenv_s("NINFER_EXL3_COHERENT_DOWN_K7","0");
-    Exl3CudaLinearWorkspace old(in_features,out_features,8,
+    _putenv_s("VOIDINFER_EXL3_COHERENT_DOWN_K7","0");
+    Exl3CudaLinearWorkspace old(in_features,out_features,16,
         false,false,true,false);
-    _putenv_s("NINFER_EXL3_COHERENT_DOWN_K7","1");
-    Exl3CudaLinearWorkspace shared(in_features,out_features,8,
+    _putenv_s("VOIDINFER_EXL3_COHERENT_DOWN_K7","1");
+    Exl3CudaLinearWorkspace shared(in_features,out_features,16,
         false,false,true,false);
     require(shared.coherent_down_k7_shared_bytes_for_test()==12800,
         "coherent K7 down shared resource declaration mismatch");
@@ -732,7 +732,7 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
                 Exl3CudaLinearMetadata{in_features,out_features,6,false,true,false},
                 1,Admission::ordinary))!=
                 "coherent_down_k7_shared_rows_n8_split5" &&
-            std::string(shared.dispatch_name(metadata,9,Admission::ordinary))!=
+            std::string(shared.dispatch_name(metadata,17,Admission::ordinary))!=
                 "coherent_down_k7_shared_rows_n8_split5",
         "coherent K7 down escaped its metadata or row contract");
     const auto before_calls=Exl3CudaLinearWorkspace::
@@ -740,14 +740,14 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
     const auto before_rows=Exl3CudaLinearWorkspace::
         process_coherent_down_k7_rows_for_test();
     std::vector<coherent_down_witness::Result> oracle;
-    for(int row=0;row<8;++row)
+    for(int row=0;row<16;++row)
         oracle.push_back(coherent_down_witness::evaluate_down_k7(
             input_bits,host[1].typed<std::uint16_t>("F16"),
             host[2].typed<std::uint16_t>("F16"),
             host[0].typed<std::uint16_t>("I16"),
             static_cast<std::uint32_t>(host[3].typed<std::int32_t>("I32")[0]),row));
-    std::array<std::vector<std::uint16_t>,8> row_snapshots;
-    for(int rows:{1,2,3,4,7,8}) {
+    std::array<std::vector<std::uint16_t>,16> row_snapshots;
+    for(int rows:{1,2,3,4,7,8,9,12,16}) {
         const auto admission=rows==1?Admission::ordinary:
             Admission::target_continuation_down;
         require(std::string(shared.dispatch_name(metadata,rows,admission))==
@@ -763,7 +763,7 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
                     "coherent_down_k7_shared_rows_n8_split5",
             "coherent K7 down scalar and correction admission differ");
         cuda_check(cudaMemset(candidate,0xa5,
-            (8u*out_features+guard)*sizeof(std::uint16_t)),
+            (16u*out_features+guard)*sizeof(std::uint16_t)),
             "K7 down tail canary");
         old.forward(weights,metadata,input,control,rows,nullptr,admission);
         shared.forward(weights,metadata,input,candidate,rows,nullptr,admission);
@@ -782,7 +782,7 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
             "coherent K7 down alternate-admission download");
         require(other==actual,
             "coherent K7 down scalar/correction arithmetic differs");
-        std::vector<std::uint16_t> tail(8u*out_features+guard-actual.size());
+        std::vector<std::uint16_t> tail(16u*out_features+guard-actual.size());
         cuda_check(cudaMemcpy(tail.data(),candidate+actual.size(),
             tail.size()*sizeof(std::uint16_t),cudaMemcpyDeviceToHost),
             "K7 down tail download");
@@ -834,17 +834,17 @@ void run_coherent_down_k7_operator(const std::filesystem::path& model_dir) {
         "K7 down correction download");
     require(scalar==correction,"coherent K7 down scalar/correction M1 mismatch");
     require(Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test()-
-                before_calls==14 &&
+                before_calls==20 &&
             Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test()-
-                before_rows==52,
+                before_rows==126,
         "coherent K7 down dispatch counts or rows mismatch");
-    std::cout<<"COHERENT_DOWN_K7_OPERATOR PASS calls=14 rows=52\n";
+    std::cout<<"COHERENT_DOWN_K7_OPERATOR PASS calls=20 rows=126\n";
 }
 
 void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
-    using Admission=ninfer::exl3::Exl3CudaLinearAdmission;
-    const bool split10=std::getenv("NINFER_EXL3_TEST_COHERENT_WIDE_K6_SPLIT10") &&
-        std::strcmp(std::getenv("NINFER_EXL3_TEST_COHERENT_WIDE_K6_SPLIT10"),"1")==0;
+    using Admission=voidinfer::exl3::Exl3CudaLinearAdmission;
+    const bool split10=std::getenv("VOIDINFER_EXL3_TEST_COHERENT_WIDE_K6_SPLIT10") &&
+        std::strcmp(std::getenv("VOIDINFER_EXL3_TEST_COHERENT_WIDE_K6_SPLIT10"),"1")==0;
     struct Shape {
         const char* name; const char* prefix;
         int in_features,out_features,operation;
@@ -871,7 +871,7 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
         {"up","model.language_model.layers.19.mlp.up_proj.",5120,17408,4,
             Admission::target_continuation_gate_up,true,false,false,false,false,
             "coherent_wide_k6_gate_up_n8_m16_split5"}};
-    const auto collection=ninfer::exl3::inspect_indexed_directory(model_dir);
+    const auto collection=voidinfer::exl3::inspect_indexed_directory(model_dir);
     constexpr std::size_t guard=64;
     for(const auto& shape:shapes) {
         std::vector<TensorPayload> host;
@@ -900,7 +900,7 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             reinterpret_cast<const std::uint16_t*>(upload(d_suh,host[1],"wide suh")),
             reinterpret_cast<const std::uint16_t*>(upload(d_svh,host[2],"wide svh")),
             reinterpret_cast<const std::int32_t*>(upload(d_mul1,host[3],"wide mul1"))};
-        std::vector<std::uint16_t> input_bits(8u*shape.in_features);
+        std::vector<std::uint16_t> input_bits(16u*shape.in_features);
         for(std::size_t i=0;i<input_bits.size();++i) {
             const auto magnitude=static_cast<std::uint16_t>(
                 0x2800u+((i*73u+i/shape.in_features*31u)%0x800u));
@@ -911,19 +911,19 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
         cuda_check(cudaMemcpy(input,input_bits.data(),
             input_bits.size()*sizeof(std::uint16_t),cudaMemcpyHostToDevice),
             "wide input upload");
-        const std::size_t extent=8u*shape.out_features+guard;
+        const std::size_t extent=16u*shape.out_features+guard;
         auto* scalar=allocate_device<std::uint16_t>(d_scalar,extent,"wide scalar");
         auto* verifier=allocate_device<std::uint16_t>(d_verifier,extent,"wide verifier");
         const Exl3CudaLinearMetadata metadata{
             shape.in_features,shape.out_features,6,false,true,false};
-        _putenv_s("NINFER_EXL3_TARGET_COHERENT_WIDE_K6","0");
+        _putenv_s("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6","0");
         Exl3CudaLinearWorkspace old(shape.in_features,shape.out_features,8,
             false,shape.gate_up,false,shape.o,shape.z,false,false,
             {},{},shape.qkv,false,shape.q);
-        _putenv_s("NINFER_EXL3_TARGET_COHERENT_WIDE_K6","1");
-        _putenv_s("NINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",split10?"1":"0");
-        Exl3CudaLinearWorkspace candidate(shape.in_features,shape.out_features,
-            split10?16:8,
+        _putenv_s("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6","1");
+        _putenv_s("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6_SPLIT10",split10?"1":"0");
+        // 16 rows: batched rounds of two agents' verifier rows share one launch.
+        Exl3CudaLinearWorkspace candidate(shape.in_features,shape.out_features,16,
             false,shape.gate_up,false,shape.o,shape.z,false,false,
             {},{},shape.qkv,false,shape.q);
         std::string dispatch=shape.dispatch;
@@ -933,10 +933,11 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
                 candidate.coherent_wide_k6_registers_per_thread_for_test()>0 &&
                 candidate.coherent_wide_k6_shared_bytes_for_test()==12288,
             std::string("coherent wide K6 resource/owner gate: ")+shape.name);
-        require(std::string(candidate.dispatch_name(
+        const bool row_timing=env_or_empty("VOIDINFER_EXL3_TEST_ROW_TIMING")=="1";
+        require(row_timing || std::string(candidate.dispatch_name(
                 Exl3CudaLinearMetadata{shape.in_features,shape.out_features,7,
                     false,true,false},1,Admission::ordinary))!=dispatch &&
-                std::string(candidate.dispatch_name(metadata,9,
+                std::string(candidate.dispatch_name(metadata,17,
                     Admission::ordinary))!=dispatch &&
                 std::string(candidate.dispatch_name(metadata,1,
                     Admission::target_continuation_down))!=dispatch,
@@ -947,17 +948,18 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             coherent_wide_k6_rows_for_test(shape.operation);
         const auto before_split10=Exl3CudaLinearWorkspace::
             coherent_wide_k6_split10_calls_for_test(shape.operation);
-        std::array<coherent_wide_k6_witness::Output,8> oracle;
-        for(int row=0;row<8;++row)
+        std::array<coherent_wide_k6_witness::Output,16> oracle;
+        for(int row=0;row<16;++row)
             oracle[row]=coherent_wide_k6_witness::evaluate(
                 input_bits,host[1].typed<std::uint16_t>("F16"),
                 host[2].typed<std::uint16_t>("F16"),
                 host[0].typed<std::uint16_t>("I16"),
                 static_cast<std::uint32_t>(host[3].typed<std::int32_t>("I32")[0]),
                 row,shape.in_features,shape.out_features);
-        std::array<std::vector<std::uint16_t>,8> row_snapshots;
-        for(int rows:{1,2,3,4,7,8}) {
-            require(std::string(old.dispatch_name(metadata,rows,
+        std::array<std::vector<std::uint16_t>,16> row_snapshots;
+        for(int rows:{1,2,3,4,7,8,9,12,16}) {
+            if(env_or_empty("VOIDINFER_EXL3_TEST_ROW_TIMING")=="1")break;
+            require(rows>8 || std::string(old.dispatch_name(metadata,rows,
                         Admission::ordinary))!=dispatch &&
                     std::string(candidate.dispatch_name(metadata,rows,
                         Admission::ordinary))==dispatch &&
@@ -1014,12 +1016,85 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
             require(max_abs<=0.02 && relative_l2<=0.002,
                 std::string("coherent wide K6 FP64 bound: ")+shape.name);
         }
+        if(env_or_empty("VOIDINFER_EXL3_TEST_ROW_TIMING")=="1") {
+            // Batched-round economics: one launch per projection at each width.
+            for(int rows:{1,8,16}) {
+                cudaEvent_t start,stop;
+                cuda_check(cudaEventCreate(&start),"timing event");cuda_check(cudaEventCreate(&stop),"timing event");
+                for(int i=0;i<20;++i)candidate.forward(weights,metadata,input,scalar,rows,nullptr,shape.continuation);
+                cuda_check(cudaEventRecord(start),"timing start");
+                for(int i=0;i<200;++i)candidate.forward(weights,metadata,input,scalar,rows,nullptr,shape.continuation);
+                cuda_check(cudaEventRecord(stop),"timing stop");cuda_check(cudaEventSynchronize(stop),"timing sync");
+                float elapsed=0;cuda_check(cudaEventElapsedTime(&elapsed,start,stop),"timing read");
+                std::cout<<"ROW_TIMING op="<<shape.name<<" M="<<rows<<" us="<<elapsed*1000.0f/200<<'\n';
+                cudaEventDestroy(start);cudaEventDestroy(stop);
+            }
+            // Wider batched rounds (4/8 agents): the routes a 64-row workspace takes.
+            // VOIDINFER_EXL3_TEST_M64=1: the serving coherent M32/M64 producer
+            // (wide K6 off) at up to 64 rows, M64 rows checked against M16.
+            const bool m64=env_or_empty("VOIDINFER_EXL3_TEST_M64")=="1";
+            if(m64)_putenv_s("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6","0");
+            Exl3CudaLinearWorkspace wide(shape.in_features,shape.out_features,64,
+                false,shape.gate_up,false,shape.o,shape.z,true,false,
+                {},{},shape.qkv,false,shape.q);
+            DeviceBuffer d_wide_in,d_wide_out;
+            auto* wide_in=allocate_device<std::uint16_t>(d_wide_in,64u*shape.in_features,"wide timing input");
+            auto* wide_out=allocate_device<std::uint16_t>(d_wide_out,64u*shape.out_features,"wide timing output");
+            for(int r=0;r<4;++r)cuda_check(cudaMemcpy(wide_in+static_cast<std::size_t>(r)*16*shape.in_features,input,
+                16u*shape.in_features*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice),"wide timing input copy");
+            for(int rows:{8,16,24,32,48,64}) {
+                if(rows>32 && !m64)break;
+                cudaEvent_t start,stop;
+                cuda_check(cudaEventCreate(&start),"timing event");cuda_check(cudaEventCreate(&stop),"timing event");
+                for(int i=0;i<20;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?shape.continuation:Admission::ordinary);
+                cuda_check(cudaEventRecord(start),"timing start");
+                for(int i=0;i<200;++i)wide.forward(weights,metadata,wide_in,wide_out,rows,nullptr,rows>16?shape.continuation:Admission::ordinary);
+                cuda_check(cudaEventRecord(stop),"timing stop");cuda_check(cudaEventSynchronize(stop),"timing sync");
+                float elapsed=0;cuda_check(cudaEventElapsedTime(&elapsed,start,stop),"timing read");
+                std::cout<<"ROW_TIMING_WIDE op="<<shape.name<<" M="<<rows<<" us="<<elapsed*1000.0f/200
+                         <<" dispatch="<<wide.dispatch_name(metadata,rows,rows>16?shape.continuation:Admission::ordinary)<<'\n';
+                cudaEventDestroy(start);cudaEventDestroy(stop);
+            }
+            {
+                // M32 rows equal the M16 result of the same rows bit for bit.
+                std::vector<std::uint16_t> wide32(32u*shape.out_features),half16(32u*shape.out_features);
+                wide.forward(weights,metadata,wide_in,wide_out,32,nullptr,shape.continuation);
+                cuda_check(cudaMemcpy(wide32.data(),wide_out,wide32.size()*2,cudaMemcpyDeviceToHost),"m32 read");
+                std::cout<<"M32 dispatch16="<<wide.dispatch_name(metadata,16,shape.continuation)<<" dispatch32="<<wide.dispatch_name(metadata,32,shape.continuation)<<std::endl;
+                for(int h=0;h<2;++h) {
+                    wide.forward(weights,metadata,wide_in+static_cast<std::size_t>(h)*16*shape.in_features,
+                        wide_out,16,nullptr,shape.continuation);
+                    cuda_check(cudaMemcpy(half16.data()+static_cast<std::size_t>(h)*16*shape.out_features,wide_out,
+                        16u*shape.out_features*2,cudaMemcpyDeviceToHost),"m16 read");
+                }
+                std::size_t differ=0;
+                for(std::size_t i=0;i<wide32.size();++i)differ+=wide32[i]!=half16[i];
+                std::cout<<"ROW_M32_EXACT op="<<shape.name<<" differing="<<differ<<'\n';
+            }
+            if(m64) {
+                // M64 rows equal the M16 result of the same rows bit for bit.
+                std::vector<std::uint16_t> wide64(64u*shape.out_features),quarter16(64u*shape.out_features);
+                wide.forward(weights,metadata,wide_in,wide_out,64,nullptr,shape.continuation);
+                cuda_check(cudaMemcpy(wide64.data(),wide_out,wide64.size()*2,cudaMemcpyDeviceToHost),"m64 read");
+                for(int h=0;h<4;++h) {
+                    wide.forward(weights,metadata,wide_in+static_cast<std::size_t>(h)*16*shape.in_features,
+                        wide_out,16,nullptr,shape.continuation);
+                    cuda_check(cudaMemcpy(quarter16.data()+static_cast<std::size_t>(h)*16*shape.out_features,wide_out,
+                        16u*shape.out_features*2,cudaMemcpyDeviceToHost),"m16 read");
+                }
+                std::size_t differ=0;
+                for(std::size_t i=0;i<wide64.size();++i)differ+=wide64[i]!=quarter16[i];
+                std::cout<<"ROW_M64_EXACT op="<<shape.name<<" dispatch64="<<wide.dispatch_name(metadata,64,shape.continuation)
+                         <<" differing="<<differ<<std::endl;
+            }
+            continue;
+        }
         require(Exl3CudaLinearWorkspace::coherent_wide_k6_calls_for_test(
-                    shape.operation)-before_calls==12 &&
+                    shape.operation)-before_calls==18 &&
                 Exl3CudaLinearWorkspace::coherent_wide_k6_rows_for_test(
-                    shape.operation)-before_rows==50 &&
+                    shape.operation)-before_rows==124 &&
                 Exl3CudaLinearWorkspace::coherent_wide_k6_split10_calls_for_test(
-                    shape.operation)-before_split10==(split10?12u:0u),
+                    shape.operation)-before_split10==(split10?18u:0u),
             std::string("coherent wide K6 actual calls/rows: ")+shape.name);
     }
 }
@@ -1028,13 +1103,13 @@ void run_coherent_wide_k6_operator(const std::filesystem::path& model_dir) {
 
 int main() {
     try {
-        if (env_or_empty("NINFER_EXL3_TEST_COHERENT_DOWN_CPU") == "1" ||
-            env_or_empty("NINFER_EXL3_TEST_COHERENT_DOWN_K7_CPU") == "1") {
+        if (env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_DOWN_CPU") == "1" ||
+            env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_DOWN_K7_CPU") == "1") {
             const bool k7_cpu =
-                env_or_empty("NINFER_EXL3_TEST_COHERENT_DOWN_K7_CPU") == "1";
-            const auto model_text = env_or_empty("NINFER_EXL3_TARGET_PATH");
+                env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_DOWN_K7_CPU") == "1";
+            const auto model_text = env_or_empty("VOIDINFER_EXL3_TARGET_PATH");
             require(!model_text.empty(), "coherent down CPU witness requires model path");
-            const auto collection = ninfer::exl3::inspect_indexed_directory(model_text);
+            const auto collection = voidinfer::exl3::inspect_indexed_directory(model_text);
             std::vector<TensorPayload> host;
             for (const char* suffix : {"trellis", "suh", "svh", "mul1"})
                 host.push_back(load_indexed_tensor(collection,
@@ -1103,31 +1178,31 @@ int main() {
                       << cudaGetErrorString(device_status) << '\n';
             return 77;
         }
-        const auto model_text = env_or_empty("NINFER_EXL3_TARGET_PATH");
-        if (env_or_empty("NINFER_EXL3_TEST_FAST_SMALL_M_DOWN") == "1" ||
-            env_or_empty("NINFER_EXL3_TEST_COHERENT_DOWN_K6") == "1") {
+        const auto model_text = env_or_empty("VOIDINFER_EXL3_TARGET_PATH");
+        if (env_or_empty("VOIDINFER_EXL3_TEST_FAST_SMALL_M_DOWN") == "1" ||
+            env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_DOWN_K6") == "1") {
             require(!model_text.empty(), "small-M down test requires model path");
             run_fast_small_m_down_operator(std::filesystem::path(model_text));
             return 0;
         }
-        if (env_or_empty("NINFER_EXL3_TEST_COHERENT_WIDE_K6") == "1") {
+        if (env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_WIDE_K6") == "1") {
             require(!model_text.empty(),"coherent wide K6 test requires model path");
             run_coherent_wide_k6_operator(std::filesystem::path(model_text));
             return 0;
         }
-        if (env_or_empty("NINFER_EXL3_TEST_COHERENT_DOWN_K7") == "1") {
+        if (env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_DOWN_K7") == "1") {
             require(!model_text.empty(),"coherent K7 down test requires model path");
             run_coherent_down_k7_operator(std::filesystem::path(model_text));
             return 0;
         }
-        if (env_or_empty("NINFER_EXL3_TEST_COHERENT_O_K7") == "1") {
+        if (env_or_empty("VOIDINFER_EXL3_TEST_COHERENT_O_K7") == "1") {
             require(!model_text.empty(),"coherent K7 O test requires model path");
             run_coherent_o_k7_operator(std::filesystem::path(model_text));
             return 0;
         }
-        const auto oracle_text = env_or_empty("NINFER_EXL3_ORACLE_PATH");
+        const auto oracle_text = env_or_empty("VOIDINFER_EXL3_ORACLE_PATH");
         if (model_text.empty() || oracle_text.empty()) {
-            std::cerr << "SKIP: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n";
+            std::cerr << "SKIP: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_ORACLE_PATH\n";
             return 77;
         }
         const std::filesystem::path model_dir(model_text);
@@ -1135,7 +1210,7 @@ int main() {
         require(std::filesystem::exists(model_dir), "model directory does not exist");
         require(std::filesystem::exists(oracle_path), "oracle fixture does not exist");
 
-        const auto collection = ninfer::exl3::inspect_indexed_directory(model_dir);
+        const auto collection = voidinfer::exl3::inspect_indexed_directory(model_dir);
         std::vector<TensorPayload> keep_alive;
         keep_alive.reserve(4);
         keep_alive.push_back(load_indexed_tensor(collection, kTrellisName));
@@ -1145,13 +1220,13 @@ int main() {
         const Exl3LinearTensors host_tensors{
             &keep_alive[0], &keep_alive[1], &keep_alive[2], &keep_alive[3]};
         const Exl3LinearMetadata host_metadata{5120, 17408, 5, false, true, false, "mul1"};
-        ninfer::exl3::validate_linear_tensors(host_tensors, host_metadata);
+        voidinfer::exl3::validate_linear_tensors(host_tensors, host_metadata);
 
-        const auto oracle_header = ninfer::exl3::inspect_file(oracle_path);
+        const auto oracle_header = voidinfer::exl3::inspect_file(oracle_path);
         const auto canonical_input =
-            ninfer::exl3::read_tensor(oracle_path, oracle_header, "linear_input");
+            voidinfer::exl3::read_tensor(oracle_path, oracle_header, "linear_input");
         const auto canonical_output =
-            ninfer::exl3::read_tensor(oracle_path, oracle_header, "linear_output");
+            voidinfer::exl3::read_tensor(oracle_path, oracle_header, "linear_output");
         const auto canonical_input_bits = canonical_input.typed<std::uint16_t>("F16");
         const auto canonical_output_bits = canonical_output.typed<std::uint16_t>("F16");
         require(canonical_input.info.shape == std::vector<std::uint64_t>{1, 14, 5120},
@@ -1194,7 +1269,7 @@ int main() {
         run_negative_tests(workspace, device_weights, device_metadata, input, output);
 
         const auto reference_14 =
-            ninfer::exl3::exl3_linear_reference(canonical_input, host_tensors, host_metadata);
+            voidinfer::exl3::exl3_linear_reference(canonical_input, host_tensors, host_metadata);
         const auto reference_14_metrics = compare(reference_14.fp16_bits, canonical_output_bits);
         print_metrics("E2 reference vs E1 canonical M=14", reference_14_metrics);
         require(reference_14_metrics.max_abs <= 0.0015 &&
@@ -1202,7 +1277,7 @@ int main() {
                 "E2 reference no longer agrees with canonical oracle");
 
         std::vector<int> row_counts{1, 2, 4, 8, 14, 16};
-        if (const auto only_rows = env_or_empty("NINFER_EXL3_ONLY_M"); !only_rows.empty()) {
+        if (const auto only_rows = env_or_empty("VOIDINFER_EXL3_ONLY_M"); !only_rows.empty()) {
             row_counts = {std::stoi(only_rows)};
         }
         for (const int rows : row_counts) {
@@ -1224,7 +1299,7 @@ int main() {
                     "optimized EXL3 result failed E1/E2 tolerance");
             if (rows == 16) {
                 const auto reference_16 =
-                    ninfer::exl3::exl3_linear_reference(input_payload, host_tensors, host_metadata);
+                    voidinfer::exl3::exl3_linear_reference(input_payload, host_tensors, host_metadata);
                 const auto reference_metrics = compare(actual, reference_16.fp16_bits);
                 print_metrics("CUDA vs E2 reference M=16", reference_metrics);
                 require(reference_metrics.max_abs <= 0.0015 &&
@@ -1237,7 +1312,7 @@ int main() {
             std::cout << "benchmark M=" << rows << " cuda_us=" << std::setprecision(10)
                       << cuda_us << " kernel_launches=3\n";
         }
-        std::cout << "ninfer_exl3_cuda_linear_test: PASS\n";
+        std::cout << "voidinfer_exl3_cuda_linear_test: PASS\n";
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << "FAIL: " << exception.what() << '\n';

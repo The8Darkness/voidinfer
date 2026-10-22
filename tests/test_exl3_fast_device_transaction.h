@@ -7,19 +7,19 @@
 void run_fast_device_real_dflash(Exl3TextModel& target,
     Exl3Dflash2DraftModel& draft,const std::vector<std::int64_t>& ids) {
     using Clock=std::chrono::steady_clock;
-    using ninfer::exl3::Exl3VeriCacheServingPrefixCache;
-    using ninfer::exl3::Exl3VeriCacheServingCoordinator;
-    using ninfer::exl3::Exl3VeriCacheServingIdentity;
-    using ninfer::exl3::Exl3ResourceInventory;
-    const auto prefix_option=env("NINFER_E5A4_CONTEXTS");
+    using voidinfer::exl3::Exl3VeriCacheServingPrefixCache;
+    using voidinfer::exl3::Exl3VeriCacheServingCoordinator;
+    using voidinfer::exl3::Exl3VeriCacheServingIdentity;
+    using voidinfer::exl3::Exl3ResourceInventory;
+    const auto prefix_option=env("VOIDINFER_E5A4_CONTEXTS");
     const bool custom_prompt=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_CUSTOM_PROMPT")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_CUSTOM_PROMPT")=="1";
     const int prefix_rows=std::stoi(prefix_option);
     require(prefix_option=="4096" || prefix_option=="16384" ||
             (custom_prompt && ((prefix_rows>=4096 && prefix_rows<=4224) ||
                 (prefix_rows>=16384 && prefix_rows<=16512))),
         "real device DFlash probe requires 4K or 16K fixture");
-    const auto output_option=env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_OUTPUTS");
+    const auto output_option=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_REAL_OUTPUTS");
     require(output_option=="128" || output_option=="512",
         "real device DFlash output budget must be 128 or 512");
     const int output_rows=std::stoi(output_option);
@@ -29,13 +29,13 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
                 (custom_prompt?0:128),
         "real device DFlash fixture and capacity");
     const bool draft_layer_major=
-        env("NINFER_EXL3_FAST_LAYER_MAJOR_PREFILL")=="1";
-    require(env("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION")=="1" &&
-            env("NINFER_EXL3_EXACT_HOST_KV")=="0" &&
-            env("NINFER_OSCAR_EXL3")=="0" &&
-            (!draft_layer_major || env("NINFER_DFLASH2_PREFILL_WINDOW")=="1"),
+        env("VOIDINFER_EXL3_FAST_LAYER_MAJOR_PREFILL")=="1";
+    require(env("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION")=="1" &&
+            env("VOIDINFER_EXL3_EXACT_HOST_KV")=="0" &&
+            env("VOIDINFER_OSCAR_EXL3")=="0" &&
+            (!draft_layer_major || env("VOIDINFER_DFLASH2_PREFILL_WINDOW")=="1"),
         "real device DFlash probe numeric and prefill policy");
-    if(env("NINFER_EXL3_TEST_FAST_DEVICE_RING_UNDO")=="1") {
+    if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_RING_UNDO")=="1") {
         // End four positions before a 2048-slot boundary so the eight-row
         // trial overwrites both sides of the physical ring wrap.
         const int root_position=prefix_rows-4;
@@ -109,64 +109,64 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
                  <<" rows=1,8 physical_slots=2048 accept=1\n";
         return;
     }
-    const auto width_option=env("NINFER_EXL3_TEST_FAST_DEVICE_REAL_WIDTH");
+    const auto width_option=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_REAL_WIDTH");
     require(width_option=="4" || width_option=="6" || width_option=="8",
         "real device DFlash width must be 4, 6 or 8");
     const int real_width=std::stoi(width_option);
     const bool adaptive_width=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_ADAPTIVE_WIDTH")=="1";
-    const auto seed_reuse_option=env("NINFER_EXL3_TEST_FAST_DEVICE_SEED_REUSE");
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_ADAPTIVE_WIDTH")=="1";
+    const auto seed_reuse_option=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_SEED_REUSE");
     require(seed_reuse_option.empty() || seed_reuse_option=="0" ||
             seed_reuse_option=="1", "real device DFlash seed reuse must be 0 or 1");
     const bool seed_reuse=seed_reuse_option=="1";
-    const auto shared_round_option=env("NINFER_EXL3_TEST_SHARED_DEVICE_ROUND");
+    const auto shared_round_option=env("VOIDINFER_EXL3_TEST_SHARED_DEVICE_ROUND");
     require(shared_round_option.empty() || shared_round_option=="0" ||
             shared_round_option=="1",
         "shared device round selection must be 0 or 1");
     const bool shared_round=shared_round_option=="1";
     const bool pending_round=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_PENDING_ROUND")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_PENDING_ROUND")=="1";
     const bool device_pending_round=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_DEVICE_PENDING_ROUND")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_DEVICE_PENDING_ROUND")=="1";
     require(!(pending_round && device_pending_round) &&
             (!(pending_round || device_pending_round) || shared_round),
         "pending device round requires the shared request round");
-    const bool coherent_down_k6=env("NINFER_EXL3_COHERENT_DOWN_K6")=="1";
+    const bool coherent_down_k6=env("VOIDINFER_EXL3_COHERENT_DOWN_K6")=="1";
     const auto coherent_calls_before=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test();
     const auto coherent_rows_before=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test();
-    const bool coherent_down_k7=env("NINFER_EXL3_COHERENT_DOWN_K7")=="1";
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test();
+    const bool coherent_down_k7=env("VOIDINFER_EXL3_COHERENT_DOWN_K7")=="1";
     const auto coherent_down_k7_calls_before=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test();
     const auto coherent_down_k7_rows_before=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test();
-    const bool coherent_o_k7=env("NINFER_EXL3_COHERENT_O_K7")=="1";
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test();
+    const bool coherent_o_k7=env("VOIDINFER_EXL3_COHERENT_O_K7")=="1";
     const auto coherent_o_calls_before=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test();
     const auto coherent_o_rows_before=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test();
     const bool coherent_wide_k6=
-        env("NINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
+        env("VOIDINFER_EXL3_TARGET_COHERENT_WIDE_K6")=="1";
     std::uint64_t coherent_wide_calls_before[5]{},
         coherent_wide_rows_before[5]{},
         coherent_wide_calls_after_scalar[5]{},
         coherent_wide_rows_after_scalar[5]{};
     for(int operation=0;operation<5;++operation) {
         coherent_wide_calls_before[operation]=
-            ninfer::exl3::Exl3CudaLinearWorkspace::
+            voidinfer::exl3::Exl3CudaLinearWorkspace::
                 coherent_wide_k6_calls_for_test(operation);
         coherent_wide_rows_before[operation]=
-            ninfer::exl3::Exl3CudaLinearWorkspace::
+            voidinfer::exl3::Exl3CudaLinearWorkspace::
                 coherent_wide_k6_rows_for_test(operation);
     }
     require(!adaptive_width || real_width==8,
         "adaptive real device DFlash requires B8 upper horizon");
     const std::vector<std::int64_t> prefix(ids.begin(),ids.begin()+prefix_rows);
     if(custom_prompt &&
-       env("NINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1") {
+       env("VOIDINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1") {
         auto cold=target.create_context(true);
-        if(env("NINFER_EXL3_L0_OSCAR")!="0") {
+        if(env("VOIDINFER_EXL3_L0_OSCAR")!="0") {
             // L0 OSCAR contexts prefill row-major in 1024-row chunks.
             const std::span<const std::int64_t> all(prefix);
             cold->prefill(all.first(16));
@@ -174,7 +174,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
                 cold->append_prefill_wide(all.subspan(first,std::min<std::size_t>(1024,all.size()-first)));
         } else {
         const auto initial=static_cast<std::size_t>(
-            ninfer::exl3::Exl3TextContext::layer_major_initial_rows());
+            voidinfer::exl3::Exl3TextContext::layer_major_initial_rows());
         if(initial)cold->prefill(std::span<const std::int64_t>(prefix).first(initial));
         cold->append_prefill_layer_major(
             std::span<const std::int64_t>(prefix).subspan(initial));
@@ -203,7 +203,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         oracle.push_back(token);
         scalar->decode(token);
     }
-    if(const auto path=env("NINFER_EXL3_TEST_FAST_DEVICE_ORACLE_OUT");!path.empty()) {
+    if(const auto path=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_ORACLE_OUT");!path.empty()) {
         std::ofstream out(path,std::ios::binary);
         for(const auto id:oracle)out<<id<<'\n';
         require(out.good(),"real device DFlash oracle token export failed");
@@ -211,23 +211,23 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     const auto final_hash=scalar->export_exact_host_state()->
         represented_payload_hash_for_test();
     const auto coherent_calls_after_scalar=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test();
     const auto coherent_rows_after_scalar=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test();
     const auto coherent_down_k7_calls_after_scalar=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test();
     const auto coherent_down_k7_rows_after_scalar=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test();
     const auto coherent_o_calls_after_scalar=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test();
     const auto coherent_o_rows_after_scalar=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test();
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test();
     for(int operation=0;operation<5;++operation) {
         coherent_wide_calls_after_scalar[operation]=
-            ninfer::exl3::Exl3CudaLinearWorkspace::
+            voidinfer::exl3::Exl3CudaLinearWorkspace::
                 coherent_wide_k6_calls_for_test(operation);
         coherent_wide_rows_after_scalar[operation]=
-            ninfer::exl3::Exl3CudaLinearWorkspace::
+            voidinfer::exl3::Exl3CudaLinearWorkspace::
                 coherent_wide_k6_rows_for_test(operation);
     }
     scalar.reset();
@@ -238,7 +238,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         cudaStream_t value=nullptr;
         ~DiagnosticStream(){if(value)cudaStreamDestroy(value);}
     } diagnostic_stream;
-    if(env("NINFER_EXL3_TEST_FAST_DEVICE_OWN_STREAM")=="1") {
+    if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_OWN_STREAM")=="1") {
         require(shared_round && custom_prompt,
             "diagnostic nondefault stream needs matched shared round");
         cuda_check(cudaStreamCreateWithFlags(&diagnostic_stream.value,
@@ -255,14 +255,14 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     if(!shared_round)draft.reset();
     const auto live_request_start=Clock::now();
     const bool engine_context_shape=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_ENGINE_CONTEXT_SHAPE")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_ENGINE_CONTEXT_SHAPE")=="1";
     if(engine_context_shape)
         require(shared_round && custom_prompt,
             "Engine context shape diagnostic needs matched shared round");
     const bool reserved_context=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_RESERVED_CONTEXT")=="1";
     const bool reserved_lane=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_RESERVED_LANE")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_RESERVED_LANE")=="1";
     std::unique_ptr<Exl3VeriCacheServingPrefixCache> diagnostic_cache;
     std::unique_ptr<Exl3VeriCacheServingCoordinator> diagnostic_coordinator;
     std::shared_ptr<Exl3TextContext> live;
@@ -284,7 +284,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         live=target.create_context(true,!engine_context_shape,
             engine_context_shape);
     }
-    if(env("NINFER_EXL3_TEST_FAST_DEVICE_PREPARE_BEFORE_PREFIX")=="1") {
+    if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_PREPARE_BEFORE_PREFIX")=="1") {
         require(shared_round && custom_prompt,
             "early continuation preparation needs matched shared round");
         if(reserved_context) {
@@ -295,13 +295,13 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             live->prepare_transaction();
         }
     }
-    std::shared_ptr<ninfer::exl3::Exl3Dflash2Execution> diagnostic_lane;
+    std::shared_ptr<voidinfer::exl3::Exl3Dflash2Execution> diagnostic_lane;
     if(reserved_lane) {
         require(reserved_context,
             "reserved lane diagnostic needs reserved context");
         std::shared_ptr<Exl3Dflash2DraftModel> retained_draft(&draft,
             [](Exl3Dflash2DraftModel*){});
-        diagnostic_lane=ninfer::exl3::Exl3Dflash2Execution::create_reserved(
+        diagnostic_lane=voidinfer::exl3::Exl3Dflash2Execution::create_reserved(
             *diagnostic_coordinator,live,std::move(retained_draft),
             "matched-device-round-diagnostic",diagnostic_stream.value,{});
     }
@@ -312,19 +312,19 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         std::cout<<"FAST_DEVICE_RESERVED_MEMORY free_mib="
                  <<available/(1024*1024)<<'\n';
     }
-    if(env("NINFER_EXL3_TEST_FAST_DEVICE_RESET_FOR_REQUEST")=="1") {
+    if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_RESET_FOR_REQUEST")=="1") {
         require(shared_round && custom_prompt,
             "request reset diagnostic needs matched shared round");
         if(!reserved_lane)
             live->bind_request_compatibility("matched-device-round-diagnostic");
         live->reset_for_request("matched-device-round-diagnostic");
     }
-    std::unique_ptr<ninfer::exl3::Exl3FastDeviceRound> reusable_round;
+    std::unique_ptr<voidinfer::exl3::Exl3FastDeviceRound> reusable_round;
     if(shared_round) {
         std::array<std::uint16_t*,5> stage_planes{};
         std::copy(stage.bulk_ptrs.begin(),stage.bulk_ptrs.end(),
             stage_planes.begin());
-        reusable_round=std::make_unique<ninfer::exl3::Exl3FastDeviceRound>(
+        reusable_round=std::make_unique<voidinfer::exl3::Exl3FastDeviceRound>(
             live,draft,stage_planes,1,1,seed_reuse,diagnostic_stream.value);
     }
     const auto live_prefill_start=Clock::now();
@@ -332,14 +332,14 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         reusable_round->begin_fresh(std::span<const std::int64_t>(prefix),
             draft_layer_major);
         diagnose_fast_device_prefill(*live,draft,prefix_rows,true);
-        if(env("NINFER_EXL3_TEST_FAST_DEVICE_SPLIT_ROUND")=="1") {
+        if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_SPLIT_ROUND")=="1") {
             require(custom_prompt,
                 "split prefill and decode rounds need matched Engine prompt");
             reusable_round.reset();
             std::array<std::uint16_t*,5> stage_planes{};
             std::copy(stage.bulk_ptrs.begin(),stage.bulk_ptrs.end(),
                 stage_planes.begin());
-            reusable_round=std::make_unique<ninfer::exl3::Exl3FastDeviceRound>(
+            reusable_round=std::make_unique<voidinfer::exl3::Exl3FastDeviceRound>(
                 live,draft,stage_planes,1,1,seed_reuse,diagnostic_stream.value);
         }
     } else ingest_prefix(*live,prefix,CommitSink{&draft,&stage});
@@ -368,13 +368,13 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             draft.ring_base_abs()+draft.ring_count()==prefix_rows &&
             // L0 OSCAR: the oracle ingests through the INT2-history route while
             // the live wide prefill attends exactly, so the roots differ by design.
-            (live_initial_hash==initial_hash || env("NINFER_EXL3_L0_OSCAR")!="0"),
+            (live_initial_hash==initial_hash || env("VOIDINFER_EXL3_L0_OSCAR")!="0"),
         "real device DFlash root frontier differs from target-only oracle");
-    std::shared_ptr<const ninfer::exl3::Exl3VeriCacheRequest> diagnostic_root;
-    if(env("NINFER_EXL3_TEST_FAST_DEVICE_EXPORT_ROOT")=="1") {
+    std::shared_ptr<const voidinfer::exl3::Exl3VeriCacheRequest> diagnostic_root;
+    if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_EXPORT_ROOT")=="1") {
         require(shared_round && custom_prompt,
             "device root export diagnostic needs matched shared round");
-        diagnostic_root=ninfer::exl3::Exl3VeriCacheRequest::
+        diagnostic_root=voidinfer::exl3::Exl3VeriCacheRequest::
             initialize_device_root(*live,draft,prefix,diagnostic_stream.value);
     }
     if(shared_round) {
@@ -383,23 +383,23 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         live->prepare_continuation(8);
         live->prepare_transaction();
     }
-    if(!env("NINFER_EXL3_TEST_VERIFY_QUALITY_OUT").empty()) {
+    if(!env("VOIDINFER_EXL3_TEST_VERIFY_QUALITY_OUT").empty()) {
         // Verify-path quality diagnostic: teacher-force a canonical
         // continuation through committed 8-row verifier transactions and
         // record, per row, the NLL of the next canonical token and whether the
         // row argmax equals it. The DFlash round is not run in this mode.
-        std::ifstream token_file(env("NINFER_EXL3_TEST_VERIFY_QUALITY_TOKENS"));
+        std::ifstream token_file(env("VOIDINFER_EXL3_TEST_VERIFY_QUALITY_TOKENS"));
         std::vector<std::int64_t> tokens;
         for(std::int64_t token=0;token_file>>token;)tokens.push_back(token);
         require(tokens.size()>=9,"verify quality continuation too short");
-        std::ofstream quality(env("NINFER_EXL3_TEST_VERIFY_QUALITY_OUT"));
+        std::ofstream quality(env("VOIDINFER_EXL3_TEST_VERIFY_QUALITY_OUT"));
         quality<<"index,target,nll,argmax\n";
         constexpr int kVocabRows=248320;
         double total_nll=0.0;std::size_t scored=0,agree=0;
         // Block length (1..8; default 8) selects the verifier row count, so
         // decode-sized attention/GEMM routes can be gated by the same metric.
-        const int block_rows=env("NINFER_EXL3_TEST_VERIFY_QUALITY_ROWS").empty()?8:
-            std::stoi(env("NINFER_EXL3_TEST_VERIFY_QUALITY_ROWS"));
+        const int block_rows=env("VOIDINFER_EXL3_TEST_VERIFY_QUALITY_ROWS").empty()?8:
+            std::stoi(env("VOIDINFER_EXL3_TEST_VERIFY_QUALITY_ROWS"));
         require(block_rows>=1&&block_rows<=8,"verify quality rows");
         for(std::size_t first=0;first+block_rows<tokens.size();first+=block_rows) {
             const std::span<const std::int64_t> block(tokens.data()+first,block_rows);
@@ -432,7 +432,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     if(pending_round || device_pending_round) {
         const std::array<std::int64_t,2> model_stops{248046,248044};
         const std::span<const std::int64_t> pending_terminal=
-            env("NINFER_EXL3_TEST_FAST_DEVICE_MODEL_STOPS")=="1"?
+            env("VOIDINFER_EXL3_TEST_FAST_DEVICE_MODEL_STOPS")=="1"?
                 std::span<const std::int64_t>(model_stops):
                 std::span<const std::int64_t>{};
         if(device_pending_round)draft.bind_ring_scope(1,1);
@@ -466,7 +466,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         const auto make_round=[&] {
             std::array<std::uint16_t*,5> planes{};
             std::copy(stage.bulk_ptrs.begin(),stage.bulk_ptrs.end(),planes.begin());
-            auto next=std::make_unique<ninfer::exl3::Exl3FastDeviceRound>(
+            auto next=std::make_unique<voidinfer::exl3::Exl3FastDeviceRound>(
                 live,draft,planes,1,1,seed_reuse,diagnostic_stream.value);
             next->begin_prefilled();
             return next;
@@ -490,7 +490,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         const auto refused=prepare();
         bool callback_threw=false;
         try {
-            const auto reject=[](const ninfer::exl3::Exl3FastDeviceRound::Step&) {
+            const auto reject=[](const voidinfer::exl3::Exl3FastDeviceRound::Step&) {
                 throw std::runtime_error("pending publication fault");
             };
             if(device_pending_round)
@@ -583,7 +583,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         return;
     }
     const bool projection_diagnostic=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_PROJECTION_TIMING")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_PROJECTION_TIMING")=="1";
     require(!shared_round || !projection_diagnostic,
         "shared device round projection diagnostic uses the legacy isolated gate");
     if(projection_diagnostic)live->prepare_target_projection_timing();
@@ -593,19 +593,19 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     std::array<std::uint64_t,9> accepted_hist{};
     std::array<std::uint64_t,9> useful_hist{};
     const bool round_state_diagnostic=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_ROUND_STATE")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_ROUND_STATE")=="1";
     const bool stage_timeline_diagnostic=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_STAGE_TIMELINE")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_STAGE_TIMELINE")=="1";
     std::vector<std::pair<int,std::uint64_t>> round_state_hashes;
-    std::shared_ptr<const ninfer::exl3::Exl3ExactHostState> first_round_state;
+    std::shared_ptr<const voidinfer::exl3::Exl3ExactHostState> first_round_state;
     std::array<std::int64_t,8> first_proposal{};
     double proposal_ms=0.0,verifier_ms=0.0,ring_ms=0.0;
     double target_seed_ms=0.0,draft_api_ms=0.0;
-    ninfer::exl3::Exl3OuterDeviceStageTimeline verifier_stages{};
+    voidinfer::exl3::Exl3OuterDeviceStageTimeline verifier_stages{};
     std::size_t verified_rows=0,replayed_rows=0,rounds=0,d2d_bytes=0;
     std::size_t reused_seeds=0,seed_fallbacks=0;
     std::size_t fused_flash_multirow_calls=0;
-    ninfer::exl3::Exl3DeviceHorizonCostPolicy horizon_policy;
+    voidinfer::exl3::Exl3DeviceHorizonCostPolicy horizon_policy;
     struct PendingHorizonCost {
         unsigned width=0,useful=0;
         Clock::time_point start{};
@@ -626,10 +626,10 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         const int root_position=live->position();
         const int remaining=output_rows-static_cast<int>(committed.size());
         if(reusable_round) {
-            const auto fused_before=ninfer::exl3::
+            const auto fused_before=voidinfer::exl3::
                 exl3_fast_fused_flash_multirow_attention_calls_for_test();
-            ninfer::exl3::Exl3OuterDeviceStageTimeline round_timeline{};
-            ninfer::exl3::Exl3FastDeviceRound::ChooseWidth choose;
+            voidinfer::exl3::Exl3OuterDeviceStageTimeline round_timeline{};
+            voidinfer::exl3::Exl3FastDeviceRound::ChooseWidth choose;
             if(adaptive_width && remaining>1)
                 choose=[&](Clock::time_point seed_ready,int maximum) {
                     settle_horizon_cost(seed_ready);
@@ -638,7 +638,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
                 };
             auto outcome=reusable_round->step(std::min(real_width,remaining),{},
                 stage_timeline_diagnostic?&round_timeline:nullptr,{},{},choose);
-            fused_flash_multirow_calls+=ninfer::exl3::
+            fused_flash_multirow_calls+=voidinfer::exl3::
                 exl3_fast_fused_flash_multirow_attention_calls_for_test()-
                 fused_before;
             if(stage_timeline_diagnostic) {
@@ -720,19 +720,19 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         std::array<std::int64_t,8> block{};
         block.fill(248070);
         auto revision=std::make_shared<const std::uint64_t>(rounds+1);
-        ninfer::exl3::Exl3CommittedTapBinding binding{
+        voidinfer::exl3::Exl3CommittedTapBinding binding{
             std::shared_ptr<const void>(live,live.get()),revision,
             root_position,1,1};
         const auto proposal_start=Clock::now();
         block[0]=exl3_branch_greedy(*live);
         constexpr std::uint64_t coherent_device_policy=0x434f484552454e54ULL;
-        std::optional<ninfer::exl3::Exl3OuterDeviceSeedPacket> ready_seed;
-        if(seed_reuse)ready_seed=ninfer::exl3::bind_exl3_outer_device_seed(
+        std::optional<voidinfer::exl3::Exl3OuterDeviceSeedPacket> ready_seed;
+        if(seed_reuse)ready_seed=voidinfer::exl3::bind_exl3_outer_device_seed(
             *live,binding,block[0],coherent_device_policy);
         if(seed_reuse && rounds==0) {
             const auto matches=[&](const auto& candidate,const auto& owner,
                                    std::uint64_t policy) {
-                return ninfer::exl3::exl3_outer_device_seed_matches(
+                return voidinfer::exl3::exl3_outer_device_seed_matches(
                     *live,&owner,&candidate,policy,block[0]);
             };
             require(matches(*ready_seed,binding,coherent_device_policy),
@@ -779,8 +779,8 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             Clock::now()-proposal_start).count();
 
         std::size_t staged_bytes=0;
-        ninfer::exl3::Exl3CommittedTapConsumer consumer=[&](
-            const ninfer::exl3::Exl3CommittedTapSegment& segment,
+        voidinfer::exl3::Exl3CommittedTapConsumer consumer=[&](
+            const voidinfer::exl3::Exl3CommittedTapSegment& segment,
             cudaStream_t stream) {
             segment.validate();
             require(segment.owner==binding.context_owner &&
@@ -801,14 +801,14 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
                 kTapCount*kHidden*2;
         };
         const auto verifier_start=Clock::now();
-        const auto fused_flash_before=ninfer::exl3::
+        const auto fused_flash_before=voidinfer::exl3::
             exl3_fast_fused_flash_multirow_attention_calls_for_test();
         if(projection_diagnostic && rounds==0) {
             live->begin_target_projection_timing_round(1);
             live->set_target_projection_timing_phase(
-                ninfer::exl3::Exl3TargetProjectionPhase::attempt);
+                voidinfer::exl3::Exl3TargetProjectionPhase::attempt);
         }
-        ninfer::exl3::Exl3OuterDeviceStageTimeline round_timeline{};
+        voidinfer::exl3::Exl3OuterDeviceStageTimeline round_timeline{};
         auto verified=verify_exl3_outer_device_resident_reference(
             *live,std::span<const std::int64_t>(block).first(width),{},nullptr,
             &binding,&consumer,
@@ -817,7 +817,7 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             seed_reuse?coherent_device_policy:0);
         reused_seeds+=verified.device_seed_reused;
         seed_fallbacks+=verified.device_seed_fallback;
-        fused_flash_multirow_calls+=ninfer::exl3::
+        fused_flash_multirow_calls+=voidinfer::exl3::
             exl3_fast_fused_flash_multirow_attention_calls_for_test()-
             fused_flash_before;
         if(rounds==0)
@@ -853,13 +853,13 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             for(const auto& [key,group]:groups) {
                 const auto [phase,operation,bits,topology,rows]=key;
                 std::cout<<"FAST_DEVICE_REAL_DFLASH_PROJECTION_GROUP"
-                    <<" phase="<<ninfer::exl3::target_projection_phase_name(
-                        static_cast<ninfer::exl3::Exl3TargetProjectionPhase>(phase))
-                    <<" operation="<<ninfer::exl3::target_projection_operator_name(
-                        static_cast<ninfer::exl3::Exl3TargetProjectionOperator>(operation))
+                    <<" phase="<<voidinfer::exl3::target_projection_phase_name(
+                        static_cast<voidinfer::exl3::Exl3TargetProjectionPhase>(phase))
+                    <<" operation="<<voidinfer::exl3::target_projection_operator_name(
+                        static_cast<voidinfer::exl3::Exl3TargetProjectionOperator>(operation))
                     <<" K="<<bits<<" topology="
-                    <<ninfer::exl3::target_projection_topology_name(
-                        static_cast<ninfer::exl3::Exl3TargetProjectionTopology>(topology))
+                    <<voidinfer::exl3::target_projection_topology_name(
+                        static_cast<voidinfer::exl3::Exl3TargetProjectionTopology>(topology))
                     <<" rows="<<rows<<" calls="<<group.first
                     <<" gpu_us="<<std::fixed<<std::setprecision(3)
                     <<group.second<<'\n';
@@ -955,10 +955,10 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     const auto coherent_scalar_calls=coherent_calls_after_scalar-coherent_calls_before;
     const auto coherent_scalar_rows=coherent_rows_after_scalar-coherent_rows_before;
     const auto coherent_live_calls=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test()-
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_calls_for_test()-
         coherent_calls_after_scalar;
     const auto coherent_live_rows=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test()-
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k6_rows_for_test()-
         coherent_rows_after_scalar;
     std::cout<<"FAST_DEVICE_REAL_DFLASH_COHERENT_DOWN_K6 enabled="<<coherent_down_k6
              <<" scalar_calls="<<coherent_scalar_calls
@@ -976,10 +976,10 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     const auto coherent_down_k7_scalar_rows=
         coherent_down_k7_rows_after_scalar-coherent_down_k7_rows_before;
     const auto coherent_down_k7_live_calls=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test()-
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_calls_for_test()-
         coherent_down_k7_calls_after_scalar;
     const auto coherent_down_k7_live_rows=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test()-
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_down_k7_rows_for_test()-
         coherent_down_k7_rows_after_scalar;
     std::cout<<"FAST_DEVICE_REAL_DFLASH_COHERENT_DOWN_K7 enabled="<<coherent_down_k7
              <<" scalar_calls="<<coherent_down_k7_scalar_calls
@@ -997,10 +997,10 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
     const auto coherent_o_scalar_rows=
         coherent_o_rows_after_scalar-coherent_o_rows_before;
     const auto coherent_o_live_calls=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test()-
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_calls_for_test()-
         coherent_o_calls_after_scalar;
     const auto coherent_o_live_rows=
-        ninfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test()-
+        voidinfer::exl3::Exl3CudaLinearWorkspace::process_coherent_o_k7_rows_for_test()-
         coherent_o_rows_after_scalar;
     std::cout<<"FAST_DEVICE_REAL_DFLASH_COHERENT_O_K7 enabled="<<coherent_o_k7
              <<" scalar_calls="<<coherent_o_scalar_calls
@@ -1018,10 +1018,10 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
             coherent_wide_calls_before[operation];
         const auto scalar_rows=coherent_wide_rows_after_scalar[operation]-
             coherent_wide_rows_before[operation];
-        const auto live_calls=ninfer::exl3::Exl3CudaLinearWorkspace::
+        const auto live_calls=voidinfer::exl3::Exl3CudaLinearWorkspace::
             coherent_wide_k6_calls_for_test(operation)-
             coherent_wide_calls_after_scalar[operation];
-        const auto live_rows=ninfer::exl3::Exl3CudaLinearWorkspace::
+        const auto live_rows=voidinfer::exl3::Exl3CudaLinearWorkspace::
             coherent_wide_k6_rows_for_test(operation)-
             coherent_wide_rows_after_scalar[operation];
         std::cout<<"FAST_DEVICE_REAL_DFLASH_COHERENT_WIDE_K6 op="
@@ -1114,10 +1114,10 @@ void run_fast_device_real_dflash(Exl3TextModel& target,
         "real device DFlash seed packet did not reach every verifier round");
     // Captured multirow full-layer graphs replay the fused multirow attention
     // without host-side dispatch counts; accept their replay as evidence.
-    if(env("NINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW")=="1")
+    if(env("VOIDINFER_EXL3_FAST_SAME_WEIGHTS_FP16KV_FUSED_FLASH_MULTIROW")=="1")
         require(fused_flash_multirow_calls>0 ||
-                (env("NINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS")=="1" &&
-                 ninfer::exl3::Exl3TextContext::ordinary_graph_process_stats_for_test()
+                (env("VOIDINFER_EXL3_ORDINARY_FULL_LAYER_MULTIROW_GRAPHS")=="1" &&
+                 voidinfer::exl3::Exl3TextContext::ordinary_graph_process_stats_for_test()
                      .full_layer_replays>0),
             "real device DFlash multirow fused attention did not dispatch");
     if(adaptive_width) {
@@ -1179,7 +1179,7 @@ void run_fast_device_long_resident(Exl3TextModel& target,
     const std::vector<std::int64_t>& ids) {
     require(target.max_context()>=4352 && ids.size()>=4096,
         "long device-resident verifier requires 4K fixture and context");
-    const auto width_option=env("NINFER_EXL3_TEST_FAST_DEVICE_LONG_WIDTH");
+    const auto width_option=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_LONG_WIDTH");
     require(width_option.empty() || width_option=="4" || width_option=="8",
         "long device-resident verifier width must be 4 or 8");
     const int width=width_option=="8"?8:4;
@@ -1240,14 +1240,14 @@ void run_fast_device_long_resident(Exl3TextModel& target,
         process_fast_fp16_m2_8_down_calls_for_test()-packed_before;
     const auto fused_calls=Exl3CudaLinearWorkspace::
         process_fast_fp16_m2_8_fused_down_calls_for_test()-fused_before;
-    if(env("NINFER_EXL3_FAST_FP16_M2_8")=="1" ||
-       env("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6")=="1")
+    if(env("VOIDINFER_EXL3_FAST_FP16_M2_8")=="1" ||
+       env("VOIDINFER_EXL3_FAST_FP16_M2_8_DOWN_K6")=="1")
         require(packed_calls>0,
             "long device-resident packed M2-8 route did not dispatch");
-    if(env("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6")=="1")
+    if(env("VOIDINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6")=="1")
         require(fused_calls>0,
             "long device-resident fused-output M2-8 down route did not dispatch");
-    if(env("NINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH")=="1") {
+    if(env("VOIDINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH")=="1") {
         require(graph_after.captures==graph_before.captures+1 &&
                 graph_after.replays==graph_before.replays+rounds-1,
             "long device-resident checkpoint graph did not cover repeated frontiers");
@@ -1270,33 +1270,33 @@ void run_fast_device_long_resident(Exl3TextModel& target,
 
 void run_fast_device_transaction(Exl3TextModel& target,
     const std::vector<std::int64_t>& ids) {
-    if(env("NINFER_EXL3_TEST_FAST_DEVICE_LONG_RESIDENT")=="1") {
+    if(env("VOIDINFER_EXL3_TEST_FAST_DEVICE_LONG_RESIDENT")=="1") {
         run_fast_device_long_resident(target,ids);
         return;
     }
     require(target.max_context()>=256 && ids.size()>=256,
         "fast device transaction requires a real 256-token fixture");
-    require(env("NINFER_EXL3_EXACT_HOST_KV")=="0" &&
-            env("NINFER_OSCAR_EXL3")=="0" &&
-            env("NINFER_EXL3_FAST_DEVICE_KV_TRANSACTION")=="1",
+    require(env("VOIDINFER_EXL3_EXACT_HOST_KV")=="0" &&
+            env("VOIDINFER_OSCAR_EXL3")=="0" &&
+            env("VOIDINFER_EXL3_FAST_DEVICE_KV_TRANSACTION")=="1",
         "fast device transaction requires its guarded numerical/KV policy");
     auto scalar=target.create_context(true);
     auto batched=target.create_context(true);
-    const bool resident_probe=env("NINFER_EXL3_TEST_FAST_DEVICE_RESIDENT")=="1";
+    const bool resident_probe=env("VOIDINFER_EXL3_TEST_FAST_DEVICE_RESIDENT")=="1";
     const bool deferred_verifier_probe=
-        env("NINFER_EXL3_TEST_FAST_DEVICE_DEFERRED_VERIFIER")=="1";
+        env("VOIDINFER_EXL3_TEST_FAST_DEVICE_DEFERRED_VERIFIER")=="1";
     require(!deferred_verifier_probe || resident_probe,
         "deferred verifier gate needs the device-resident context");
     const bool checkpoint_graph_probe=
-        env("NINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH")=="1";
+        env("VOIDINFER_EXL3_DEVICE_KV_TRANSACTION_CHECKPOINT_GRAPH")=="1";
     require(!checkpoint_graph_probe || resident_probe,
         "device transaction checkpoint graph probe requires resident verifier");
     std::shared_ptr<Exl3TextContext> resident;
     if(resident_probe)resident=target.create_context(true);
     auto tap_staging=resident?
         std::make_unique<DeviceBuffer>(5ULL*8*5120*sizeof(std::uint16_t)):nullptr;
-    ninfer::exl3::Exl3CommittedTapConsumer stage_committed_taps=[&](
-        const ninfer::exl3::Exl3CommittedTapSegment& segment,cudaStream_t stream) {
+    voidinfer::exl3::Exl3CommittedTapConsumer stage_committed_taps=[&](
+        const voidinfer::exl3::Exl3CommittedTapSegment& segment,cudaStream_t stream) {
         segment.validate();
         require(segment.destination_first>=0 &&
                 segment.destination_first+segment.rows<=8,
@@ -1369,7 +1369,7 @@ void run_fast_device_transaction(Exl3TextModel& target,
                 resident->restore_exact_host_state(*root);
                 auto pending=verify_exl3_outer_device_resident_reference(
                     *resident,tentative,{},nullptr,nullptr,nullptr,nullptr,
-                    nullptr,0,ninfer::exl3::Exl3OuterDeviceSettlement::
+                    nullptr,0,voidinfer::exl3::Exl3OuterDeviceSettlement::
                         DeferTargetCommit);
                 require(resident->transaction_active() &&
                     pending.committed_tokens==reference.committed_tokens &&
@@ -1440,10 +1440,10 @@ void run_fast_device_transaction(Exl3TextModel& target,
                 batched_end-scalar_end).count()<<
             " scalar_hash="<<reference.committed_state->represented_payload_hash_for_test()<<
             " batched_hash="<<result.committed_state->represented_payload_hash_for_test()<<'\n';
-        if(env("NINFER_EXL3_FAST_FP16_M2_8_DOWN_K6")=="1" ||
-           env("NINFER_EXL3_FAST_FP16_M2_8")=="1")
+        if(env("VOIDINFER_EXL3_FAST_FP16_M2_8_DOWN_K6")=="1" ||
+           env("VOIDINFER_EXL3_FAST_FP16_M2_8")=="1")
             require(down_calls>0,"packed FP16 M2-8 down did not dispatch");
-        if(env("NINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6")=="1")
+        if(env("VOIDINFER_EXL3_FAST_FP16_M2_8_FUSED_DOWN_K6")=="1")
             require(fused_calls>0,"fused-output packed FP16 M2-8 down did not dispatch");
         require(reference.committed_tokens==result.committed_tokens &&
                 reference.accepted==result.accepted &&
@@ -1459,7 +1459,7 @@ void run_fast_device_transaction(Exl3TextModel& target,
                 "fast device terminal scenario did not stop after two rows");
         if(resident) {
             resident->restore_exact_host_state(*root);
-            const ninfer::exl3::Exl3CommittedTapBinding binding{
+            const voidinfer::exl3::Exl3CommittedTapBinding binding{
                 std::static_pointer_cast<const void>(resident),
                 std::static_pointer_cast<const void>(root),root->position(),
                 1,static_cast<std::uint64_t>(scenario+1)};
@@ -1501,7 +1501,7 @@ void run_fast_device_transaction(Exl3TextModel& target,
                     *scalar,*reference.committed_state,next,true);
                 require(chained_reference.accepted==1 && chained_reference.rejected,
                     "fast device chained scenario did not exercise prefix repair");
-                const ninfer::exl3::Exl3CommittedTapBinding chained_binding{
+                const voidinfer::exl3::Exl3CommittedTapBinding chained_binding{
                     std::static_pointer_cast<const void>(resident),
                     std::static_pointer_cast<const void>(reference.committed_state),
                     reference.committed_state->position(),1,5};

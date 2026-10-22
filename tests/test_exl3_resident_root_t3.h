@@ -5,8 +5,8 @@ void run_exact_resident_root_t3(Exl3TextModel& target,
     const std::vector<std::int64_t>& structured,const std::vector<std::int64_t>& heldout) {
     constexpr int prefix=4096,budget=128,block=4;
     require(target.max_context()==4352,"resident-root T3 context extent");
-    _putenv_s("NINFER_EXL3_OSCAR_L0_ONLY","0");
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    _putenv_s("VOIDINFER_EXL3_OSCAR_L0_ONLY","0");
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto source=target.create_context(true),forced=target.create_context(true),resident=target.create_context(true);
     source->prepare_continuation(8);forced->prepare_continuation(8);resident->prepare_continuation(8);
     const auto greedy=[](Exl3TextContext& context) {
@@ -24,7 +24,7 @@ void run_exact_resident_root_t3(Exl3TextModel& target,
     for(const auto& fixture:fixtures) {
         require(fixture.second->size()>=prefix,"resident-root T3 fixture extent");
         const std::vector<std::int64_t> input(fixture.second->begin(),fixture.second->begin()+prefix);
-        const auto root=ninfer::exl3::Exl3VeriCacheRequest::initialize(*source,input,1024)->state();
+        const auto root=voidinfer::exl3::Exl3VeriCacheRequest::initialize(*source,input,1024)->state();
         source->restore_exact_host_state(*root);
         std::vector<std::int64_t> reference;reference.reserve(budget);
         for(int row=0;row<budget;++row) {const auto token=greedy(*source);source->decode(token);reference.push_back(token);}
@@ -37,7 +37,7 @@ void run_exact_resident_root_t3(Exl3TextModel& target,
             while(tokens.size()<budget) {
                 std::array<std::int64_t,block> tentative{};
                 std::copy_n(reference.begin()+tokens.size(),block,tentative.begin());
-                const auto verified=ninfer::exl3::verify_exl3_outer_batched_reference(
+                const auto verified=voidinfer::exl3::verify_exl3_outer_batched_reference(
                     context,*current,tentative,false,{},nullptr,reuse);
                 restores+=verified.root_restores;
                 tokens.insert(tokens.end(),verified.committed_tokens.begin(),verified.committed_tokens.end());

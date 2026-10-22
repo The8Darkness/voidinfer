@@ -13,7 +13,7 @@
 
 #include <cuda_runtime_api.h>
 
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 
 namespace {
 
@@ -121,12 +121,12 @@ int split_for(int visible) {
 
 int main() {
     try {
-        const auto target = env("NINFER_EXL3_TARGET_PATH");
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH");
         if (target.empty()) {
-            std::cerr << "E4C1G skipped: set NINFER_EXL3_TARGET_PATH\n";
+            std::cerr << "E4C1G skipped: set VOIDINFER_EXL3_TARGET_PATH\n";
             return 77;
         }
-        const char* only = std::getenv("NINFER_E4C1G_PHASE");
+        const char* only = std::getenv("VOIDINFER_E4C1G_PHASE");
         const std::string phase = only != nullptr ? only : "all";
         const auto model = Exl3TextModel::load(target, 17408);
         cudaStream_t stream = nullptr;

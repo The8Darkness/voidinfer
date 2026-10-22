@@ -128,7 +128,7 @@ void run_prefix_retention_qualification(Exl3TextModel& target,
                                         const std::vector<std::int64_t>& source_ids) {
     require(target.max_context() == 4096 && !source_ids.empty(),
             "prefixretain requires maxctx4096 and real prompt IDs");
-    require(env("NINFER_OSCAR_EXL3") == "1", "prefixretain requires canonical OSCAR");
+    require(env("VOIDINFER_OSCAR_EXL3") == "1", "prefixretain requires canonical OSCAR");
     std::vector<std::int64_t> ids(4096);
     for (std::size_t index = 0; index < ids.size(); ++index)
         ids[index] = source_ids[index % source_ids.size()];

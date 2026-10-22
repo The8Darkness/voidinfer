@@ -21,7 +21,7 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 constexpr int HIDDEN = 5120, QKV = 10240, Z = 6144, HEADS = 48, INTERMEDIATE = 17408;
 constexpr int PREFILL = 11, DECODE_STEPS = 4;
 
@@ -171,7 +171,11 @@ void check_recurrent_scratch_reuse_contract() {
     require(split.history_storage(16,false,false)==
                 Exl3GdnHistoryStorage::private_retained,
             "native16 private scratch plan was refused");
-    require(split.history_storage(32,false,false)==
+    constexpr std::size_t first_wide_rows=Exl3GdnScratchReuseContract::private_history_rows+1;
+    require(split.history_storage(Exl3GdnScratchReuseContract::private_history_rows,false,false)==
+                Exl3GdnHistoryStorage::private_retained,
+            "M32 private scratch plan was refused");
+    require(split.history_storage(first_wide_rows,false,false)==
                 Exl3GdnHistoryStorage::shared_wide,
             "wide transient scratch plan was refused");
     require(split.history_storage(3,true,false)==
@@ -184,9 +188,9 @@ void check_recurrent_scratch_reuse_contract() {
     require(split.history_storage(9,true,false)==
                 Exl3GdnHistoryStorage::refused,
             "unsupported retained history width was accepted");
-    require(split.history_storage(32,true,false)==
+    require(split.history_storage(first_wide_rows,true,false)==
                 Exl3GdnHistoryStorage::refused &&
-            split.history_storage(32,false,true)==
+            split.history_storage(first_wide_rows,false,true)==
                 Exl3GdnHistoryStorage::refused,
             "saved or graph history was assigned shared wide scratch");
     require(split.history_storage(1025,false,false)==
@@ -195,7 +199,7 @@ void check_recurrent_scratch_reuse_contract() {
     auto short_wide=split;
     --short_wide.shared_wide_bytes;
     require(!short_wide.valid() &&
-                short_wide.history_storage(32,false,false)==
+                short_wide.history_storage(first_wide_rows,false,false)==
                     Exl3GdnHistoryStorage::refused,
             "undersized shared wide scratch was accepted");
     Exl3GdnScratchReuseContract private_only{16,16,0,0};
@@ -675,11 +679,11 @@ int main() {
         check_gdn_stage_fusion_contract();
         check_gdn_continuation_history_contract();
         run_gdn_verifier_recurrence_oracle();
-        const auto target = env("NINFER_EXL3_TARGET_PATH"), fixture_path = env("NINFER_EXL3_ORACLE_PATH");
-        if (target.empty() || fixture_path.empty()) { std::cerr << "E3B skipped: set NINFER_EXL3_TARGET_PATH and NINFER_EXL3_ORACLE_PATH\n"; return 77; }
+        const auto target = env("VOIDINFER_EXL3_TARGET_PATH"), fixture_path = env("VOIDINFER_EXL3_ORACLE_PATH");
+        if (target.empty() || fixture_path.empty()) { std::cerr << "E3B skipped: set VOIDINFER_EXL3_TARGET_PATH and VOIDINFER_EXL3_ORACLE_PATH\n"; return 77; }
         run_gdn_stage_fusion_fixtures();
         run_gdn_known_oracle_cases();
-        if(const auto future=env("NINFER_EXL3_RECURRENT_FUTURE_ORACLE_PATH");!future.empty())
+        if(const auto future=env("VOIDINFER_EXL3_RECURRENT_FUTURE_ORACLE_PATH");!future.empty())
             run_gdn_external_future_oracle(future);
         const auto collection = inspect_indexed_directory(target);
         const auto fixture = inspect_file(fixture_path);
@@ -753,7 +757,7 @@ int main() {
             require(lifetime_children[i]->can_attach_device_credit(),"unreserved GDN child unexpectedly received constructor device credit");
         }
         require(layer.fixed_owner_metadata_bytes()==sizeof(Exl3GdnLayer)+
-            6*Exl3CudaLinearWorkspace::metadata_bytes()+sizeof(ninfer::DeviceArena)+34*Exl3LayerBufferRetirement::record_bytes(),
+            6*Exl3CudaLinearWorkspace::metadata_bytes()+sizeof(voidinfer::DeviceArena)+34*Exl3LayerBufferRetirement::record_bytes(),
             "GDN linear, buffer retirement records and arena");
         const auto buffer_children=layer.buffer_retirement_owners();
         std::uint64_t child_bytes=0;
@@ -773,14 +777,14 @@ int main() {
         const std::size_t linear_bytes=PREFILL*(44032ull*2+61440ull*5*4);
         const std::size_t half_bytes=PREFILL*(6ull*5120+3ull*10240+7ull*6144+2ull*2048+3ull*17408)*2;
         const std::size_t control_bytes=PREFILL*6ull*48*4;
-        const std::size_t normalized_bytes=env("NINFER_EXL3_PREFILL_GDN_RESIDENT")=="1"
+        const std::size_t normalized_bytes=env("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT")=="1"
             ? PREFILL*(2ull*16*128+48)*4 : 0;
         const std::size_t state_bytes=2ull*48*128*128*4+10240ull*(4+3)*2;
         const std::size_t expected_workspace=linear_bytes+half_bytes+control_bytes+
             normalized_bytes+state_bytes+(1ull<<20);
         require(layer.workspace_bytes()==expected_workspace,"GDN independent complete workspace ledger");
         require(Exl3GdnLayer::workspace_bytes_required(PREFILL,false,false,false,false,
-            env("NINFER_EXL3_PREFILL_GDN_RESIDENT")=="1")==expected_workspace,
+            env("VOIDINFER_EXL3_PREFILL_GDN_RESIDENT")=="1")==expected_workspace,
             "GDN independent configuration requirement ledger");
         for(int rows:{-1,0,1025}) {
             bool refused=false;

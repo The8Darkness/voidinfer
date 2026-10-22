@@ -5,7 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 inline constexpr std::size_t output_delivery_byte_limit=64*1024;
 inline constexpr std::size_t output_delivery_outstanding_limit=2;
 // Admission policy, not a promise about an STL implementation's growth rule.

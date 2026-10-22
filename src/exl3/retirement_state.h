@@ -3,7 +3,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 enum class Exl3RetirementPhase { active, draining, retired, quarantined };
 struct Exl3RetirementResult {
     Exl3RetirementPhase phase=Exl3RetirementPhase::active;

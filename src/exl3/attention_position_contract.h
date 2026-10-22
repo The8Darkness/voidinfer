@@ -1,6 +1,6 @@
 #pragma once
 #include <stdexcept>
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Captured with the numerical input binding. This is not an ownership token.
 struct Exl3AttentionPositionContract {
     const int* mrope=nullptr;

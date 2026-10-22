@@ -6,7 +6,7 @@
 #include "exl3/bounded_shared_owner.h"
 #include "exl3/resource_inventory.h"
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Frontend-resolved boundaries only; never infer a tool boundary from tokens or
 // trim/normalize tool text. Zero means no eligible shared text checkpoint.
 inline std::size_t exl3_declared_prefix_frontier(
@@ -132,4 +132,4 @@ public:
         identity_.visit_allocations(visitor, capacity);
     }
 };
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

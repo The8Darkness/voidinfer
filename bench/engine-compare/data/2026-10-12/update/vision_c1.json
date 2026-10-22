@@ -1,0 +1,58 @@
+[
+ {
+  "label": "ours.exl3-vision",
+  "image": "natural_scene",
+  "rep": 0,
+  "ok": true,
+  "s": 2.0916764736175537,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 404,
+   "total_tokens": 660
+  },
+  "timings": null,
+  "text": "This is a cheerful, stylized digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, displayed in bold, dark blue capital letters at the top left of the image.\n\nThe scene depicts a peaceful, sunny day in a mountainous landscape, rendered in a simple, flat, cartoon-like style with clean lines and solid colors.\n\n---\n\n### **Sky and Sun**\n- The sky is a gradient of light blue, lighter near the horizon and slightly deeper toward the top.\n- In the upper right corner, there’s a large, bright yellow sun with a thin orange outline, radiating warmth and brightness.\n\n---\n\n### **Mountains**\n- Behind the house, three stylized mountains rise against the sky:\n  - The **leftmost mountain** is medium gray-blue with a sharp peak.\n  - The **central mountain** is taller, with a white snow-capped peak and a darker blue-gray body.\n  - The **rightmost mountain** is smaller and lighter gray-blue, partially behind the tree.\n- All mountains have simple triangular shapes with no texture or detail beyond their base color and snow cap.\n\n---\n\n### **House**\n- Centered in the foreground is a charming, single-story"
+ },
+ {
+  "label": "ours.exl3-vision",
+  "image": "natural_scene",
+  "rep": 1,
+  "ok": true,
+  "s": 1.7641642093658447,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 404,
+   "total_tokens": 660
+  },
+  "timings": null,
+  "text": "This is a cheerful, stylized digital illustration titled **“A SUNNY HOUSE BY THE MOUNTAINS”**, displayed in bold, dark blue capital letters at the top left of the image.\n\nThe scene depicts a peaceful, sunny day in a mountainous landscape, rendered in a simple, flat, cartoon-like style with clean lines and solid colors.\n\n---\n\n### **Sky and Sun**\n- The sky is a gradient of light blue, lighter near the horizon and slightly deeper toward the top.\n- In the upper right corner, there’s a large, bright yellow sun with a thin orange outline, radiating warmth and brightness.\n\n---\n\n### **Mountains**\n- Behind the house, three stylized mountains rise against the sky:\n  - The **leftmost mountain** is medium gray-blue with a sharp peak.\n  - The **central mountain** is taller, with a white snow-capped peak and a darker blue-gray body.\n  - The **rightmost mountain** is smaller and lighter gray-blue, partially behind the tree.\n- All mountains have simple triangular shapes with no texture or detail beyond their base colors.\n\n---\n\n### **Ground**\n- The ground is a solid, vibrant green field that stretches across the entire"
+ },
+ {
+  "label": "ours.exl3-vision",
+  "image": "visual_chart",
+  "rep": 0,
+  "ok": true,
+  "s": 1.7185428142547607,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 411,
+   "total_tokens": 667
+  },
+  "timings": null,
+  "text": "This chart, titled **\"NIFER VISION 731\"**, appears to be a simple visual test or demonstration of basic shape recognition and spatial relationships — possibly for vision screening, cognitive assessment, or educational purposes. It is divided into two sections: **COUNT** and **POSITION**.\n\n---\n\n### ✅ What the Chart Shows:\n\n#### 1. **COUNT Section**\n- Displays **three red circles** arranged horizontally.\n- Below them, the text reads:  \n  > **THREE RED CIRCLES**\n\n→ This tests the ability to count objects and identify their color and shape.\n\n---\n\n#### 2. **POSITION Section**\n- Shows a **blue square** on the left.\n- An arrow points from the blue square to the right.\n- On the right side, there is a **green triangle**.\n- Labels below each shape:\n  - Left: **BLUE SQUARE**\n  - Right: **GREEN TRIANGLE**\n\n→ This tests the ability to understand directional relationships (left-to-right) and identify shapes and colors.\n\n---\n\n### 📊 Values You Can Read:\n\n| Section   | Element             | Value / Description         |\n|-----------|---------------------|-----------------------------"
+ },
+ {
+  "label": "ours.exl3-vision",
+  "image": "visual_chart",
+  "rep": 1,
+  "ok": true,
+  "s": 1.6435561180114746,
+  "usage": {
+   "completion_tokens": 256,
+   "prompt_tokens": 411,
+   "total_tokens": 667
+  },
+  "timings": null,
+  "text": "This chart, titled **\"NIFER VISION 731\"**, appears to be a simple visual test or demonstration of basic shape recognition and spatial relationships — possibly for vision screening, cognitive assessment, or educational purposes. It is divided into two sections: **COUNT** and **POSITION**.\n\n---\n\n### ✅ What the Chart Shows:\n\n#### 1. **COUNT Section**\n- Displays **three red circles** arranged horizontally.\n- Below them, the text reads:  \n  > **THREE RED CIRCLES**\n\n→ This tests the ability to count objects and identify their color and shape.\n\n---\n\n#### 2. **POSITION Section**\n- Shows a **blue square** on the left.\n- An arrow points from the blue square to the right.\n- On the right side is a **green triangle**.\n- Labels below each shape:\n  - Left: **BLUE SQUARE**\n  - Right: **GREEN TRIANGLE**\n\n→ This tests the ability to understand directional relationships (left-to-right) and identify shapes and colors.\n\n---\n\n### 📊 Values You Can Read:\n\n| Section   | Element             | Value / Description         |\n|-----------|---------------------|-----------------------------|\n"
+ }
+]

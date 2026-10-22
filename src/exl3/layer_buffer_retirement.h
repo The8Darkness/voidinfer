@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // Owning storage only: borrowed layer scratch must never be adopted here.
 // Allocate this record before allocating device storage. Failed cleanup publishes
 // an immutable record and never retries or switches the current CUDA device.

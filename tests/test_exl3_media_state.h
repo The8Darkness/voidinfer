@@ -2,8 +2,8 @@
 
 void run_media_state_gate(Exl3TextModel& model,const std::vector<std::int64_t>& code,
     const std::vector<std::int64_t>& prose){
-    using namespace ninfer::exl3;using Json=nlohmann::ordered_json;
-    const std::filesystem::path dir=env("NINFER_REAL_DFLASH_OUT");
+    using namespace voidinfer::exl3;using Json=nlohmann::ordered_json;
+    const std::filesystem::path dir=env("VOIDINFER_REAL_DFLASH_OUT");
     require(!dir.empty()&&!std::filesystem::exists(dir),"preserve media-state receipt");std::filesystem::create_directories(dir);
     std::ofstream checks(dir/"checks.csv");checks<<"case,pass\n";
     auto gate=[&](const char* name,bool pass){checks<<name<<','<<pass<<'\n';checks.flush();require(pass,std::string("media state ")+name);};
@@ -30,9 +30,9 @@ void run_media_state_gate(Exl3TextModel& model,const std::vector<std::int64_t>& 
     Json audits=Json::array();
     for(int fixture=0;fixture<2;++fixture){
         const auto& ids=fixture?prose:code;require(ids.size()>=80,"media state text fixture length");
-        _putenv_s("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH","0");auto plain=model.create_context(true);plain->prepare_continuation(8);
+        _putenv_s("VOIDINFER_EXL3_MEDIA_EXECUTION_RESEARCH","0");auto plain=model.create_context(true);plain->prepare_continuation(8);
         auto initial=Exl3VeriCacheRequest::initialize(*plain,std::span<const std::int64_t>(ids.data(),64),1024)->state();
-        _putenv_s("NINFER_EXL3_MEDIA_EXECUTION_RESEARCH","1");auto media=model.create_context(true);media->prepare_continuation(8);
+        _putenv_s("VOIDINFER_EXL3_MEDIA_EXECUTION_RESEARCH","1");auto media=model.create_context(true);media->prepare_continuation(8);
         gate("bounded_private_media_scratch",media->persistent_bytes()==plain->persistent_bytes()+8ULL*5120*4+8ULL*3*4);
         auto embeddings=[&](int count){
             std::vector<std::uint16_t> raw(std::size_t(count)*5120);std::vector<float> features(raw.size());
@@ -80,7 +80,7 @@ void run_media_state_gate(Exl3TextModel& model,const std::vector<std::int64_t>& 
         recycled->restore_exact_host_state(*initial);plain->restore_exact_host_state(*initial);const auto token=sample_target(*plain);plain->decode(token);recycled->decode(token);
         gate("recycled_scalar_request_exact",recycled->export_exact_host_state()->same_payload(*plain->export_exact_host_state()));
     }
-    const std::filesystem::path frozen=env("NINFER_TEST_FROZEN_V6_EMBEDDINGS");
+    const std::filesystem::path frozen=env("VOIDINFER_TEST_FROZEN_V6_EMBEDDINGS");
     if(!frozen.empty()){
         require(std::filesystem::file_size(frozen)==64ULL*5120*4,"frozen native V6 embedding extent");
         std::vector<float> features(64*5120);std::ifstream input(frozen,std::ios::binary);

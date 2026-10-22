@@ -18,7 +18,7 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::exl3;
+using namespace voidinfer::exl3;
 
 void check(cudaError_t error, const char* operation) {
     if (error != cudaSuccess) {
@@ -177,7 +177,7 @@ std::vector<std::uint16_t> run(Linear& linear, const std::vector<std::uint16_t>&
           "upload oracle input");
     // The topology is intentionally selected by the library from this process
     // environment; "32" is the explicit inherited differential baseline.
-    _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", topology.c_str());
+    _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", topology.c_str());
     Exl3CudaLinearWorkspace workspace(17408, 5120, 1);
     workspace.forward(linear.view, linear.metadata,
                       static_cast<const std::uint16_t*>(input_device.ptr),
@@ -212,12 +212,12 @@ Metrics compare(const std::vector<std::uint16_t>& reference, const std::vector<s
 
 int main() {
     try {
-        const std::string target = env("NINFER_EXL3_TARGET_PATH");
-        if (target.empty()) { std::cerr << "SKIP: set NINFER_EXL3_TARGET_PATH\n"; return 77; }
-        const std::string e3a_path = env("NINFER_EXL3_E3A_ORACLE_PATH");
-        const std::string e3b_path = env("NINFER_EXL3_E3B_ORACLE_PATH");
+        const std::string target = env("VOIDINFER_EXL3_TARGET_PATH");
+        if (target.empty()) { std::cerr << "SKIP: set VOIDINFER_EXL3_TARGET_PATH\n"; return 77; }
+        const std::string e3a_path = env("VOIDINFER_EXL3_E3A_ORACLE_PATH");
+        const std::string e3b_path = env("VOIDINFER_EXL3_E3B_ORACLE_PATH");
         if (e3a_path.empty() || e3b_path.empty()) {
-            std::cerr << "SKIP: set NINFER_EXL3_E3A_ORACLE_PATH and NINFER_EXL3_E3B_ORACLE_PATH\n";
+            std::cerr << "SKIP: set VOIDINFER_EXL3_E3A_ORACLE_PATH and VOIDINFER_EXL3_E3B_ORACLE_PATH\n";
             return 77;
         }
         const auto target_collection = inspect_indexed_directory(std::filesystem::path(target));
@@ -272,7 +272,7 @@ int main() {
                 if (metrics.max_abs > 0.0015 || metrics.rel > 0.0007) failed = true;
             }
         }
-        _putenv_s("NINFER_EXL3_LARGE_DOWN_TOPOLOGY", "");
+        _putenv_s("VOIDINFER_EXL3_LARGE_DOWN_TOPOLOGY", "");
         if (failed) throw std::runtime_error("large-down topology differential oracle failed");
         std::cout << "E4B3D large-down differential oracle: PASS\n";
         return 0;

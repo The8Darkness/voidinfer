@@ -8,7 +8,7 @@
 #include <optional>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Prepared, opt-in collection surface. No production provider is installed by
 // this type. Registered-host and locked-resident observations may overlap and
@@ -116,4 +116,4 @@ private:
     std::uint64_t next_sequence_=1;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

@@ -2,8 +2,8 @@
 
 void run_compact_request_qualification(Exl3TextModel& target,Exl3Dflash2DraftModel& draft,
     const std::vector<std::int64_t>& source) {
-    using Request=ninfer::exl3::Exl3VeriCacheRequest;
-    _putenv_s("NINFER_EXL3_EXACT_HOST_KV","1");
+    using Request=voidinfer::exl3::Exl3VeriCacheRequest;
+    _putenv_s("VOIDINFER_EXL3_EXACT_HOST_KV","1");
     auto exact=target.create_context(true);exact->prepare_continuation(8);
     std::array<std::unique_ptr<DeviceBuffer>,5> stage;std::array<std::uint16_t*,5> staging{};
     for(int tap=0;tap<5;++tap) {stage[tap]=std::make_unique<DeviceBuffer>(16ULL*kHidden*2);staging[tap]=static_cast<std::uint16_t*>(stage[tap]->get());}

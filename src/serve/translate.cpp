@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace voidinfer::serve {
 namespace {
 
 std::uint64_t random_seed() {
@@ -32,9 +32,9 @@ std::uint64_t random_seed() {
     throw ApiException(std::move(error));
 }
 
-ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
+voidinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
                                                      const ServeOptions& server) {
-    ninfer::SamplingOverrides sampling = server.sampling_overrides;
+    voidinfer::SamplingOverrides sampling = server.sampling_overrides;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
@@ -104,7 +104,7 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
-                                                 const ninfer::PromptCapabilities& capabilities) {
+                                                 const voidinfer::PromptCapabilities& capabilities) {
     ResolvedPromptSemantics result{
         .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
         .reasoning_effort  = std::nullopt,
@@ -130,13 +130,13 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
 
     switch (requested) {
     case RequestedReasoningEffort::Low:
-        result.reasoning_effort = ninfer::ReasoningEffort::Low;
+        result.reasoning_effort = voidinfer::ReasoningEffort::Low;
         break;
     case RequestedReasoningEffort::Medium:
-        result.reasoning_effort = ninfer::ReasoningEffort::Medium;
+        result.reasoning_effort = voidinfer::ReasoningEffort::Medium;
         break;
     case RequestedReasoningEffort::XHigh:
-        result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+        result.reasoning_effort = voidinfer::ReasoningEffort::XHigh;
         break;
     case RequestedReasoningEffort::Minimal:
     case RequestedReasoningEffort::High:
@@ -158,33 +158,33 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     return result;
 }
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
+voidinfer::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
-    ninfer::PromptInput input;
+    voidinfer::PromptInput input;
     input.messages.reserve(request.messages.size());
     for (std::size_t turn_index = 0; turn_index < request.messages.size(); ++turn_index) {
         const ChatTurn& turn = request.messages[turn_index];
-        ninfer::ChatMessage message;
+        voidinfer::ChatMessage message;
         message.role              = turn.role;
         message.reasoning_content = turn.reasoning_content;
         message.tool_call_id      = turn.tool_call_id;
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
-            message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
+            message.tool_calls.push_back(voidinfer::ToolCall{call.id, call.name, call.arguments_json});
         }
 
         std::uint64_t text_bytes = 0;
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Text) {
                 if (!message.parts.empty() && !part.text.empty() &&
-                    message.parts.back().kind == ninfer::MessagePartKind::Text) {
-                    ninfer::MessagePart newline;
+                    message.parts.back().kind == voidinfer::MessagePartKind::Text) {
+                    voidinfer::MessagePart newline;
                     newline.text = "\n";
                     message.parts.push_back(std::move(newline));
                     ++text_bytes;
                 }
-                ninfer::MessagePart text;
+                voidinfer::MessagePart text;
                 text.text = part.text;
                 message.parts.push_back(std::move(text));
                 if (part.text.size() > std::numeric_limits<std::uint32_t>::max() - text_bytes) {
@@ -197,8 +197,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 if (!acquire_media) {
                     throw std::logic_error("media acquisition callback is not configured");
                 }
-                ninfer::MessagePart media;
-                media.kind  = ninfer::MessagePartKind::Media;
+                voidinfer::MessagePart media;
+                media.kind  = voidinfer::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
                 continue;
@@ -218,9 +218,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 }
             }
             if (!turn.shared_cache_boundaries_after_text_bytes.empty()) {
-                input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                    .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                    .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                input.context_cache.markers.push_back(voidinfer::PromptCacheMarker{
+                    .kind     = voidinfer::PromptCacheMarkerKind::SharedStablePrefix,
+                    .location = voidinfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
                     .leading_instruction_bytes =
                         turn.shared_cache_boundaries_after_text_bytes.back(),
                 });
@@ -231,10 +231,10 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::overflow_error("conversation cache boundary exceeds uint32");
             }
-            input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            input.context_cache.markers.push_back(voidinfer::PromptCacheMarker{
                 .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
-                .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
-                .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+                .kind                = voidinfer::PromptCacheMarkerKind::PrivateLongAnchor,
+                .location            = voidinfer::PromptCacheMarkerLocation::MessageBoundary,
             });
         }
     }
@@ -257,25 +257,25 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     // Anthropic request: the latest explicit breakpoint contains every earlier stable section and
     // avoids pinning the sole shared slot with an earlier tool-only prefix during the same request.
     bool has_shared_marker = false;
-    for (const ninfer::PromptCacheMarker& marker : input.context_cache.markers) {
+    for (const voidinfer::PromptCacheMarker& marker : input.context_cache.markers) {
         has_shared_marker =
-            has_shared_marker || marker.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+            has_shared_marker || marker.kind == voidinfer::PromptCacheMarkerKind::SharedStablePrefix;
     }
     if (!has_shared_marker && last_tool_cache_boundary) {
-        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+        input.context_cache.markers.push_back(voidinfer::PromptCacheMarker{
+            .kind             = voidinfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .location         = voidinfer::PromptCacheMarkerLocation::ToolBoundary,
             .after_tool_count = *last_tool_cache_boundary,
         });
     }
     return input;
 }
 
-ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+voidinfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server,
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse) {
-    ninfer::RequestOptions options;
+    voidinfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     if (semantics.enable_thinking) {
@@ -288,26 +288,26 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
-                ninfer::StopString{.text              = stop,
-                                   .channel           = ninfer::OutputChannel::Content,
+                voidinfer::StopString{.text              = stop,
+                                   .channel           = voidinfer::OutputChannel::Content,
                                    .include_in_output = false});
         }
     }
     return options;
 }
 
-const char* finish_reason_wire(ninfer::FinishReason reason) {
+const char* finish_reason_wire(voidinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
+    case voidinfer::FinishReason::OutputLimit:
+    case voidinfer::FinishReason::ContextCapacity:
         return "length";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
+    case voidinfer::FinishReason::None:
+    case voidinfer::FinishReason::StopToken:
+    case voidinfer::FinishReason::StopString:
+    case voidinfer::FinishReason::Cancelled:
         return "stop";
     }
     return "stop";
 }
 
-} // namespace ninfer::serve
+} // namespace voidinfer::serve

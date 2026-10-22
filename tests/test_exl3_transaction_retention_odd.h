@@ -5,7 +5,7 @@ void run_transaction_retention_odd_qualification(
     const std::vector<std::int64_t>& source_ids) {
     require(target.max_context() == 4096 && source_ids.size() >= 4096,
             "transactionretainoddqual requires maxctx4096 and real prompt IDs");
-    require(env("NINFER_OSCAR_EXL3") == "1",
+    require(env("VOIDINFER_OSCAR_EXL3") == "1",
             "transactionretainoddqual requires canonical OSCAR");
 
     int cases = 0;

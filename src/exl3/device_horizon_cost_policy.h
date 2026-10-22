@@ -6,7 +6,7 @@
 #include <deque>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 // Request-local, greedy-only B4/B8 experiment. A sample is complete host wall
 // from the post-seed proposal boundary through the next target seed readiness;
@@ -76,4 +76,4 @@ private:
     std::uint64_t observed_=0;
 };
 
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

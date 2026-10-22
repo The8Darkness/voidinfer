@@ -7,12 +7,12 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 // The compact device argmax is the qualified greedy-text default. Explicit 0
 // retains the host-logit control and rollback path; explicit 1 remains
 // accepted for pinned configurations.
 inline bool exl3_device_greedy_enabled() {
-    const auto* flag=std::getenv("NINFER_EXL3_DEVICE_GREEDY");
+    const auto* flag=std::getenv("VOIDINFER_EXL3_DEVICE_GREEDY");
     if(flag && std::string_view(flag)!="0" && std::string_view(flag)!="1")
         throw std::invalid_argument("device greedy must be 0 or 1");
     return !flag || std::string_view(flag)=="1";
@@ -133,4 +133,4 @@ inline void exl3_greedy_path(std::int64_t seed, const Exl3GreedyPacket& packet,
     path[0]=seed;
     for(std::size_t i=1;i<path.size();++i) path[i]=packet.decisions[i-1].token;
 }
-} // namespace ninfer::exl3
+} // namespace voidinfer::exl3

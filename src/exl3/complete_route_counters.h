@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 struct Exl3CompleteRouteCounterSnapshot {
     std::uint64_t proposed_rows=0;

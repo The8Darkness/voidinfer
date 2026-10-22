@@ -18,9 +18,9 @@
 
  namespace {
 
- using ninfer::exl3::Exl3TextModel;
- using ninfer::exl3::Exl3TextContext;
- using ninfer::exl3::Exl3Dflash2DraftModel;
+ using voidinfer::exl3::Exl3TextModel;
+ using voidinfer::exl3::Exl3TextContext;
+ using voidinfer::exl3::Exl3Dflash2DraftModel;
 
  constexpr int kHidden = 5120;
  constexpr int kTapCount = 5;
@@ -76,8 +76,8 @@
 
  int main() {
      try {
-         const auto target_path = env("NINFER_EXL3_TARGET_PATH");
-         const auto draft_path = env("NINFER_EXL3_DFLASH2_PATH");
+         const auto target_path = env("VOIDINFER_EXL3_TARGET_PATH");
+         const auto draft_path = env("VOIDINFER_EXL3_DFLASH2_PATH");
          if (target_path.empty() || draft_path.empty()) {
              std::cerr << "WRAP skipped: set env paths\n";
              return 77;

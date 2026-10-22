@@ -3,6 +3,9 @@
 // so a resume uploads them with asynchronous DMA, carved from 64-block slabs
 // so parking does not pay a page-locking call per chunk. Blocks return to a
 // process-wide free list; slabs are kept for reuse.
+#include "exl3/host_memory_ledger.h"
+#include "exl3/l0_oscar_format.h"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -12,12 +15,17 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::exl3 {
+namespace voidinfer::exl3 {
 
 class Exl3L0PinnedPool {
 public:
-    // One 4096-row chunk: codes 2 x 4096 x 4 x 64 B + meta 2 x 4096 x 4 x 4 x 2 B.
-    static constexpr std::size_t kBlockBytes = 4096ull * 2 * 4 * 64 + 4096ull * 2 * 4 * 4 * 2;
+    // One 4096-row chunk: codes then FP16 meta (l0_oscar_format.h; the code
+    // width is fixed for the process).
+    static std::size_t block_bytes() {
+        static const std::size_t value = 4096ull * (l0_oscar_format::row_code_bytes() +
+            l0_oscar_format::kRowMetaBytes);
+        return value;
+    }
     static constexpr std::size_t kSlabBlocks = 64;
 
     struct Block {
@@ -41,14 +49,21 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (free_.empty()) {
             void* slab = nullptr;
-            if (cudaHostAlloc(&slab, kBlockBytes * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess)
-                throw std::runtime_error("L0 OSCAR pinned chunk slab allocation");
+            // When the driver refuses page-locked memory the slab is pageable:
+            // its uploads and downloads become synchronous, nothing fails.
+            if (cudaHostAlloc(&slab, block_bytes() * kSlabBlocks, cudaHostAllocPortable) != cudaSuccess) {
+                (void)cudaGetLastError();
+                slab = ::operator new(block_bytes() * kSlabBlocks);
+            }
             slabs_.push_back(slab);
+            Exl3HostMemoryLedger::get().code_slab_bytes += static_cast<std::int64_t>(block_bytes() * kSlabBlocks);
+            Exl3HostMemoryLedger::get().code_free_bytes += static_cast<std::int64_t>(block_bytes() * kSlabBlocks);
             for (std::size_t i = 0; i < kSlabBlocks; ++i)
-                free_.push_back(static_cast<std::uint8_t*>(slab) + i * kBlockBytes);
+                free_.push_back(static_cast<std::uint8_t*>(slab) + i * block_bytes());
         }
         auto* p = free_.back();
         free_.pop_back();
+        Exl3HostMemoryLedger::get().code_free_bytes -= static_cast<std::int64_t>(block_bytes());
         return Block(p);
     }
 
@@ -56,10 +71,11 @@ private:
     void give_back(std::uint8_t* p) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         free_.push_back(p);
+        Exl3HostMemoryLedger::get().code_free_bytes += static_cast<std::int64_t>(block_bytes());
     }
     std::mutex mutex_;
     std::vector<void*> slabs_;
     std::vector<std::uint8_t*> free_;
 };
 
-}  // namespace ninfer::exl3
+}  // namespace voidinfer::exl3

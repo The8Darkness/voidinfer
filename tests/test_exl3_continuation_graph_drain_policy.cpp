@@ -3,7 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 
-using Policy=ninfer::exl3::Exl3ContinuationGraphDrainPolicy;
+using Policy=voidinfer::exl3::Exl3ContinuationGraphDrainPolicy;
 static void need(bool value) {if(!value)throw std::runtime_error("graph drain policy assertion");}
 
 int main() {try {

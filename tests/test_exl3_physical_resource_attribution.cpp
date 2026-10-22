@@ -3,7 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 
-using Collector=ninfer::exl3::Exl3PhysicalResourceAttributionCollector;
+using Collector=voidinfer::exl3::Exl3PhysicalResourceAttributionCollector;
 namespace {
 void need(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 template<class F> bool refuses(F&& call){try{call();}catch(...){return true;}return false;}

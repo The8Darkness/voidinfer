@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test {
+namespace voidinfer::test {
 
 // Windows qualification fixtures mutate process-local controls synchronously.
 // Capture before any mutation and restore in the original key order, including
@@ -31,4 +31,4 @@ private:
     std::vector<std::pair<std::string, std::string>> saved_;
 };
 
-} // namespace ninfer::test
+} // namespace voidinfer::test

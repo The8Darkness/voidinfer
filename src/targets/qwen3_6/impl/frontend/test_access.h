@@ -1,10 +1,10 @@
 #pragma once
 
-#include <ninfer/targets/qwen3_6/frontend.h>
-#include <ninfer/targets/qwen3_6/frontend_resources.h>
-#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <voidinfer/targets/qwen3_6/frontend.h>
+#include <voidinfer/targets/qwen3_6/frontend_resources.h>
+#include <voidinfer/targets/qwen3_6/prepared_prompt.h>
 
-namespace ninfer::targets::qwen3_6 {
+namespace voidinfer::targets::qwen3_6 {
 
 class FrontendTestAccess {
 public:
@@ -15,4 +15,4 @@ public:
     [[nodiscard]] static const PreparedPromptData& inspect(const PreparedPrompt& prompt);
 };
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace voidinfer::targets::qwen3_6
