@@ -26,8 +26,8 @@ ctest --test-dir build --output-on-failure
 the license notices. No Visual Studio, CUDA toolkit, vcpkg or VC++ redistributable is needed.
 
 Requirements: Windows 11 x64, an RTX 5090 with an NVIDIA driver that supports CUDA 13.3 (tested with
-621.01), and host RAM for the exact attention history (measured with 96 GB). The binaries contain
-`sm_120a` code only and do not run on other GPUs.
+621.01), and host RAM for the exact attention history: 64 KiB per token of context, see
+[host memory](#host-memory). The binaries contain `sm_120a` code only and do not run on other GPUs.
 
 1. Extract the zip and check it against the `.sha256` file published next to it:
    `(Get-FileHash -Algorithm SHA256 voidinfer-<version>-win64-sm120a.zip).Hash`.
@@ -75,6 +75,36 @@ Weights are not in Git. The Engine needs:
 
 A `<target>/.voidinfer/dual-load.json` manifest lets the loader read weights from verified C: and D:
 mirrors concurrently ([EXL3 dual loading](EXL3_DUAL_LOADING.md)).
+
+## Host memory
+
+The GPU keeps only the compressed INT4 history codes (about 17 KiB per token). The exact FP16
+attention history that every token is verified against lives in host RAM: **64 KiB per token**
+(16 full-attention layers × 4 KV heads × 256 dimensions × K and V × 2 bytes).
+
+| Context held in RAM | Exact FP16 history |
+|---|---:|
+| 32K tokens | 2 GiB |
+| 64K tokens | 4 GiB |
+| 128K tokens | 8 GiB |
+| 262,144 tokens (one full window) | 16 GiB |
+| 8 agents × 110K tokens | 54 GiB |
+
+Every running request holds its whole history. Finished conversations stay in RAM as retained roots,
+up to `--host-kv-mib` (default: the largest of 8 GiB, `--max-context` × 64 KiB and 40% of physical
+memory), so a returning agent resumes without a new prefill. A root evicted from that budget is
+prefilled again on its next turn. Under memory pressure idle histories are packed losslessly and only
+then spilled to a delete-on-close file in `%TEMP%`.
+
+Windows also charges commit for the engine's GPU allocations (about 27 GiB at startup, never resident
+in RAM). The commit limit is RAM plus the pagefile, so a small pagefile can force a spill while RAM
+is still free.
+
+Tested: 8 agents with ~110K tokens each (880K tokens of context) for 3 turns on 4 lanes, on a PC
+with **96 GB RAM** and a 14 GB pagefile. All 24 turns were served, at least 33.8 GB of RAM stayed
+free, and 4 GiB of idle history spilled when commit ran short. The run used
+`--host-kv-mib 20000`, which retains about four of the eight histories; the others were prefilled
+again on their next turn. Data: [2026-10-20 agents](../bench/engine-compare/data/2026-10-20/README.md).
 
 ## CLI smoke
 
