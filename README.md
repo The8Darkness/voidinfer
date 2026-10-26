@@ -39,8 +39,8 @@ of upstream `81c8ce0`) ran its official NVFP4 and groupwise artifacts with FP8 K
 | Paired NLL on real text, 4K–32K, 12,288 tokens | **reference** | +0.016 nats/token (95% CI excludes 0) |
 | SuperGPQA, answer letter only, all 26,529 questions ([10-20](bench/quality-20261020/README.md)) | **40.21%** | 38.17% |
 | MMLU-Pro, answer letter only, all 12,032 questions | **60.14%** | 58.93% |
-| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) ([10-25](bench/agentic-20261023/README.md#aime-2026)) | **95.0%** (114 / 120) | 92.5% (111 / 120, p = 0.50) |
-| AIME 2026, thinking on, 205K-token reasoning budget, 8 runs over all 30 problems (avg@8) | **98.3%** (236 / 240) | 96.7% (232 / 240, p = 0.22) |
+| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) ([10-25](bench/agentic-20261023/README.md#aime-2026)) | **95.0%** (114 / 120) | 92.5% (111 / 120) |
+| AIME 2026, thinking on, 205K-token reasoning budget, 8 runs over all 30 problems (avg@8) | **98.3%** (236 / 240) | 96.7% (232 / 240) |
 
 On the two full-size multiple-choice sets the fidelity lead shows up as accuracy, growing with
 difficulty (SuperGPQA calculation questions +3.1 points, hard +2.8). The smaller task suites (GSM8K,
