@@ -49,12 +49,12 @@ NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 
 **Long-running coding agents** (Oct 23 2026, [code and raw data](bench/agentic-20261023/README.md))
 
-| Test | VoidInfer | NInfer | p |
-|---|---:|---:|---:|
-| Coding agent recalls team decisions across 11 context compactions, ledger library, 6 runs | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) | 0.015 |
-| └ team decisions honored in the final code | **19.3 / 20** | 17.3 / 20 | 0.009 |
-| Same test, new project (room-booking library), 6 runs | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) | 0.037 |
-| └ hidden functional tests passed | **60.5 / 61** | 57.7 / 61 | 0.015 |
+| Test | VoidInfer | NInfer |
+|---|---:|---:|
+| Coding agent recalls team decisions across 11 context compactions, ledger library, 6 runs | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) |
+| └ team decisions honored in the final code | **19.3 / 20** | 17.3 / 20 |
+| Same test, new project (room-booking library), 6 runs | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) |
+| └ hidden functional tests passed | **60.5 / 61** | 57.7 / 61 |
 
 How the coding-agent tests were run:
 
@@ -71,7 +71,7 @@ How the coding-agent tests were run:
   compactions per run, the same count on both engines.
 * **Scoring.** The final code is scored by hidden tests: functional tests plus one test per decision
   and per convention. The two projects use different code, decisions and tests, and a reference
-  solution scores full marks on each. p is a two-sided Mann-Whitney U test over runs.
+  solution scores full marks on each.
 
 **Maximum context per lane** ([2026-10-20/21](bench/engine-compare/data/2026-10-20/README.md),
 the prompt actually prefilled and answered)
