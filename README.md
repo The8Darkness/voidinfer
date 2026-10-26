@@ -39,7 +39,7 @@ of upstream `81c8ce0`) ran its official NVFP4 and groupwise artifacts with FP8 K
 | Paired NLL on real text, 4K–32K, 12,288 tokens | **reference** | +0.016 nats/token (95% CI excludes 0) |
 | SuperGPQA, answer letter only, all 26,529 questions ([10-20](bench/quality-20261020/README.md)) | **40.21%** | 38.17% (McNemar p = 3e-23) |
 | MMLU-Pro, answer letter only, all 12,032 questions | **60.14%** | 58.93% (p = 7e-6) |
-| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) | **95.0%** (114 / 120) | 92.5% (111 / 120, p = 0.50) |
+| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) ([10-25](bench/agentic-20261023/README.md#aime-2026)) | **95.0%** (114 / 120) | 92.5% (111 / 120, p = 0.50) |
 | AIME 2026, thinking on, 205K-token reasoning budget, 8 runs over all 30 problems (avg@8) | **98.3%** (236 / 240) | 96.7% (232 / 240, p = 0.22) |
 
 On the two full-size multiple-choice sets the fidelity lead shows up as accuracy, growing with
@@ -47,7 +47,7 @@ difficulty (SuperGPQA calculation questions +3.1 points, hard +2.8). The smaller
 MATH-500, a 1,000-question step-by-step MMLU-Pro sample, IFEval, HumanEval, competition math, RULER,
 NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 
-**Long-running coding agents** (Oct 23 2026)
+**Long-running coding agents** (Oct 23 2026, [code and raw data](bench/agentic-20261023/README.md))
 
 | Test | VoidInfer | NInfer | p |
 |---|---:|---:|---:|
@@ -93,15 +93,15 @@ the prompt actually prefilled and answered)
   **18.6 vs 33.6 s**, and the BF16 tower matches the Hugging Face FP32 tower at cosine
   0.9998–0.9999.
 
-**Speed** ([2026-10-20/22](bench/engine-compare/data/2026-10-20/README.md)). NInfer is faster on raw
-speed; the fidelity above costs decode and prefill throughput.
+**Speed** (2026-10-26, release v2026.10.22 vs NInfer `a0cf1c17`, [code and raw data](bench/agentic-20261023/README.md)).
+NInfer is faster on raw speed; the fidelity above costs decode and prefill throughput.
 
 | | VoidInfer | NInfer |
 |---|---:|---:|
-| Decode, 2 requests at once (total) | 228 tok/s | **329 tok/s** |
-| Prefill, 3K / 32K / 128K prompt | 3.5K / 3.9K / 3.2K tok/s | **9.3K / 10.3K / 6.2K tok/s** |
-| Time to first token, 32K / 128K prompt | 8.1 / 40.8 s | **3.1 / 20.9 s** |
-| Agent resume (100K-token agent) | 0.75–0.89 s | **0.13–0.26 s** |
+| Decode, 2 requests at once (total, 4K prompts, 1,024 tokens each) | 231 tok/s | **365 tok/s** |
+| Prefill, 3K / 32K / 130K prompt | 4.0K / 4.1K / 3.2K tok/s | **11.0K / 11.5K / 6.5K tok/s** |
+| Time to first token, 32K / 130K prompt | 7.8 / 40.5 s | **2.8 / 20.0 s** |
+| Agent resume (100K-token agent, time to first token) | 0.44–0.79 s | **0.09–0.22 s** |
 
 **Decode speed by context length** (Oct 26 2026). One request at a time, both engines at a 208,896-token
 window, greedy, thinking off. Each request carries a different slice of C++ source (no prefix reuse) and
