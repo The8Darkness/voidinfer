@@ -3,7 +3,7 @@
 This folder holds the test code and raw results for these sections of the top-level README:
 - the *Long-running coding agents* table;
 - the *AIME 2026* rows of the *Quality* table;
-- the *Speed* tables.
+- the *Decode speed by context length* table.
 
 Both engines ran on the same RTX 5090 (Windows 11, WDDM, 96 GB RAM):
 
@@ -27,7 +27,7 @@ exact server command lines are stored with the agent results (`results/<tag>/<en
 | `harness/report.py` | Aggregates `results/<tag>/<engine>.jsonl` into tables (Mann-Whitney U per row) |
 | `harness/aime.py` | AIME 2026 runner and report (avg@k, majority vote, pass@k, paired sign-flip permutation test) |
 | `harness/decode_sweep.py` | Decode tok/s and time to first token from 3K to 200K tokens of context |
-| `harness/speed_rows.py` | Two requests at once (aggregate decode) and 100K-token agent resume |
+| `harness/speed_rows.py` | Two requests at once (aggregate decode) and 100K-token agent resume, re-measured on the release build (not in the top-level README) |
 | `harness/setup_wsl.sh` | Creates the WSL Python environment (pytest) that runs the agent's commands |
 | `results/lh2_c1_w208896`, `results/lh3_c1_w208896` | Per-run agent results for the two README agent tests (6 runs per engine) |
 | `results/aime2026`, `results/aime2026_c1_200k` | Every AIME generation: answer, correctness, finish reason, tokens, seconds |
