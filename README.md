@@ -98,11 +98,27 @@ speed; the fidelity above costs decode and prefill throughput.
 
 | | VoidInfer | NInfer |
 |---|---:|---:|
-| Decode, 1 request (4K prompt, 1,024 tokens) | 147 tok/s | **190 tok/s** |
 | Decode, 2 requests at once (total) | 228 tok/s | **329 tok/s** |
 | Prefill, 3K / 32K / 128K prompt | 3.5K / 3.9K / 3.2K tok/s | **9.3K / 10.3K / 6.2K tok/s** |
 | Time to first token, 32K / 128K prompt | 8.1 / 40.8 s | **3.1 / 20.9 s** |
 | Agent resume (100K-token agent) | 0.75–0.89 s | **0.13–0.26 s** |
+
+**Decode speed by context length** (Oct 26 2026). One request at a time, both engines at a 208,896-token
+window, greedy, thinking off. Each request carries a different slice of C++ source (no prefix reuse) and
+asks for a code review of exactly 1,024 tokens. Each length was run 3 times with different slices; decode is
+timed from the first to the last streamed token, so prefill is excluded.
+
+| Prompt tokens | VoidInfer decode | NInfer decode | Time to first token, VoidInfer / NInfer |
+|---|---:|---:|---:|
+| 3K | 193 tok/s | **219 tok/s** | 0.8 / **0.3 s** |
+| 7K | 188 tok/s | **204 tok/s** | 1.8 / **0.6 s** |
+| 15K | 182 tok/s | **205 tok/s** | 3.7 / **1.2 s** |
+| 32K | 177 tok/s | **197 tok/s** | 7.8 / **2.8 s** |
+| 64K | 169 tok/s | **189 tok/s** | 17.4 / **7.2 s** |
+| 97K | 146 tok/s | **176 tok/s** | 28.0 / **12.8 s** |
+| 130K | 145 tok/s | **173 tok/s** | 40.5 / **20.0 s** |
+| 163K | 144 tok/s | **170 tok/s** | 55.0 / **28.8 s** |
+| 200K | 127 tok/s | **153 tok/s** | 72.9 / **40.7 s** |
 
 ## Model weights
 
