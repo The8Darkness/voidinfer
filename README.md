@@ -55,7 +55,6 @@ NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 | └ hidden functional tests passed | | **60.5 / 61** | 57.7 / 61 | 0.015 |
 | AIME 2026, 82K-token reasoning budget, avg@4 | 4 | **95.0%** (114 / 120) | 92.5% (111 / 120) | 0.50 |
 | AIME 2026, 205K-token reasoning budget, avg@8 | 8 | **98.3%** (236 / 240) | 96.7% (232 / 240) | 0.22 |
-| AIME 2026, both rounds pooled | 12 | **97.2%** (350 / 360) | 95.3% (343 / 360) | 0.13 |
 
 How these were tested:
 
