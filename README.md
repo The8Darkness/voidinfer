@@ -37,24 +37,24 @@ of upstream `81c8ce0`) ran its official NVFP4 and groupwise artifacts with FP8 K
 | Weights only: KL on German / Chinese / C++ and CUDA | **0.0021 / 0.0015 / 0.0007** | 0.063 / 0.038 / 0.016 |
 | BF16 argmax agrees with each engine's served greedy answers, 382 GSM8K / MATH-500 / IFEval / HumanEval items ([on-policy](bench/engine-compare/data/quality/onpolicy_20261013.txt)) | **99.3%** | 96.0–96.1% |
 | Paired NLL on real text, 4K–32K, 12,288 tokens | **reference** | +0.016 nats/token (95% CI excludes 0) |
-| SuperGPQA, answer letter only, all 26,529 questions ([10-20](bench/quality-20261020/README.md)) | **40.21%** | 38.17% (McNemar p = 3e-23) |
-| MMLU-Pro, answer letter only, all 12,032 questions | **60.14%** | 58.93% (p = 7e-6) |
-| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) | **95.0%** (114 / 120) | 92.5% (111 / 120, p = 0.50) |
-| AIME 2026, thinking on, 205K-token reasoning budget, 8 runs over all 30 problems (avg@8) | **98.3%** (236 / 240) | 96.7% (232 / 240, p = 0.22) |
+| SuperGPQA, answer letter only, all 26,529 questions ([10-20](bench/quality-20261020/README.md)) | **40.21%** | 38.17% |
+| MMLU-Pro, answer letter only, all 12,032 questions | **60.14%** | 58.93% |
+| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) ([10-25](bench/agentic-20261023/README.md#aime-2026)) | **95.0%** (114 / 120) | 92.5% (111 / 120) |
+| AIME 2026, thinking on, 205K-token reasoning budget, 8 runs over all 30 problems (avg@8) | **98.3%** (236 / 240) | 96.7% (232 / 240) |
 
 On the two full-size multiple-choice sets the fidelity lead shows up as accuracy, growing with
 difficulty (SuperGPQA calculation questions +3.1 points, hard +2.8). The smaller task suites (GSM8K,
 MATH-500, a 1,000-question step-by-step MMLU-Pro sample, IFEval, HumanEval, competition math, RULER,
 NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 
-**Long-running coding agents** (Oct 23 2026)
+**Long-running coding agents** (Oct 23 2026, [code and raw data](bench/agentic-20261023/README.md))
 
-| Test | VoidInfer | NInfer | p |
-|---|---:|---:|---:|
-| Coding agent recalls team decisions across 11 context compactions, ledger library, 6 runs | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) | 0.015 |
-| └ team decisions honored in the final code | **19.3 / 20** | 17.3 / 20 | 0.009 |
-| Same test, new project (room-booking library), 6 runs | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) | 0.037 |
-| └ hidden functional tests passed | **60.5 / 61** | 57.7 / 61 | 0.015 |
+| Test | VoidInfer | NInfer |
+|---|---:|---:|
+| Coding agent recalls team decisions across 11 context compactions, ledger library, 6 runs | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) |
+| └ team decisions honored in the final code | **19.3 / 20** | 17.3 / 20 |
+| Same test, new project (room-booking library), 6 runs | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) |
+| └ hidden functional tests passed | **60.5 / 61** | 57.7 / 61 |
 
 How the coding-agent tests were run:
 
@@ -71,7 +71,7 @@ How the coding-agent tests were run:
   compactions per run, the same count on both engines.
 * **Scoring.** The final code is scored by hidden tests: functional tests plus one test per decision
   and per convention. The two projects use different code, decisions and tests, and a reference
-  solution scores full marks on each. p is a two-sided Mann-Whitney U test over runs.
+  solution scores full marks on each.
 
 **Maximum context per lane** ([2026-10-20/21](bench/engine-compare/data/2026-10-20/README.md),
 the prompt actually prefilled and answered)
