@@ -45,6 +45,51 @@ difficulty (SuperGPQA calculation questions +3.1 points, hard +2.8). The smaller
 MATH-500, a 1,000-question step-by-step MMLU-Pro sample, IFEval, HumanEval, competition math, RULER,
 NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 
+**Long-running coding agents and AIME 2026** (Oct 23–26 2026)
+
+| Test | Runs per engine | VoidInfer | NInfer | p |
+|---|---:|---:|---:|---:|
+| Coding agent recalls team decisions across 11 context compactions, ledger library | 6 | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) | 0.015 |
+| └ team decisions honored in the final code | | **19.3 / 20** | 17.3 / 20 | 0.009 |
+| Same test, new project (room-booking library) | 6 | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) | 0.037 |
+| └ hidden functional tests passed | | **60.5 / 61** | 57.7 / 61 | 0.015 |
+| AIME 2026, 82K-token reasoning budget, avg@4 | 4 | **95.0%** (114 / 120) | 92.5% (111 / 120) | 0.50 |
+| AIME 2026, 205K-token reasoning budget, avg@8 | 8 | **98.3%** (236 / 240) | 96.7% (232 / 240) | 0.22 |
+
+How these were tested:
+
+* **Engines.** Both on the same RTX 5090. VoidInfer: release v2026.10.22 with its defaults (EXL3
+  6 bpw, L0 OSCAR INT4 KV, exact VeriCache, DFlash2). NInfer: `a0cf1c17` with its NVFP4 artifact,
+  FP8 KV and DFlash2. Sampling parameters were sent explicitly with every request, so both engines
+  received the same settings.
+* **Coding agents.**
+  * **Agent loop.** The loop is mini-swe-agent style: one bash command per reply, run in a WSL Ubuntu
+    sandbox. Thinking is off, sampling is T 0.7 / top_p 0.8 / top_k 20, and each reply is capped
+    at 4,096 tokens. Each stage gets at most 30 agent steps.
+  * **Context.** One agent per engine, both at a 208,896-token window (NInfer's single-request
+    maximum).
+  * **Task.** The agent builds a Python package in 12 stages. 12 coding conventions and 20 team
+    decisions (4 of them later revised) appear only once, inside "team chat" messages.
+  * **Compaction.** Each stage adds ~100K tokens of unrelated file reads, so the context fills up
+    every stage. When a prompt would exceed 80% of the window, the agent writes a handoff summary
+    and the history is replaced by the brief, the summary and the most recent turns. That makes
+    about 11 compactions per run, the same count on both engines.
+  * **Scoring.** The final code is scored by hidden tests: functional tests plus one test per
+    decision and per convention. The two projects use different code, decisions and tests, and a
+    reference solution scores full marks on each. p is a two-sided Mann-Whitney U test over runs.
+* **AIME 2026.**
+  * **Problems.** All 30 problems (AIME I and II), each sent as the problem text plus an instruction
+    to put the final answer in `\boxed{}`. Answers are scored with `math_verify`.
+  * **Settings.** Thinking is on, with Qwen's recommended sampling (T 1.0 / top_p 0.95 / top_k 20).
+  * **Rounds.** Round 1 ran 2 requests at a time with an 86,016-token window and an 81,920-token
+    budget, 4 samples per problem. Round 2 ran one request at a time with a 208,896-token window
+    and a 204,800-token budget, 8 samples per problem; the engines alternated pass by pass, and no
+    answer hit the budget. p is a paired sign-flip permutation test over the 30 problems.
+* **Speed and limits.** NInfer finished every one of these tests faster: 1.5–1.7× in agent
+  wall-clock time and 1.35–1.6× per AIME answer. In four further variants of the agent test, neither
+  engine was significantly better: frequent revisions, facts delivered in tool output,
+  22 compactions, and thinking on.
+
 **Maximum context per lane** ([2026-10-20/21](bench/engine-compare/data/2026-10-20/README.md),
 the prompt actually prefilled and answered)
 
