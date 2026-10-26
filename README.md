@@ -39,24 +39,24 @@ of upstream `81c8ce0`) ran its official NVFP4 and groupwise artifacts with FP8 K
 | Paired NLL on real text, 4K–32K, 12,288 tokens | **reference** | +0.016 nats/token (95% CI excludes 0) |
 | SuperGPQA, answer letter only, all 26,529 questions ([10-20](bench/quality-20261020/README.md)) | **40.21%** | 38.17% (McNemar p = 3e-23) |
 | MMLU-Pro, answer letter only, all 12,032 questions | **60.14%** | 58.93% (p = 7e-6) |
+| AIME 2026, thinking on, 82K-token reasoning budget, 4 runs over all 30 problems (avg@4) | **95.0%** (114 / 120) | 92.5% (111 / 120, p = 0.50) |
+| AIME 2026, thinking on, 205K-token reasoning budget, 8 runs over all 30 problems (avg@8) | **98.3%** (236 / 240) | 96.7% (232 / 240, p = 0.22) |
 
 On the two full-size multiple-choice sets the fidelity lead shows up as accuracy, growing with
 difficulty (SuperGPQA calculation questions +3.1 points, hard +2.8). The smaller task suites (GSM8K,
 MATH-500, a 1,000-question step-by-step MMLU-Pro sample, IFEval, HumanEval, competition math, RULER,
 NoLiMa, MRCR to 196K, IFBench) are statistically tied.
 
-**Long-running coding agents and AIME 2026** (Oct 23–26 2026)
+**Long-running coding agents** (Oct 23 2026)
 
-| Test | Runs per engine | VoidInfer | NInfer | p |
-|---|---:|---:|---:|---:|
-| Coding agent recalls team decisions across 11 context compactions, ledger library | 6 | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) | 0.015 |
-| └ team decisions honored in the final code | | **19.3 / 20** | 17.3 / 20 | 0.009 |
-| Same test, new project (room-booking library) | 6 | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) | 0.037 |
-| └ hidden functional tests passed | | **60.5 / 61** | 57.7 / 61 | 0.015 |
-| AIME 2026, 82K-token reasoning budget, avg@4 | 4 | **95.0%** (114 / 120) | 92.5% (111 / 120) | 0.50 |
-| AIME 2026, 205K-token reasoning budget, avg@8 | 8 | **98.3%** (236 / 240) | 96.7% (232 / 240) | 0.22 |
+| Test | VoidInfer | NInfer | p |
+|---|---:|---:|---:|
+| Coding agent recalls team decisions across 11 context compactions, ledger library, 6 runs | **83.3 / 86** (96.9%) | 80.2 / 86 (93.2%) | 0.015 |
+| └ team decisions honored in the final code | **19.3 / 20** | 17.3 / 20 | 0.009 |
+| Same test, new project (room-booking library), 6 runs | **92.0 / 93** (98.9%) | 88.5 / 93 (95.2%) | 0.037 |
+| └ hidden functional tests passed | **60.5 / 61** | 57.7 / 61 | 0.015 |
 
-How these were tested:
+How the coding-agent and AIME 2026 results were tested:
 
 * **Engines.** Both on the same RTX 5090. VoidInfer: release v2026.10.22 with its defaults (EXL3
   6 bpw, L0 OSCAR INT4 KV, exact VeriCache, DFlash2). NInfer: `a0cf1c17` with its NVFP4 artifact,
@@ -85,10 +85,6 @@ How these were tested:
     budget, 4 samples per problem. Round 2 ran one request at a time with a 208,896-token window
     and a 204,800-token budget, 8 samples per problem; the engines alternated pass by pass, and no
     answer hit the budget. p is a paired sign-flip permutation test over the 30 problems.
-* **Speed and limits.** NInfer finished every one of these tests faster: 1.5–1.7× in agent
-  wall-clock time and 1.35–1.6× per AIME answer. In four further variants of the agent test, neither
-  engine was significantly better: frequent revisions, facts delivered in tool output,
-  22 compactions, and thinking on.
 
 **Maximum context per lane** ([2026-10-20/21](bench/engine-compare/data/2026-10-20/README.md),
 the prompt actually prefilled and answered)
