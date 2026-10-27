@@ -21,8 +21,8 @@ exact server command lines are stored with the agent results (`results/<tag>/<en
 
 | Path | What |
 |---|---|
-| `harness/bench.py` | Agent loop, compaction, sandbox execution, scoring (all `lh*` suites) |
-| `harness/lh_spec.py` … `lh7_spec.py` | Stage texts, decisions, conventions and filler plan for each suite version |
+| `harness/bench.py` | Agent loop, compaction, sandbox execution, scoring |
+| `harness/lh2_spec.py`, `lh3_spec.py` | Stage texts, decisions, conventions and filler plan for the two projects |
 | `hidden/<suite>/` | Hidden tests (`test_functional.py`, `test_rules.py`), convention checker, reference solution (`ref/`) |
 | `harness/report.py` | Aggregates `results/<tag>/<engine>.jsonl` into tables (Mann-Whitney U per row) |
 | `harness/aime.py` | AIME 2026 runner and report (avg@k, majority vote, pass@k, paired sign-flip permutation test) |
@@ -62,15 +62,6 @@ Use `--suite lh3 --tag lh3_c1_w208896` for the room-booking project. NInfer need
 because `--kv-capacity auto` misses this window by a few MB. Before the first run, `wsl -d Ubuntu-24.04 bash harness/setup_wsl.sh`
 creates the sandbox Python. The filler is a large C++ source file, pre-tokenized into a JSON list of token IDs
 (`AB_SRC_IDS`). The source file itself is not included; any large source file works, though scores may differ slightly.
-
-`harness/bench.py` also contains the other suite versions that are not in the README:
-- `lh4`: revisions;
-- `lh5`: facts delivered in tool output;
-- `lh6`: 22 compactions;
-- `lh7`: deferred decisions;
-- `polyglot`: Aider polyglot.
-
-None of them showed a significant difference between the engines.
 
 ## AIME 2026
 

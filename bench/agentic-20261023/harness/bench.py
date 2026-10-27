@@ -560,7 +560,7 @@ def poly_job(job, window, filler_tokens, log):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", required=True, choices=["ours", "nv"])
-    ap.add_argument("--suite", required=True, choices=["lh", "lh2", "lh3", "lh4", "lh5", "lh6", "lh7", "polyglot"])
+    ap.add_argument("--suite", required=True, choices=["lh", "lh2", "lh3", "polyglot"])
     ap.add_argument("--conc", type=int, default=1)
     ap.add_argument("--window", type=int, required=True)
     ap.add_argument("--filler", type=int, default=0)
