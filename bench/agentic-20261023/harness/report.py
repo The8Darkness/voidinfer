@@ -2,8 +2,6 @@
 import json, math, os, re, statistics as st, sys
 
 ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
-CONV = ["c01_package", "c02_no_float", "c03_vxerror_codes", "c04_logging", "c05_stdlib", "c06_type_hints",
-        "c07_utc_z", "c08_atomic", "c09_exit3", "c10_spdx", "c11_chf", "c12_acc_ids"]
 
 
 def load(tag, eng):
@@ -32,12 +30,6 @@ def fmt(m, ci, nd=1):
     if m is None:
         return "-"
     return f"{m:.{nd}f}" + (f" ± {ci:.{nd}f}" if ci is not None else "")
-
-
-def tokens(rows):
-    pt = sum(c.get("prompt_tokens") or 0 for r in rows for c in r.get("calls", []))
-    ct = sum(c.get("completion_tokens") or 0 for r in rows for c in r.get("calls", []))
-    return pt, ct
 
 
 def mwu_p(a, b):
@@ -71,86 +63,10 @@ def mwu_p(a, b):
     return min(1.0, math.erfc(max(0.0, z) / math.sqrt(2)))
 
 
-def lh_table(tag):
-    out = {}
-    lines = [f"### {tag}", "", "| | ours | NInfer | p (MWU) |", "|---|---|---|---|"]
-    data = {e: load(tag, e) for e in ("ours", "nv")}
-    for e, rows in data.items():
-        if not rows:
-            continue
-        s = {"runs": len(rows), "window": rows[0]["_meta"].get("window"), "conc": rows[0]["_meta"].get("conc"),
-             "errors": sum(1 for r in rows if r.get("status") != "ok")}
-        s["tests"] = [r.get("tests_passed", 0) for r in rows]
-        s["conv"] = [r.get("conv_score", 0) for r in rows]
-        s["compactions"] = [r.get("compactions", 0) for r in rows]
-        s["wall_min"] = [r.get("wall_s", 0) / 60 for r in rows]
-        s["stages_done"] = [sum(1 for x in r.get("stages", []) if x.get("done")) for r in rows]
-        rec_all = [h for r in rows for h in r.get("summary_recall", [])]
-        s["recall_all"] = (sum(sum(h.values()) for h in rec_all) / (12 * len(rec_all))) if rec_all else None
-        last = [r["summary_recall"][-1] for r in rows if r.get("summary_recall")]
-        s["recall_last"] = (sum(sum(h.values()) for h in last) / (12 * len(last))) if last else None
-        s["n_summaries"] = len(rec_all)
-        s["per_conv"] = {c: sum(1 for r in rows if r.get("conventions", {}).get(c)) for c in CONV}
-        s["per_conv_recall"] = {c: (sum(1 for h in rec_all if h.get(c)) / len(rec_all)) if rec_all else None for c in CONV}
-        pt, ct = tokens(rows)
-        s["prompt_tokens"], s["completion_tokens"] = pt, ct
-        s["t_llm_min"] = [r.get("t_llm_s", 0) / 60 for r in rows]
-        steps = [c for r in rows for c in r.get("calls", []) if c.get("kind") == "step"]
-        s["decode_tok_s"] = (sum(c["completion_tokens"] for c in steps) /
-                             max(1e-9, sum(c["wall_s"] - c["ttft_s"] for c in steps))) if steps else None
-        s["ttft_mean"] = st.mean(c["ttft_s"] for c in steps) if steps else None
-        comp = [c for r in rows for c in r.get("calls", []) if c.get("kind") == "compact"]
-        s["compact_call_s"] = st.mean(c["wall_s"] for c in comp) if comp else None
-        out[e] = s
-    o, n = out.get("ours"), out.get("nv")
-
-    def row(label, key, nd=1, test=True):
-        vals = []
-        for s in (o, n):
-            vals.append(fmt(*mean_ci(s[key])[:2], nd=nd) if s else "-")
-        p = mwu_p(o[key], n[key]) if (o and n and test) else None
-        lines.append(f"| {label} | {vals[0]} | {vals[1]} | {'' if p is None else f'{p:.3f}'} |")
-
-    def row_s(label, key, f=lambda v: f"{v:.2f}"):
-        vals = [(f(s[key]) if s and s.get(key) is not None else "-") for s in (o, n)]
-        lines.append(f"| {label} | {vals[0]} | {vals[1]} | |")
-
-    row_s("window x lanes", "window", lambda v: str(v))
-    lines[-1] = lines[-1].replace("| |", f"| |") if True else ""
-    row_s("runs (errors)", "runs", lambda v: str(v))
-    row("hidden tests passed /54", "tests")
-    row("conventions kept /12", "conv")
-    row("compactions per run", "compactions")
-    row("stages completed /12", "stages_done")
-    row("wall clock per run (min)", "wall_min")
-    row_s("summary recall, all summaries", "recall_all", lambda v: f"{100 * v:.1f}%")
-    row_s("summary recall, last summary", "recall_last", lambda v: f"{100 * v:.1f}%")
-    row_s("summaries written", "n_summaries", lambda v: str(v))
-    row_s("decode tok/s per agent (step calls)", "decode_tok_s", lambda v: f"{v:.0f}")
-    row_s("mean time to first token (s)", "ttft_mean", lambda v: f"{v:.1f}")
-    row_s("mean compaction call (s)", "compact_call_s", lambda v: f"{v:.1f}")
-    row_s("prompt tokens (all runs)", "prompt_tokens", lambda v: f"{v:,}")
-    row_s("completion tokens (all runs)", "completion_tokens", lambda v: f"{v:,}")
-    lines.append("")
-    lines.append("Convention kept (runs) / recalled in summaries:")
-    lines.append("")
-    lines.append("| convention | ours kept | NInfer kept | ours recall | NInfer recall |")
-    lines.append("|---|---|---|---|---|")
-    for c in CONV:
-        cells = []
-        for s in (o, n):
-            cells.append(f"{s['per_conv'][c]}/{s['runs']}" if s else "-")
-        for s in (o, n):
-            v = s["per_conv_recall"][c] if s else None
-            cells.append("-" if v is None else f"{100 * v:.0f}%")
-        lines.append(f"| {c} | " + " | ".join(cells) + " |")
-    return out, "\n".join(lines)
-
-
-def lh2_table(tag, suite="lh2"):
+def lh_table(tag, suite):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import importlib
-    lh2_spec = importlib.import_module(f"{suite}_spec")
+    spec = importlib.import_module(f"{suite}_spec")
     out = {}
     lines = [f"### {tag}", "", "| | ours | NInfer | p (MWU) |", "|---|---|---|---|"]
     data = {e: load(tag, e) for e in ("ours", "nv")}
@@ -174,14 +90,8 @@ def lh2_table(tag, suite="lh2"):
         by_age = {}
         for x in recs:
             for item, v in x["hit"].items():
-                by_age.setdefault(x["delivered"] - lh2_spec.ITEM_STAGE[item], []).append(v)
+                by_age.setdefault(x["delivered"] - spec.ITEM_STAGE[item], []).append(v)
         s["recall_by_age"] = {k: sum(v) / len(v) for k, v in sorted(by_age.items())}
-        # lh7: recall of decisions whose feature was not built yet when the summary was written (memory only)
-        use = getattr(lh2_spec, "USE_STAGE", None)
-        if use:
-            pend = [v for x in recs for item, v in x["hit"].items() if item in use and x["delivered"] < use[item]]
-            s["recall_pending"] = sum(pend) / len(pend) if pend else None
-            s["recall_pending_n"] = len(pend)
         # recall and stale values by compaction number (1 = first summary of the run)
         by_n = {}
         for r in rows:
@@ -217,12 +127,12 @@ def lh2_table(tag, suite="lh2"):
 
     row_s("window", "window", str)
     row_s("runs (errors)", "runs", str)
-    H = getattr(lh2_spec, "HIDDEN", suite)
+    H = suite
     nrule = len(re.findall(r"^def test_", open(os.path.join(ROOT, "..", "hidden", H, "test_rules.py"),
                                                  encoding="utf-8").read(), re.M))
     row(f"decisions honored /{nrule} (rule tests)", "rules")
-    # lh2 reuses the v1 functional suite, whose 32 test functions expand to 54 parametrized tests
-    nfun = {"lh2": 54}.get(H) or len(re.findall(r"^def test_", open(os.path.join(ROOT, "..", "hidden", H, "test_functional.py"),
+    # the lh1 functional suite has 32 test functions that expand to 54 parametrized tests
+    nfun = {"lh1": 54}.get(H) or len(re.findall(r"^def test_", open(os.path.join(ROOT, "..", "hidden", H, "test_functional.py"),
                                                                     encoding="utf-8").read(), re.M))
     row(f"functional tests /{nfun}", "tests")
     row("conventions /12", "conv")
@@ -260,44 +170,6 @@ def lh2_table(tag, suite="lh2"):
     return out, "\n".join(lines)
 
 
-def poly_table(tag, data=None):
-    out, lines = {}, [f"### {tag}", "", "| | ours | NInfer |", "|---|---|---|"]
-    data = data or {e: load(tag, e) for e in ("ours", "nv")}
-    for e, rows in data.items():
-        if not rows:
-            continue
-        s = {"tasks": len(rows), "pass1": sum(1 for r in rows if r.get("pass1")), "pass2": sum(1 for r in rows if r.get("pass2")),
-             "errors": sum(1 for r in rows if r.get("status") != "ok"),
-             "wall_sum_min": sum(r.get("wall_s", 0) for r in rows) / 60,
-             "compactions": sum(r.get("compactions", 0) for r in rows)}
-        for lang in ("python", "cpp"):
-            lr = [r for r in rows if r.get("lang") == lang]
-            s[f"{lang}_pass2"] = f"{sum(1 for r in lr if r.get('pass2'))}/{len(lr)}"
-        pt, ct = tokens(rows)
-        s["prompt_tokens"], s["completion_tokens"] = pt, ct
-        s["by_task"] = {r["id"].split(".", 2)[2]: bool(r.get("pass2")) for r in rows}
-        s["solved_wall_min"] = s["wall_sum_min"] / max(1, s["pass2"])
-        out[e] = s
-    o, n = out.get("ours"), out.get("nv")
-    for label, key, f in [("tasks", "tasks", str), ("pass@attempt1", "pass1", str), ("pass@attempt2", "pass2", str),
-                          ("python pass@2", "python_pass2", str), ("C++ pass@2", "cpp_pass2", str),
-                          ("errors", "errors", str), ("compactions", "compactions", str),
-                          ("agent-minutes total (4 agents in parallel)", "wall_sum_min", lambda v: f"{v:.1f}"),
-                          ("agent-minutes per solved task", "solved_wall_min", lambda v: f"{v:.2f}"),
-                          ("completion tokens", "completion_tokens", lambda v: f"{v:,}")]:
-        lines.append(f"| {label} | {f(o[key]) if o else '-'} | {f(n[key]) if n else '-'} |")
-    if o and n:
-        common = set(o["by_task"]) & set(n["by_task"])
-        b = sum(1 for t in common if o["by_task"][t] and not n["by_task"][t])
-        c = sum(1 for t in common if n["by_task"][t] and not o["by_task"][t])
-        p = None
-        if b + c:
-            k = min(b, c)
-            p = min(1.0, 2 * sum(math.comb(b + c, i) for i in range(k + 1)) / 2 ** (b + c))
-        lines.append(f"| discordant (ours only / NInfer only), exact McNemar p | {b} | {c} (p={p if p is None else f'{p:.3f}'}) |")
-    return out, "\n".join(lines)
-
-
 if __name__ == "__main__":
     summary, md = {}, []
     for tag in sorted(os.listdir(ROOT)):
@@ -305,24 +177,11 @@ if __name__ == "__main__":
             continue
         if not os.path.isdir(os.path.join(ROOT, tag)):
             continue
-        if tag.startswith(("lh2", "smoke_lh2")):
-            s, t = lh2_table(tag)
-        elif re.match(r"(smoke_)?lh[3-9]", tag):
-            s, t = lh2_table(tag, re.match(r"(?:smoke_)?(lh[3-9])", tag).group(1))
-        elif tag.startswith(("lh", "smoke_lh")):
-            s, t = lh_table(tag)
-        elif tag.startswith(("poly", "smoke_poly")):
-            s, t = poly_table(tag)
-        else:
+        m = re.match(r"(?:smoke_)?(lh[12])_", tag)
+        if not m:
             continue
+        s, t = lh_table(tag, m.group(1))
         summary[tag] = s
-        md.append(t)
-    # final polyglot: Python from poly_c4, C++ from the fixed-harness rerun
-    if os.path.isdir(os.path.join(ROOT, "poly_c4_cpp_v2")):
-        comb = {e: [r for r in load("poly_c4", e) if r.get("lang") == "python"] +
-                   [r for r in load("poly_c4_cpp_v2", e) if r.get("lang") == "cpp"] for e in ("ours", "nv")}
-        s, t = poly_table("poly_c4_final (python from poly_c4, C++ from poly_c4_cpp_v2)", comb)
-        summary["poly_c4_final"] = s
         md.append(t)
     json.dump(summary, open(os.path.join(ROOT, "summary.json"), "w"), indent=1, default=str)
     print("\n\n".join(md))

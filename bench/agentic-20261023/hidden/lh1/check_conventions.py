@@ -242,15 +242,15 @@ def _():
     return not bad, bad[:6]
 
 
-@check("c11_chf")
+@check("c11_default_eur")
 def _():
     money = importlib.import_module(PKG + ".money")
     led = importlib.import_module(PKG + ".ledger").Ledger()
     a = led.open_account("Cur A")
     bad = []
-    if money.format_amount(123456) != "CHF 1,234.56":
+    if money.format_amount(123456) != "EUR 1,234.56":
         bad.append(f"format_amount default {money.format_amount(123456)!r}")
-    if led.account(a)["currency"] != "CHF":
+    if led.account(a)["currency"] != "EUR":
         bad.append(f"open_account default {led.account(a)['currency']!r}")
     return not bad, bad
 

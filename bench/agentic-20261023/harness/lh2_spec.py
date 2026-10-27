@@ -1,234 +1,238 @@
-"""Long-horizon v2: `vxledger` over 12 stages, rules buried mid-session.
+"""Long-horizon lh2: `roomly` (meeting-room booking) over 12 stages, rules buried mid-session.
 
-Unlike v1 there is no tidy convention list. 12 conventions and 20 team decisions arrive inside "team notes"
-blocks of the stage messages (chatter, rejected alternatives, near-miss values), many of them apply only to a
-LATER stage, and 5 are superseded later (the agent must carry the latest value). Stage texts only say "as
-agreed" where a decision applies. With ~100K tokens of reference filler per stage the agent compacts before
-almost every stage, so a rule given in stage k must survive up to 12-k handoff summaries.
-Scoring: hidden/lh2/test_functional.py (stage behaviour), hidden/lh2/test_rules.py (one test per decision),
-hidden/lh2/check_conventions.py (12 conventions, c11 = latest default currency EUR).
+Same protocol as lh1 (lh1_spec.py) with a new project and new decisions, to check that the lh1 result is not an
+artifact of the vxledger task: 12 conventions and 20 team decisions arrive only inside "team chat" blocks of the
+stage messages, 4 are superseded later (D03 grid 15->5, D06 gap 10->15, D08 closing 20:00->22:00, c11 default
+duration 30->50). Stage texts only say "as agreed".
+Scoring: hidden/lh2/test_functional.py (stage behaviour, inputs chosen so that no decision changes the outcome),
+hidden/lh2/test_rules.py (one test per decision, latest values), hidden/lh2/check_conventions.py.
 """
 
-BRIEF = """We are building `vxledger`, a small ledger library with a command-line interface, in Python 3.12, in the current directory. The work comes in 12 stages; I will send each stage after you finish the previous one. When a stage is done (implemented and checked by you), reply with a bash block containing only `echo STAGE_COMPLETE`.
+FILLER_INTRO = ("For context, here is part {k} of the source of the legacy C++ facility service we are replacing. "
+                "It is reference material only; do not port it.")
+
+BRIEF = """We are building `roomly`, a small meeting-room booking library with a command-line interface, in Python 3.12, in the current directory. The work comes in 12 stages; I will send each stage after you finish the previous one. When a stage is done (implemented and checked by you), reply with a bash block containing only `echo STAGE_COMPLETE`.
 
 Each stage message starts with an excerpt of our team chat since the previous stage. Conventions and decisions agreed there are binding for the whole project from then on (a later decision can change an earlier one). I will NOT repeat them later; the stage descriptions just say "as agreed". Keep track of them yourself."""
 
 NOTES = [
-# 1: c01 c02 c05 c08 c11(CHF) c12 D01 D02
-"""[09:02] Priya: morning! kicking off vxledger today
-[09:03] Maria (lead): Convention: all code lives in the package `vxledger/` (import name `vxledger`).
-[09:05] Tom: for display can we just use floats and round at the end?
-[09:06] Maria (lead): No. Convention: money is always integer cents. Never use float anywhere in vxledger (no float literals, no float() calls).
-[09:08] Jonas: can I pull in `attrs` or `pydantic` for the models?
-[09:09] Maria (lead): Convention: standard library only, no third-party packages in vxledger.
-[09:11] Priya: storage - do we just open(path, "w")?
-[09:12] Maria (lead): Convention: all file writes go through `atomic_write(path: str, data: str) -> None` in vxledger/storage.py, which writes a temporary file in the same directory and then calls os.replace.
-[09:15] Tom: default currency EUR? most of our pilot users are in Germany
-[09:16] Maria (lead): Convention: the default currency is CHF wherever a currency is optional. (we can revisit later)
-[09:18] Jonas: account ids - ACC-1, ACC-2?
-[09:19] Maria (lead): Convention: account ids are `ACC-` followed by a 6-digit zero-padded sequence number starting at 1 (ACC-000001, ACC-000002, ...).
-[09:21] Priya: name length limit for accounts? 32 like the old system?
-[09:22] Tom: 64 would be safer
-[09:23] Maria (lead): Decision: account names may have at most 40 characters after stripping; longer names raise ValidationError.
-[09:25] Jonas: and memos? the old engine truncated at 80
-[09:26] Maria (lead): Decision: memos are stored stripped of surrounding whitespace and truncated to their first 60 characters. History, statements and search all show the stored memo.
-[09:27] Priya: 👍""",
-# 2: c03 c06 D03 D04 D05 D06(1,000,000.00 deposits)
-"""[10:40] Jonas: exceptions - one big LedgerError?
-[10:41] Maria (lead): Convention: every exception class derives from `VxError` (in vxledger/errors.py) and has an integer class attribute `code` in the range 4700-4799, unique per class.
-[10:43] Maria (lead): Decision: these codes: AmountError 4701, ValidationError 4702, UnknownAccountError 4703, InsufficientFundsError 4704, CurrencyMismatchError 4705, LoadError 4706, UnknownHoldError 4707.
-[10:44] Tom: type hints everywhere? even private helpers?
-[10:45] Maria (lead): Convention: every public function and method (name not starting with _) has type hints for all parameters and for the return value. Private helpers are up to you.
-[10:48] Priya: the JSON save file - ops wants to diff it in git
-[10:49] Maria (lead): Decision: the saved ledger file is pretty-printed JSON with indent=2 and sort_keys=True, followed by one trailing newline.
-[10:52] Jonas: interest on yen accounts is a mess legally
-[10:53] Maria (lead): Decision: accounts in currency JPY never receive interest.
-[10:55] Tom: should we cap deposits? fraud team asked for 10,000,000.00
-[10:56] Priya: that's a lot, maybe 100,000.00?
-[10:57] Maria (lead): Decision: a single deposit may not exceed 1,000,000.00 (100000000 cents); larger deposits raise ValidationError.""",
-# 3: c04 c10 D07 D08(transfer SRC->DST)
-"""[14:02] Tom: logging - print() is fine for now?
-[14:03] Maria (lead): Convention: logging only through logging.getLogger("vx.ledger"), and every log message starts with "[VX] ".
-[14:06] Jonas: license headers?
-[14:07] Maria (lead): Convention: every .py file in vxledger starts with the line `# SPDX-License-Identifier: MPL-2.0`.
-[14:10] Priya: the bank exports for the CSV import come with Swiss dates like 05.01.2026
-[14:11] Tom: could we also take 01/05/2026?
-[14:12] Maria (lead): Decision: the CSV import accepts dates as YYYY-MM-DD and as DD.MM.YYYY. Nothing else (no slashes).
-[14:15] Jonas: empty memo on transfers looks bad in statements
-[14:16] Maria (lead): Decision: a transfer without memo (empty or whitespace) gets the memo "transfer SRC->DST" with the two account ids, e.g. "transfer ACC-000001->ACC-000002".""",
-# 4: c07 D09 D10
-"""[11:20] Priya: timestamps - local time ok?
-[11:21] Maria (lead): Convention: timestamps are ISO-8601 UTC strings with seconds precision and a trailing "Z", e.g. 2026-03-01T12:00:00Z. Never use naive datetimes.
-[11:24] Tom: statements look odd with lowercase names
-[11:25] Maria (lead): Decision: in the statement header the account name is printed in upper case.
-[11:30] Jonas: thinking ahead about holds - unlimited per account?
-[11:31] Priya: card schemes allow 5
-[11:32] Maria (lead): Decision: at most 3 active holds per account; placing a 4th raises ValidationError.""",
-# 5: c09 D11 D12
-"""[16:01] Jonas: CLI exit codes - 1 for errors like everyone else?
-[16:02] Maria (lead): Convention: the command-line interface exits with status 3 on any user or validation error (including bad arguments), and 0 on success.
-[16:04] Tom: except when the DB file itself is broken, ops wants to alert on that separately
-[16:05] Maria (lead): Decision: when the CLI cannot load the DB file (corrupt JSON, wrong version, unreadable) it prints the error line and exits with status 4 instead of 3.
-[16:09] Priya: warnings in the logs don't say which call failed
-[16:10] Maria (lead): Decision: every WARNING log record's message contains "op=<name of the public method that failed>", e.g. "op=withdraw".""",
-# 6: D13 D14
-"""[09:45] Priya: support saw holds with an empty reason
-[09:46] Maria (lead): Decision: a hold reason must be non-empty after stripping, otherwise ValidationError.
-[09:50] Jonas: CLI: can `open` set an overdraft directly?
-[09:51] Maria (lead): Decision: the CLI `open` command accepts `--overdraft AMOUNT` (parse_amount format) and sets the overdraft of the new account.
-[09:53] Tom: and a --limit flag for holds?
-[09:54] Maria (lead): No, not now.""",
-# 7: D03 superseded (4740/4770) D15 D16
-"""[13:30] Tom: monitoring maps 4704 to something else already, clash!
-[13:31] Maria (lead): Decision (changes the earlier code table): InsufficientFundsError is now 4740 and UnknownHoldError is now 4770. All other codes stay as they are.
-[13:35] Priya: search with one letter returns half the ledger
-[13:36] Maria (lead): Decision: search strips the query; a query shorter than 2 characters after stripping raises ValidationError.
-[13:40] Jonas: CLI needs a way to see transactions
-[13:41] Maria (lead): Decision: the CLI gets a command `history ACC` that prints one line per history entry: `<tx> <kind> <amount> <balance_after>`, amounts as plain integer cents (e.g. `TX00000001 deposit 500 500`).""",
-# 8: D06 superseded (5,000,000.00, all movements) c11 superseded (EUR) D17
-"""[10:10] Tom: the deposit cap is too low for corporate clients
-[10:11] Priya: 2,500,000.00?
-[10:12] Maria (lead): Decision (changes the earlier cap): the limit is now 5,000,000.00 (500000000 cents) and it applies to every single deposit, withdrawal and transfer, including imported CSV rows (an over-limit row is skipped with ValidationError).
-[10:15] Jonas: pilot moved from Zurich to Frankfurt
-[10:16] Maria (lead): Convention change: the default currency is now EUR wherever a currency is optional (no longer CHF).
-[10:20] Priya: audit wants amounts in the info logs
-[10:21] Maria (lead): Decision: the INFO log record of every deposit, withdrawal and transfer contains the moved amount formatted with format_amount(cents, account currency), e.g. "EUR 12.34".""",
-# 9: D18 D19
-"""[15:00] Jonas: search results only have the account id, UI wants the name
-[15:01] Maria (lead): Decision: every search result also has the key "account_name" with the account's name.
-[15:05] Tom: hold ids should sort nicely
-[15:06] Priya: HOLD-00001?
-[15:07] Maria (lead): Decision: hold ids are "HOLD-" followed by a 4-digit zero-padded number: HOLD-0001, HOLD-0002, ...""",
-# 10: D08 superseded (xfer SRC>DST) D20
-"""[11:11] Tom: "transfer ACC-...->ACC-..." memos are too long for the bank's 35-char field
-[11:12] Maria (lead): Decision (changes the earlier default): a transfer without memo now gets "xfer SRC>DST", e.g. "xfer ACC-000001>ACC-000002".
-[11:15] Priya: search on big ledgers returns thousands of rows
-[11:16] Maria (lead): Decision: search returns at most 25 results (the first 25 in the sorted order).""",
+# 1: c01 c02 c03 c05 c08 c11(30) c12 D01 D02
+"""[08:55] Lena: good morning, roomly kickoff 🎉
+[08:57] Sam (lead): Convention: all code lives in the package `roomly/` (import name `roomly`).
+[09:00] Omar: debugging is easier with print statements everywhere
+[09:01] Sam (lead): Convention: no print() calls anywhere in roomly except in roomly/__main__.py (the CLI). Libraries don't print.
+[09:04] Lena: error codes like the old service, 9001, 9002...?
+[09:05] Sam (lead): Convention: no numeric codes. Every exception class derives from `RoomlyError` (in roomly/errors.py) and has a class attribute `slug`: a unique string of lowercase words joined by hyphens, e.g. "unknown-room".
+[09:08] Omar: can we use dateutil? parsing is painful
+[09:09] Sam (lead): Convention: standard library only, no third-party packages in roomly.
+[09:12] Lena: saving files - plain open(path, "w")?
+[09:13] Sam (lead): Convention: every file write goes through `safe_write(path: str, text: str) -> None` in roomly/fileio.py, which writes a temporary file in the same directory and then calls os.replace.
+[09:16] Omar: default meeting length when nobody says? 60 like Outlook?
+[09:17] Lena: most of ours are short, 30 maybe
+[09:18] Sam (lead): Convention: wherever a duration is optional, the default is 30 minutes. (we'll see how it goes)
+[09:20] Omar: ids - uuids?
+[09:21] Sam (lead): Convention: room ids are "R" + a 3-digit zero-padded sequence number starting at 1 (R001, R002, ...); booking ids are "BK-" + a 5-digit zero-padded sequence number starting at 1 (BK-00001, BK-00002, ...).
+[09:24] Lena: room names on the door signs are tiny, how long may they be?
+[09:25] Omar: 64?
+[09:26] Sam (lead): Decision: room names may have at most 30 characters after stripping; longer raises ValidationError.
+[09:28] Lena: and capacity - the atrium holds 500 for town halls
+[09:29] Sam (lead): Decision: capacity is an integer from 1 to 200. The atrium is not a meeting room.""",
+# 2: c06 c07 D03(15) D04 D05
+"""[10:31] Omar: type hints or docstrings? not both please
+[10:32] Sam (lead): Convention: every public function and method (name not starting with _) has a docstring. Type hints are optional.
+[10:35] Lena: time format for what we return - with seconds? with +00:00?
+[10:36] Sam (lead): Convention: every date-time that roomly returns or stores is a string "YYYY-MM-DDTHH:MM" (minute precision, no seconds, no offset), always UTC. Never use naive datetimes internally.
+[10:40] Omar: should starts be free-form? someone will book 09:07
+[10:41] Sam (lead): Decision: a booking must start on a 15-minute grid (minute 00, 15, 30 or 45), otherwise ValidationError.
+[10:43] Lena: max length? people block rooms for whole days
+[10:44] Omar: 8 hours?
+[10:45] Sam (lead): Decision: a single booking may last at most 240 minutes (4h); longer raises ValidationError.
+[10:48] Lena: titles get pasted from emails with whitespace and novels
+[10:49] Sam (lead): Decision: titles are stored stripped and truncated to their first 50 characters; an empty title is stored as "(no title)".""",
+# 3: c04 c10 D06(10) D07 D08(20:00)
+"""[13:05] Omar: logging: just logging.info at module level?
+[13:06] Sam (lead): Convention: log only through logging.getLogger("roomly") (exactly that name, no child loggers) and every log message starts with "roomly: ".
+[13:09] Lena: license header?
+[13:10] Sam (lead): Convention: every .py file in roomly starts with the line `# roomly - internal use only`.
+[13:14] Omar: facilities wants time to clean between meetings
+[13:15] Lena: 5 minutes is enough
+[13:16] Sam (lead): Decision: two bookings of the same room need a gap of at least 10 minutes between the end of one and the start of the next; a smaller gap is a ConflictError.
+[13:20] Lena: people cancel meetings that are already running to hide no-shows
+[13:21] Sam (lead): Decision: a booking whose start is at or before the current time (clock) cannot be cancelled; that raises ValidationError.
+[13:24] Omar: building hours?
+[13:25] Sam (lead): Decision: a booking must lie completely within 07:00-20:00 (UTC) of its day: start at or after 07:00, end at or before 20:00. Otherwise ValidationError.""",
+# 4: D09
+"""[11:40] Lena: the save file - pretty print?
+[11:41] Omar: it's synced to the kiosks over a slow line, smaller is better
+[11:42] Sam (lead): Decision: the saved file is compact JSON: json.dumps(data, sort_keys=True, separators=(",", ":")) followed by one trailing newline.
+[11:45] Omar: should we also gzip it?
+[11:46] Sam (lead): No.""",
+# 5: c09 D10 D17
+"""[15:30] Omar: CLI exit codes - 1 for errors?
+[15:31] Sam (lead): Convention: the command-line interface exits with status 5 on any user or validation error (including bad arguments and unknown commands) and 0 on success.
+[15:34] Lena: first start on a kiosk has no file yet
+[15:35] Sam (lead): Decision: Scheduler.load of a path that does not exist returns an empty scheduler (no error). Corrupt files still raise LoadError.
+[15:38] Omar: and ops wants to page on a corrupt file
+[15:39] Sam (lead): Decision: when the CLI cannot load the DB file it prints the error line and exits with status 6 instead of 5.""",
+# 6: D11 D12 D13
+"""[09:12] Lena: CSV import from the old system - if row 40 fails, rows 1-39 are booked and people get confused
+[09:13] Sam (lead): Decision: the CSV import is all-or-nothing: if any row fails, nothing at all is booked; the result then has "imported": 0 and still lists the errors of all failing rows.
+[09:16] Omar: the old export writes dates like 02.03.2026 09:00
+[09:17] Sam (lead): Decision: the CSV import also accepts the start as "DD.MM.YYYY HH:MM" besides the normal format.
+[09:20] Lena: recurring meetings next stage - limit?
+[09:21] Omar: 52, a year of weeklies
+[09:22] Sam (lead): Decision: a series has at most 12 occurrences (count 1-12), otherwise ValidationError.""",
+# 7: D14 D15 D16
+"""[14:00] Omar: daily series hit Saturdays and the building is closed
+[14:01] Sam (lead): Decision: series occurrences that fall on a Saturday or Sunday are skipped (not booked, no error); they still count towards `count`.
+[14:05] Lena: the day report - rooms by id is useless for reception
+[14:06] Sam (lead): Decision: the day report lists rooms sorted by room name, case-insensitively.
+[14:08] Omar: and empty rooms make it two pages long
+[14:09] Sam (lead): Decision: rooms without bookings that day are left out of the day report.""",
+# 8: D03 superseded (5) c11 superseded (50) D18
+"""[10:20] Lena: the 15-minute grid annoys everyone, lots of 09:05 standups
+[10:21] Sam (lead): Decision (changes the earlier grid): a booking must now start on a 5-minute grid (minute divisible by 5). The 15-minute rule is gone.
+[10:24] Omar: and the 30 minute default is always too short
+[10:25] Sam (lead): Convention change: wherever a duration is optional, the default is now 50 minutes (no longer 30).
+[10:29] Lena: CLI needs to show the rooms
+[10:30] Sam (lead): Decision: the CLI gets a command `rooms` that prints one line per room in id order: `<id> <name> <capacity>`.""",
+# 9: D06 superseded (15) D19
+"""[16:10] Omar: facilities says 10 minutes isn't enough for cleaning
+[16:11] Sam (lead): Decision (changes the earlier gap): the gap between two bookings of the same room is now at least 15 minutes. It applies everywhere a booking is created or changed.
+[16:15] Lena: kiosks cache bookings, they need to know when one changed
+[16:16] Sam (lead): Decision: every booking dict has a key "rev": 1 when created, +1 every time the booking is moved. It survives save/load.""",
+# 10: D08 superseded (22:00) D20
+"""[12:00] Lena: evening classes moved in, the building is open later now
+[12:01] Sam (lead): Decision (changes the earlier opening hours): bookings must lie within 07:00-22:00 now (end at or before 22:00).
+[12:05] Omar: audit logs only have room ids, nobody knows R007
+[12:06] Sam (lead): Decision: the INFO log record of every book, move and cancel also contains the room's name.""",
 # 11: chatter only
-"""[14:40] Jonas: should we add a `close_account`?
-[14:41] Maria (lead): Not in this project.
-[14:44] Tom: maybe raise the hold limit to 5?
-[14:45] Maria (lead): No, keep what we decided.""",
+"""[14:30] Omar: should we add room features (projector, whiteboard)?
+[14:31] Sam (lead): Not in this project.
+[14:33] Lena: maybe allow 30-minute gaps for the boardroom?
+[14:34] Sam (lead): No, keep what we decided.""",
 # 12: chatter only
-"""[17:00] Priya: last stage! release on Monday
-[17:01] Maria (lead): Please make sure everything we agreed on in this chat is implemented before you hand it in.""",
+"""[17:00] Lena: last stage, demo on Thursday!
+[17:01] Sam (lead): Please make sure everything we agreed on in this chat is implemented before you hand it in.""",
 ]
 
 STAGES = [
 # 1
-"""Stage 1 - money helpers and storage.
-Create vxledger/__init__.py, vxledger/errors.py, vxledger/money.py and vxledger/storage.py.
-- `money.parse_amount(text: str) -> int` parses a decimal amount into cents. It accepts an optional leading '-', optional thousands separators ',' (only in correct groups of three digits) and 0 to 2 decimal digits. Surrounding whitespace is ignored. Examples: '12' -> 1200, '12.5' -> 1250, '-0.05' -> -5, '1,234.56' -> 123456, ' 7.00 ' -> 700. Anything else ('', '1.234', '12,34', 'abc', '1e3', '--1', '1,2345') raises `AmountError` (defined in errors.py).
-- `money.format_amount(cents: int, currency: str | None = None) -> str` returns '<currency> <amount>' with thousands separators and exactly two decimals; negative amounts put the minus sign after the currency: format_amount(123456, 'EUR') -> 'EUR 1,234.56', format_amount(-1200, 'USD') -> 'USD -12.00', format_amount(5, 'EUR') -> 'EUR 0.05'. Without a currency it uses the project default currency.
-- `storage.atomic_write` as agreed.""",
+"""Stage 1 - errors, time helpers and file helper.
+Create roomly/__init__.py, roomly/errors.py, roomly/timeutil.py and roomly/fileio.py.
+- errors.py defines ValidationError, UnknownRoomError, UnknownBookingError, ConflictError, CapacityError and LoadError (structure as agreed).
+- `timeutil.parse_duration(text: str) -> int` returns minutes. Accepted forms (surrounding whitespace ignored): '45' (plain minutes), '45m', '2h', '1h30m', '1h5m', '1h05m'. In 'XhYm' Y has 1 or 2 digits and must be 0-59. The result must be > 0. Anything else ('', '0', '0m', '1h60m', '1.5h', 'abc', '-5', '1h 30m', 'h', '30mm', '2H') raises ValidationError.
+- `timeutil.format_duration(minutes: int) -> str`: 0 -> '0m', 45 -> '45m', 60 -> '1h', 90 -> '1h30m', 125 -> '2h05m'. A negative value raises ValidationError.
+- `timeutil.parse_start(text: str) -> datetime` parses exactly 'YYYY-MM-DDTHH:MM' (surrounding whitespace ignored; it must be a real date and time) into a timezone-aware UTC datetime; anything else ('2026-03-02 09:00', '2026-03-02T9:00', '2026-02-30T09:00', '2026-03-02T09:00:00') raises ValidationError.
+- `timeutil.format_start(dt: datetime) -> str` returns 'YYYY-MM-DDTHH:MM' (the inverse of parse_start).
+- the file helper as agreed.""",
 # 2
-"""Stage 2 - accounts.
-Create vxledger/ledger.py with a class `Ledger` (also importable as `from vxledger import Ledger`).
-- `Ledger()` creates an empty ledger.
-- `open_account(self, name: str, currency: str | None = None) -> str` creates an account and returns its id (format as agreed). The name must be non-empty after stripping, within the agreed length and unique case-insensitively among accounts, otherwise raise `ValidationError`. A given currency must be exactly 3 uppercase ASCII letters, otherwise `ValidationError`.
-- `account(self, account_id: str) -> dict` returns {"id", "name", "currency", "balance"}; an unknown id raises `UnknownAccountError` (this applies to every method that takes an account id).
-- `deposit(self, account_id: str, cents: int, memo: str = "") -> str` adds money and returns a transaction id: 'TX' followed by an 8-digit zero-padded sequence number that starts at 1 and is shared by all transactions of the ledger (TX00000001, TX00000002, ...). cents must be > 0 and within the agreed limit, otherwise `ValidationError`.
-- `withdraw(self, account_id: str, cents: int, memo: str = "") -> str` removes money, same id scheme; cents must be > 0 (`ValidationError`); the balance must not go below zero, otherwise `InsufficientFundsError` and nothing changes.
-- `balance(self, account_id: str) -> int` returns the balance in cents.
-- Error classes and codes as agreed.""",
+"""Stage 2 - rooms.
+Create roomly/scheduler.py with a class `Scheduler` (also importable as `from roomly import Scheduler`).
+- `Scheduler()` creates an empty scheduler.
+- `add_room(self, name: str, capacity: int) -> str` adds a room and returns its id (format as agreed). The name is stored stripped; it must be non-empty, within the agreed length and unique case-insensitively among rooms, otherwise ValidationError. capacity must be an int (not a bool) within the agreed range, otherwise ValidationError.
+- `room(self, room_id: str) -> dict` returns {"id", "name", "capacity"}; an unknown id raises UnknownRoomError (this applies to every method that takes a room id).
+- `rooms(self) -> list[dict]` returns all rooms (same dicts) in id order.""",
 # 3
-"""Stage 3 - transfers and overdrafts.
-- `transfer(self, src: str, dst: str, cents: int, memo: str = "") -> str` moves money and returns ONE transaction id for the whole transfer. src == dst raises `ValidationError`; cents must be > 0; both accounts must have the same currency, otherwise `CurrencyMismatchError`; if src would go below its allowed minimum, raise `InsufficientFundsError`. On any error nothing changes. Memo handling as agreed.
-- `set_overdraft(self, account_id: str, limit_cents: int) -> None` sets how far below zero the account may go (default 0). limit_cents < 0 raises `ValidationError`. withdraw and transfer both respect the overdraft: the balance may go down to -limit_cents but not lower.""",
+"""Stage 3 - bookings.
+- `book(self, room_id: str, start: str, duration: int | None = None, title: str = "", attendees: int = 1) -> str` books a room and returns a booking id (format as agreed; one sequence for the whole scheduler). start uses the parse_start format. duration is in minutes (default as agreed) and must be > 0 and within the agreed maximum. The start must be on the agreed minute grid and the booking within the agreed hours. These violations raise ValidationError. attendees must be an int >= 1 (ValidationError) and at most the room's capacity (CapacityError). A booking that overlaps another booking of the same room raises ConflictError: two bookings overlap if each starts before the other ends (one ending at 10:00 and another starting at 10:00 do not overlap); spacing rules as agreed. On any error nothing changes. Title handling as agreed.
+- `booking(self, booking_id: str) -> dict` returns {"id", "room", "start", "end", "title", "attendees"} with start and end as agreed; an unknown id raises UnknownBookingError.""",
 # 4
-"""Stage 4 - history and a clock.
-- The constructor becomes `Ledger(clock: Callable[[], datetime] | None = None)`. The clock returns a timezone-aware datetime and is used to timestamp every transaction; without it use the current UTC time.
-- `history(self, account_id: str) -> list[dict]` returns the account's entries in chronological order. Each entry is a dict with exactly these keys: "tx" (transaction id), "kind" (one of 'deposit', 'withdrawal', 'transfer_in', 'transfer_out'), "amount" (signed cents: positive for deposit and transfer_in, negative for withdrawal and transfer_out), "balance_after" (the account balance right after the entry), "memo" (as agreed) and "timestamp" (as agreed). A transfer creates one entry in each of the two accounts with the same "tx".""",
+"""Stage 4 - clock, cancellations and day lists.
+- The constructor becomes `Scheduler(clock: Callable[[], datetime] | None = None)`. The clock returns the current time as a timezone-aware UTC datetime; without it use the real current UTC time.
+- `cancel(self, booking_id: str) -> None` cancels a booking (other rules as agreed). A cancelled booking frees its slot and no longer exists for booking(), day lists or anything else: booking() and cancel() of a cancelled or unknown id raise UnknownBookingError.
+- `day_bookings(self, room_id: str, day: str) -> list[dict]` returns the room's bookings that start on day ('YYYY-MM-DD'; anything else raises ValidationError) as booking() dicts sorted by start.""",
 # 5
 """Stage 5 - persistence.
-- `save(self, path: str) -> None` writes the whole ledger as one JSON document (file format as agreed) whose top-level object has "version": 2. The rest of the structure is up to you, but loading must restore everything: accounts, balances, overdrafts, history and the id sequences (a new account or transaction after loading continues the numbering).
-- `Ledger.load(path: str) -> "Ledger"` (a classmethod; it takes an optional `clock` keyword argument like the constructor) reads such a file. A missing file, invalid JSON or a version other than 2 raises `LoadError`.""",
+- `save(self, path: str) -> None` writes the whole schedule as one JSON document (file format as agreed) whose top-level object has "version": 3. The rest of the structure is up to you, but loading must restore everything: rooms, bookings and both id sequences (a new room or booking after loading continues the numbering, also when the highest booking was cancelled before saving).
+- `Scheduler.load(path: str, clock=None) -> "Scheduler"` (a classmethod; clock as in the constructor) reads such a file. Invalid JSON, a missing or wrong "version" or an unreadable structure raises LoadError. A path that does not exist: as agreed.""",
 # 6
 """Stage 6 - CSV import.
-- `import_csv(self, path: str) -> dict` imports transactions from a CSV file with the header `date,account,amount,memo`. A positive amount is a deposit, a negative amount a withdrawal; amounts use the parse_amount format (quote amounts that contain commas). Rows are applied in file order. A row with a bad date (date formats as agreed), a bad amount, a zero amount, an unknown account or insufficient funds is skipped. The history timestamp of an imported row is its date at 00:00:00 UTC, in the project timestamp format.
-- It returns {"imported": <rows applied>, "skipped": <rows skipped>, "errors": [[line_number, code], ...]} where line_number counts the header as line 1 and code is the integer code of the error that caused the skip (a bad date counts as a ValidationError).""",
+- `import_csv(self, path: str) -> dict` books the rows of a CSV file with the header `room,start,duration,title,attendees`. start uses the parse_start format (other formats as agreed). duration uses the parse_duration format and may be empty (= default duration). attendees may be empty (= 1). Each row is checked exactly like book(); rows are processed in file order and a row sees the bookings of the earlier valid rows.
+- It returns {"imported": <number of bookings created>, "errors": [[line_number, slug], ...]}: line_number counts the header as line 1, slug is the slug of the error class the row caused (a malformed field counts as ValidationError). What happens to the valid rows when other rows fail is as agreed.""",
 # 7
-"""Stage 7 - interest.
-- `apply_interest(self, rate_bp: int, memo: str = "interest") -> list[str]` credits interest to every account with a positive balance, except as agreed: rate_bp is in basis points (1/100 of a percent); the credited amount is balance * rate_bp / 10000 rounded to whole cents with round-half-to-even, computed exactly. Accounts whose interest rounds to 0 get nothing. It returns the new transaction ids in account-id order. The history kind of these entries is 'interest' (amount positive). rate_bp < 0 raises ValidationError. Interest credits are not subject to the deposit limit.""",
+"""Stage 7 - recurring series.
+- `book_series(self, room_id: str, start: str, count: int, every_days: int = 7, duration: int | None = None, title: str = "", attendees: int = 1) -> list[str]` books a series: occurrence k (k = 0 .. count-1) starts at start + k * every_days days, same time of day, duration, title and attendees, subject to the agreed limits and rules for series. every_days must be >= 1 (ValidationError). Each booked occurrence is checked like book(); if any of them fails, nothing is booked and that error is raised. It returns the booking ids in date order.""",
 # 8
-"""Stage 8 - monthly statements.
-- `monthly_statement(self, account_id: str, year: int, month: int) -> str` returns this exact text (lines joined with "\\n", no trailing newline):
-    Statement <id> (<name, as agreed>) <YYYY-MM>
-    Opening balance: <format_amount(opening, currency)>
-    <one line per history entry whose timestamp falls in that month>
-    Closing balance: <format_amount(closing, currency)>
-  Each entry line is: `<YYYY-MM-DD> <tx> <kind> <sign><format_amount(abs(amount), currency)> -> <format_amount(balance_after, currency)>` followed by ` <memo>` only if the memo is non-empty. sign is '+' or '-'. Example: `2026-03-02 TX00000002 deposit +EUR 5.00 -> EUR 15.00 refund`.
-  Opening is the balance_after of the last entry before the month (0 if none); closing is the balance_after of the last entry in the month, or the opening if there is none. month outside 1..12 raises ValidationError.""",
+"""Stage 8 - day report.
+- `day_report(self, day: str) -> str` returns this text (lines joined with "\\n", no trailing newline; a bad day raises ValidationError):
+    Rooms on <YYYY-MM-DD>
+    then for each room (selection and order as agreed) a line
+    <room id> <room name>: <n> bookings, <format_duration(total booked minutes of the room that day)>
+    followed by one line per booking of that room starting that day, sorted by start:
+      <HH:MM>-<HH:MM> <title> (<attendees>)        (indented by two spaces)
+    and finally
+    Total: <format_duration(total booked minutes of all rooms that day)>
+  Example booking line: `  09:00-10:30 Sprint review (6)`.""",
 # 9
 """Stage 9 - command-line interface.
-Create vxledger/__main__.py so that `python -m vxledger DB COMMAND ...` works. DB is the path of a ledger JSON file (stage 5 format); if it does not exist the CLI starts from an empty ledger. Every command that changes the ledger saves it back to DB.
+Create roomly/__main__.py so that `python -m roomly DB COMMAND ...` works. DB is the path of a schedule JSON file (stage 5 format; a path that does not exist behaves as agreed). Every command that changes the schedule saves it back to DB.
 Commands:
-  open NAME [--currency CUR]        prints the new account id
-  deposit ACC AMOUNT [--memo M]     prints the transaction id
-  withdraw ACC AMOUNT [--memo M]    prints the transaction id
-  transfer SRC DST AMOUNT [--memo M]  prints the transaction id
-  balance ACC                       prints format_amount(balance, account currency)
-  statement ACC YYYY-MM             prints the monthly statement
-plus any commands and options we agreed on in the team chat. AMOUNT uses the parse_amount format. On an error print `error <code>: <message>` to stderr and exit with the agreed status.""",
+  add-room NAME CAPACITY                                     prints the new room id
+  book ROOM START [--duration D] [--title T] [--attendees N] prints the booking id (D in parse_duration format)
+  cancel BOOKING                                             prints nothing
+  list ROOM DAY                                              one line per booking: `<id> <HH:MM>-<HH:MM> <title>`
+  report DAY                                                 prints the day report
+plus any commands and options we agreed on in the team chat. On an error print `error <slug>: <message>` to stderr and exit with the agreed status.""",
 # 10
-"""Stage 10 - holds.
-- `place_hold(self, account_id: str, cents: int, reason: str) -> str` reserves money and returns a hold id (format as agreed; the number starts at 1, ledger-wide). cents must be > 0 and may not exceed the available amount (InsufficientFundsError). Other limits on holds as agreed.
-- `release_hold(self, hold_id: str) -> None` removes a hold; an unknown or already released hold id raises `UnknownHoldError`.
-- `available(self, account_id: str) -> int` is balance + overdraft limit - sum of the account's active holds.
-- From now on withdraw and transfer check the amount against available() instead of balance + overdraft. Holds are not transactions (no history entries, no TX ids) and must survive save/load.""",
+"""Stage 10 - moving bookings.
+- `move(self, booking_id: str, new_start: str) -> None` moves an existing booking to a new start in the same room, keeping its duration, title and attendees. The new slot is checked like book() (a booking never conflicts with itself); on any error nothing changes. Unknown or cancelled ids raise UnknownBookingError. Booking fields as agreed. A moved booking keeps its id and moves must survive save/load.""",
 # 11
 """Stage 11 - audit logging.
-- Every successful mutating operation (open_account, deposit, withdraw, transfer, set_overdraft, place_hold, release_hold, each interest credit, each imported CSV row) emits exactly one INFO log record that contains the id it created or touched (account id, transaction id or hold id), following the logging conventions and the agreed message contents.
-- Every operation that fails with one of our errors emits one WARNING record that contains the error's integer code (and the agreed content), then raises as before.""",
+- Every successful mutating operation (add_room, every created booking including series occurrences and imported rows, cancel, move) emits exactly one INFO log record that contains the id it created or touched (room id or booking id), following the logging conventions and the agreed message contents.
+- Every public method call that fails with one of our errors emits exactly one WARNING record that contains the error's slug, then raises as before.""",
 # 12
 """Stage 12 - search and final check.
-- `search(self, text: str) -> list[dict]` returns all history entries of all accounts whose memo contains the query (case-insensitive). Each result is the history entry dict plus an "account" key (and the other agreed fields); results are sorted by transaction id and then account id. Query rules and result limit as agreed.
+- `find(self, text: str) -> list[dict]` returns the bookings whose title contains text (case-insensitive; text is stripped and an empty text raises ValidationError) as booking() dicts sorted by start, then id.
 - Finally, review the whole package once more: make sure every stage still works and that the code follows every convention and decision we agreed on, then finish with STAGE_COMPLETE.""",
 ]
 
-# Recall of the LATEST value of each item in a handoff summary (case-insensitive). Items are only scored in
-# summaries written after the stage that introduced them (ITEM_STAGE, 1-based).
+# Recall of the LATEST value of each item in a handoff summary (case-insensitive), scored only in summaries
+# written after the stage that introduced the item (ITEM_STAGE, 1-based).
 RECALL = {
-    "c01_package": r"vxledger/|package\W+.?vxledger",
-    "c02_no_float": r"float",
-    "c03_vxerror_codes": r"VxError",
-    "c04_logging": r"\[VX\]",
+    "c01_package": r"roomly/|package\W+.?roomly",
+    "c02_no_print": r"print",
+    "c03_roomlyerror_slug": r"RoomlyError(?=[\s\S]*slug)|slug[\s\S]*RoomlyError",
+    "c04_logging": r"roomly: ",
     "c05_stdlib": r"standard[ -]library|stdlib|third[- ]party|no (external|extra) (packages|dependencies)",
-    "c06_type_hints": r"type[- ]hint|annotat",
-    "c07_utc_z": r"trailing\W+z|ending in\W+z|with\W+z\b|\dZ\b|'Z'|\"Z\"",
-    "c08_atomic": r"atomic_write|os\.replace",
-    "c09_exit3": r"(status|code|exit)\D{0,12}3\b",
-    "c10_spdx": r"SPDX|MPL-2\.0",
-    "c11_default_eur": r"default\W+(currency\W+)?(is\W+)?(now\W+)?EUR|EUR\W+(is\W+)?(now\W+)?(the\W+)?default",
-    "c12_acc_ids": r"ACC-0|ACC-\\d|ACC-\{|ACC-<|6-digit|six-digit",
-    "d01_name40": r"\b40\b",
-    "d02_memo60": r"\b60\b",
-    "d03_codes": r"4740(?=[\s\S]*4770)|4770(?=[\s\S]*4740)",
-    "d04_json_format": r"sort_keys|sorted keys",
-    "d05_jpy": r"JPY|yen",
-    "d06_limit": r"5,000,000|500000000|500,000,000|5 000 000|5M\b",
-    "d07_csv_dates": r"DD\.MM\.YYYY|%d\.%m\.%Y",
-    "d08_xfer": r"xfer",
-    "d09_upper": r"upper",
-    "d10_max3holds": r"(\b3\b|three)[^\n]{0,40}hold|hold[^\n]{0,40}(\b3\b|three)",
-    "d11_exit4": r"(status|exit|code)[^\n]{0,20}\b4\b",
-    "d12_op": r"op=",
-    "d13_reason": r"reason[^\n]{0,60}(empty|strip)|(empty|strip)[^\n]{0,60}reason",
-    "d14_overdraft_flag": r"--overdraft",
-    "d15_min2": r"\b2 char|at least 2|two char|shorter than 2|< ?2\b|less than 2",
-    "d16_history_cmd": r"history ACC|`history`|history command|command `?history",
-    "d17_info_amount": r"format_amount[^\n]{0,80}(info|log)|(info|log)[^\n]{0,80}(format_amount|amount)",
-    "d18_account_name": r"account_name",
-    "d19_hold_ids": r"HOLD-0001|HOLD-\{?:?04d|4-digit|four-digit",
-    "d20_max25": r"\b25\b",
+    "c06_docstrings": r"docstring",
+    "c07_minute_times": r"YYYY-MM-DDTHH:MM(?!:)|minute precision|no seconds",
+    "c08_safe_write": r"safe_write|os\.replace",
+    "c09_exit5": r"(status|code|exit)\D{0,12}5\b",
+    "c10_header": r"internal use only",
+    "c11_default_50": r"default[^\n]{0,40}\b50\b|\b50\b[^\n]{0,30}default",
+    "c12_ids": r"R001|BK-0|BK-\\d|BK-\{|BK-<|5-digit|five-digit",
+    "d01_name30": r"\b30\b[^\n]{0,30}char|char[^\n]{0,30}\b30\b",
+    "d02_cap200": r"\b200\b",
+    "d03_grid5": r"5-minute|5 minute|multiple of 5\b|divisible by 5\b|% ?5\b",
+    "d04_max240": r"\b240\b|4 ?h(our)?s?\b",
+    "d05_no_title": r"\(no title\)",
+    "d06_gap15": r"15[- ]?min[^\n]{0,40}(gap|buffer|between|clean)|(gap|buffer)[^\n]{0,40}\b15\b",
+    "d07_no_cancel_started": r"cancel[^\n]{0,80}(start|past|already|clock|now)|(start|past|already)[^\n]{0,80}cancel",
+    "d08_close22": r"22:00",
+    "d09_compact_json": r"separators|compact",
+    "d10_load_missing": r"(missing|non-?existent|not exist|doesn't exist)[^\n]{0,80}empty|empty[^\n]{0,80}(missing|non-?existent|not exist)",
+    "d11_csv_atomic": r"all-or-nothing|all or nothing|nothing (at all )?is (booked|imported)|roll ?back",
+    "d12_csv_dates": r"DD\.MM\.YYYY",
+    "d13_series12": r"\b12\b[^\n]{0,40}occurr|occurr[^\n]{0,40}\b12\b|count[^\n]{0,20}1\s*(-|to|\.\.)\s*12",
+    "d14_weekend": r"weekend|saturday",
+    "d15_report_by_name": r"(sort|order)[^\n]{0,40}name|name[^\n]{0,40}(sort|order)",
+    "d16_report_omit_empty": r"omit|left out|without bookings|no bookings|skip[^\n]{0,20}(empty|rooms)",
+    "d17_exit6": r"(status|exit|code)[^\n]{0,20}\b6\b",
+    "d18_rooms_cmd": r"`rooms`|rooms command|command `?rooms",
+    "d19_rev": r"\brev\b",
+    "d20_info_room_name": r"room'?s? name[^\n]{0,80}(info|log)|(info|log)[^\n]{0,80}room'?s? name",
 }
-ITEM_STAGE = {"c01_package": 1, "c02_no_float": 1, "c05_stdlib": 1, "c08_atomic": 1, "c11_default_eur": 8,
-              "c12_acc_ids": 1, "d01_name40": 1, "d02_memo60": 1, "c03_vxerror_codes": 2, "c06_type_hints": 2,
-              "d03_codes": 7, "d04_json_format": 2, "d05_jpy": 2, "d06_limit": 8, "c04_logging": 3, "c10_spdx": 3,
-              "d07_csv_dates": 3, "d08_xfer": 10, "c07_utc_z": 4, "d09_upper": 4, "d10_max3holds": 4,
-              "c09_exit3": 5, "d11_exit4": 5, "d12_op": 5, "d13_reason": 6, "d14_overdraft_flag": 6,
-              "d15_min2": 7, "d16_history_cmd": 7, "d17_info_amount": 8, "d18_account_name": 9,
-              "d19_hold_ids": 9, "d20_max25": 10}
+ITEM_STAGE = {"c01_package": 1, "c02_no_print": 1, "c03_roomlyerror_slug": 1, "c05_stdlib": 1, "c08_safe_write": 1,
+              "c11_default_50": 8, "c12_ids": 1, "d01_name30": 1, "d02_cap200": 1,
+              "c06_docstrings": 2, "c07_minute_times": 2, "d03_grid5": 8, "d04_max240": 2, "d05_no_title": 2,
+              "c04_logging": 3, "c10_header": 3, "d06_gap15": 9, "d07_no_cancel_started": 3, "d08_close22": 10,
+              "d09_compact_json": 4, "c09_exit5": 5, "d10_load_missing": 5, "d17_exit6": 5,
+              "d11_csv_atomic": 6, "d12_csv_dates": 6, "d13_series12": 6,
+              "d14_weekend": 7, "d15_report_by_name": 7, "d16_report_omit_empty": 7,
+              "d18_rooms_cmd": 8, "d19_rev": 9, "d20_info_room_name": 10}
 # Stale values of superseded items (present without the new value = the summary carries the old rule).
-STALE = {"d03_codes": r"4704|4707", "d06_limit": r"1,000,000|100000000", "d08_xfer": r"transfer SRC->DST|transfer ACC-\S+->",
-         "c11_default_eur": r"default\W+(currency\W+)?(is\W+)?CHF|CHF\W+(is\W+)?(the\W+)?default"}
+STALE = {"d03_grid5": r"15-minute grid|multiple of 15|00, 15, 30|quarter[- ]hour|% ?15\b",
+         "d06_gap15": r"10[- ]?min[^\n]{0,40}(gap|buffer|between|clean)|(gap|buffer)[^\n]{0,40}\b10\b",
+         "d08_close22": r"20:00",
+         "c11_default_50": r"default[^\n]{0,40}\b30\b|\b30\b[^\n]{0,30}default"}

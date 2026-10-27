@@ -1,416 +1,60 @@
-"""Hidden functional tests for the 12 vxledger stages (v2: statement names upper case, hold ids HOLD-0001, default transfer memo). They only check what the stage messages state;
-the project conventions (default currency, id format, logging prefix, exit status, ...) are checked by
-check_conventions.py. Tests use explicit currencies and returned ids so they never depend on a convention."""
-import csv, json, logging, os, subprocess, sys
-from datetime import datetime, timezone, timedelta
+"""Hidden functional tests for roomly (long-horizon lh2), one group per stage.
+Inputs are chosen so that no team decision changes the expected outcome: explicit durations, starts on the
+15-minute grid between 08:00 and 19:00, gaps of at least 30 minutes, titles without padding, a clock before all
+bookings, rooms whose name order equals their id order. Decisions are scored separately in test_rules.py."""
+import csv, json, logging, os, re, subprocess, sys
+from datetime import datetime, timezone
 import pytest
 
-
-def M():
-    from vxledger import money
-    return money
+T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def E():
-    from vxledger import errors
+    from roomly import errors
     return errors
 
 
-def L(**kw):
-    from vxledger.ledger import Ledger
-    return Ledger(**kw)
+def TU():
+    from roomly import timeutil
+    return timeutil
 
 
-class Clock:
-    """Returns `now` however often the ledger calls it; tests move it explicitly."""
-    def __init__(self, start=datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)):
-        self.now = start
-
-    def __call__(self):
-        return self.now
-
-
-# ---------------------------------------------------------------- stage 1
-@pytest.mark.parametrize("s,v", [("12", 1200), ("12.5", 1250), ("-0.05", -5), ("1,234.56", 123456), (" 7.00 ", 700),
-                                 ("0", 0), ("1,000,000", 100000000), ("-1,234", -123400), ("3.1", 310)])
-def test_s1_parse_ok(s, v):
-    assert M().parse_amount(s) == v
+def S(**kw):
+    from roomly.scheduler import Scheduler
+    kw.setdefault("clock", lambda: T0)
+    try:
+        return Scheduler(**kw)
+    except TypeError:
+        return Scheduler()
 
 
-@pytest.mark.parametrize("s", ["", "1.234", "12,34", "abc", "1e3", "--1", "1,2345", "1.", ".5x", "12 34"])
-def test_s1_parse_bad(s):
-    with pytest.raises(E().AmountError):
-        M().parse_amount(s)
+def S0():
+    from roomly.scheduler import Scheduler
+    return Scheduler()
 
 
-def test_s1_format():
-    f = M().format_amount
-    assert f(123456, "EUR") == "EUR 1,234.56"
-    assert f(-1200, "USD") == "USD -12.00"
-    assert f(5, "EUR") == "EUR 0.05"
-    assert f(0, "EUR") == "EUR 0.00"
-    assert f(100000000, "GBP") == "GBP 1,000,000.00"
+def two(s=None):
+    s = s or S()
+    a = s.add_room("Alpha", 10)
+    b = s.add_room("Beta", 4)
+    return s, a, b
 
 
-def test_s1_atomic_write(tmp_path):
-    from vxledger.storage import atomic_write
-    p = tmp_path / "x.txt"
-    atomic_write(str(p), "hello")
-    atomic_write(str(p), "world")
-    assert p.read_text() == "world"
-    assert sorted(os.listdir(tmp_path)) == ["x.txt"]
+def cli(tmp_path, *args, db="db.json"):
+    env = dict(os.environ, PYTHONPATH=os.getcwd())
+    return subprocess.run([sys.executable, "-m", "roomly", str(tmp_path / db), *args], capture_output=True,
+                          text=True, env=env, timeout=60)
 
 
-# ---------------------------------------------------------------- stage 2
-def test_s2_open_and_account():
-    led = L()
-    a = led.open_account("Alice", "EUR")
-    b = led.open_account("Bob", "EUR")
-    assert a != b
-    info = led.account(a)
-    assert info == {"id": a, "name": "Alice", "currency": "EUR", "balance": 0}
-    from vxledger import Ledger  # re-export
-    assert Ledger is type(led)
-
-
-@pytest.mark.parametrize("name,cur", [("", "EUR"), ("   ", "EUR"), ("alice", "EUR"), ("Zed", "eur"), ("Zed", "EURO"), ("Zed", "E1R")])
-def test_s2_open_invalid(name, cur):
-    led = L()
-    led.open_account("Alice", "EUR")
-    with pytest.raises(E().ValidationError):
-        led.open_account(name, cur)
-
-
-def test_s2_deposit_withdraw_ids():
-    led = L()
-    a = led.open_account("A", "EUR")
-    b = led.open_account("B", "EUR")
-    assert led.deposit(a, 1000) == "TX00000001"
-    assert led.deposit(b, 500, "x") == "TX00000002"
-    assert led.withdraw(a, 300) == "TX00000003"
-    assert led.balance(a) == 700 and led.balance(b) == 500
-    assert led.account(a)["balance"] == 700
-
-
-def test_s2_errors():
-    led = L()
-    a = led.open_account("A", "EUR")
-    for bad in (0, -5):
-        with pytest.raises(E().ValidationError):
-            led.deposit(a, bad)
-        with pytest.raises(E().ValidationError):
-            led.withdraw(a, bad)
-    led.deposit(a, 100)
-    with pytest.raises(E().InsufficientFundsError):
-        led.withdraw(a, 101)
-    assert led.balance(a) == 100
-    for f in (lambda: led.account("nope"), lambda: led.balance("nope"), lambda: led.deposit("nope", 5)):
-        with pytest.raises(E().UnknownAccountError):
-            f()
-
-
-# ---------------------------------------------------------------- stage 3
-def test_s3_transfer():
-    led = L()
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    led.deposit(a, 1000)
-    tx = led.transfer(a, b, 400, "rent")
-    assert tx == "TX00000002"
-    assert led.balance(a) == 600 and led.balance(b) == 400
-    assert led.deposit(b, 1) == "TX00000003"
-
-
-def test_s3_transfer_errors():
-    led = L()
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR"); c = led.open_account("C", "USD")
-    led.deposit(a, 100)
-    with pytest.raises(E().ValidationError):
-        led.transfer(a, a, 10)
-    with pytest.raises(E().ValidationError):
-        led.transfer(a, b, 0)
-    with pytest.raises(E().CurrencyMismatchError):
-        led.transfer(a, c, 10)
-    with pytest.raises(E().InsufficientFundsError):
-        led.transfer(a, b, 101)
-    with pytest.raises(E().UnknownAccountError):
-        led.transfer(a, "nope", 1)
-    assert led.balance(a) == 100 and led.balance(b) == 0 and led.balance(c) == 0
-    assert led.deposit(a, 1) == "TX00000002"  # failed operations consume no ids
-
-
-def test_s3_overdraft():
-    led = L()
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    led.set_overdraft(a, 500)
-    led.withdraw(a, 300)
-    assert led.balance(a) == -300
-    led.transfer(a, b, 200)
-    assert led.balance(a) == -500
-    with pytest.raises(E().InsufficientFundsError):
-        led.withdraw(a, 1)
-    with pytest.raises(E().InsufficientFundsError):
-        led.transfer(a, b, 1)
-    with pytest.raises(E().ValidationError):
-        led.set_overdraft(a, -1)
-
-
-# ---------------------------------------------------------------- stage 4
-def test_s4_history():
-    led = L(clock=Clock())
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    t1 = led.deposit(a, 1000, "salary")
-    t2 = led.transfer(a, b, 250, "rent")
-    t3 = led.withdraw(a, 50)
-    h = led.history(a)
-    assert [e["tx"] for e in h] == [t1, t2, t3]
-    assert [e["kind"] for e in h] == ["deposit", "transfer_out", "withdrawal"]
-    assert [e["amount"] for e in h] == [1000, -250, -50]
-    assert [e["balance_after"] for e in h] == [1000, 750, 700]
-    assert [e["memo"] for e in h] == ["salary", "rent", ""]
-    assert all(set(e) == {"tx", "kind", "amount", "balance_after", "memo", "timestamp"} for e in h)
-    hb = led.history(b)
-    assert len(hb) == 1 and hb[0]["tx"] == t2 and hb[0]["kind"] == "transfer_in" and hb[0]["amount"] == 250
-    assert hb[0]["balance_after"] == 250
-
-
-def test_s4_clock_used():
-    led = L(clock=Clock(start=datetime(2026, 5, 4, 3, 2, 1, tzinfo=timezone.utc)))
-    a = led.open_account("A", "EUR")
-    led.deposit(a, 5)
-    ts = led.history(a)[0]["timestamp"]
-    assert ts.startswith("2026-05-04T03:02:01")
-
-
-def test_s4_clock_other_zone():
-    tz = timezone(timedelta(hours=2))
-    led = L(clock=lambda: datetime(2026, 5, 4, 3, 0, 0, tzinfo=tz))
-    a = led.open_account("A", "EUR")
-    led.deposit(a, 5)
-    assert led.history(a)[0]["timestamp"].startswith("2026-05-04T01:00:00")
-
-
-# ---------------------------------------------------------------- stage 5
-def _populated():
-    led = L(clock=Clock())
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    led.deposit(a, 1000, "m1"); led.set_overdraft(b, 300); led.transfer(b, a, 200, "m2")
-    return led, a, b
-
-
-def test_s5_roundtrip(tmp_path):
-    led, a, b = _populated()
-    p = str(tmp_path / "db.json")
-    led.save(p)
-    doc = json.load(open(p))
-    assert doc["version"] == 2
-    from vxledger.ledger import Ledger
-    led2 = Ledger.load(p)
-    assert led2.balance(a) == 1200 and led2.balance(b) == -200
-    assert led2.history(a) == led.history(a) and led2.history(b) == led.history(b)
-    assert led2.account(b) == led.account(b)
-    led2.withdraw(b, 100)  # overdraft restored
-    with pytest.raises(E().InsufficientFundsError):
-        led2.withdraw(b, 1)
-    c = led2.open_account("C", "EUR")
-    assert c not in (a, b)
-    assert led2.deposit(c, 1) == "TX00000004"
-
-
-def test_s5_load_clock(tmp_path):
-    led, a, b = _populated()
-    p = str(tmp_path / "db.json"); led.save(p)
-    from vxledger.ledger import Ledger
-    led2 = Ledger.load(p, clock=lambda: datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
-    led2.deposit(a, 1)
-    assert led2.history(a)[-1]["timestamp"].startswith("2030-01-02T03:04:05")
-
-
-def test_s5_load_errors(tmp_path):
-    from vxledger.ledger import Ledger
-    with pytest.raises(E().LoadError):
-        Ledger.load(str(tmp_path / "missing.json"))
-    bad = tmp_path / "bad.json"; bad.write_text("{not json")
-    with pytest.raises(E().LoadError):
-        Ledger.load(str(bad))
-    led, a, b = _populated()
-    p = tmp_path / "v.json"; led.save(str(p))
-    doc = json.load(open(p)); doc["version"] = 3; p.write_text(json.dumps(doc))
-    with pytest.raises(E().LoadError):
-        Ledger.load(str(p))
-
-
-# ---------------------------------------------------------------- stage 6
-def _csv(tmp_path, rows):
-    p = tmp_path / "in.csv"
+def _csv(tmp_path, rows, name="in.csv"):
+    p = tmp_path / name
     with open(p, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["date", "account", "amount", "memo"])
+        w.writerow(["room", "start", "duration", "title", "attendees"])
         w.writerows(rows)
     return str(p)
 
 
-def test_s6_import(tmp_path):
-    led = L(clock=Clock())
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    p = _csv(tmp_path, [
-        ["2026-01-05", a, "100.00", "first"],      # line 2 ok
-        ["2026-01-06", a, "-30", "atm"],           # line 3 ok
-        ["2026-13-01", a, "5", "bad date"],         # line 4 ValidationError
-        ["2026-01-07", "ACC-999999", "5", "x"],     # line 5 UnknownAccount
-        ["2026-01-08", b, "1.234", "bad amt"],      # line 6 AmountError
-        ["2026-01-09", b, "-1", "nsf"],             # line 7 InsufficientFunds
-        ["2026-01-10", b, "1,500.25", "big"],       # line 8 ok
-        ["2026-01-11", b, "0", "zero"],             # line 9 skipped (ValidationError)
-    ])
-    r = led.import_csv(p)
-    er = E()
-    assert r["imported"] == 3 and r["skipped"] == 5
-    assert [list(x) for x in r["errors"]] == [[4, er.ValidationError.code], [5, er.UnknownAccountError.code],
-                                             [6, er.AmountError.code], [7, er.InsufficientFundsError.code],
-                                             [9, er.ValidationError.code]]
-    assert led.balance(a) == 7000 and led.balance(b) == 150025
-    h = led.history(a)
-    assert [e["kind"] for e in h] == ["deposit", "withdrawal"]
-    assert h[0]["timestamp"].startswith("2026-01-05T00:00:00") and h[0]["memo"] == "first"
-
-
-# ---------------------------------------------------------------- stage 7
-def test_s7_interest():
-    led = L(clock=Clock())
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR"); c = led.open_account("C", "EUR")
-    d = led.open_account("D", "EUR"); e = led.open_account("E", "EUR")
-    led.deposit(a, 12345); led.deposit(b, 2); led.deposit(c, 6); led.set_overdraft(d, 100); led.withdraw(d, 50)
-    led.deposit(e, 10)
-    txs = led.apply_interest(2500)
-    # a: 3086.25 -> 3086 ; b: 0.5 -> 0 (none) ; c: 1.5 -> 2 ; d negative -> none ; e: 2.5 -> 2
-    assert led.balance(a) == 12345 + 3086 and led.balance(b) == 2 and led.balance(c) == 8 and led.balance(d) == -50
-    assert led.balance(e) == 12
-    assert len(txs) == 3 and txs == sorted(txs)
-    assert led.history(a)[-1]["tx"] == txs[0] and led.history(c)[-1]["tx"] == txs[1] and led.history(e)[-1]["tx"] == txs[2]
-    last = led.history(a)[-1]
-    assert last["kind"] == "interest" and last["amount"] == 3086 and last["memo"] == "interest"
-    with pytest.raises(E().ValidationError):
-        led.apply_interest(-1)
-
-
-def test_s7_interest_small_rate():
-    led = L()
-    a = led.open_account("A", "EUR")
-    led.deposit(a, 12345)
-    led.apply_interest(25, "q1")  # 30.8625 -> 31
-    assert led.balance(a) == 12376
-    assert led.history(a)[-1]["memo"] == "q1"
-
-
-# ---------------------------------------------------------------- stage 8
-def test_s8_statement():
-    ck = Clock(datetime(2026, 2, 27, 9, tzinfo=timezone.utc))
-    led = L(clock=ck)
-    a = led.open_account("Alice", "EUR"); b = led.open_account("Bob", "EUR")
-    led.deposit(a, 1000)
-    ck.now = datetime(2026, 3, 2, 10, tzinfo=timezone.utc)
-    led.deposit(a, 500, "refund")
-    ck.now = datetime(2026, 3, 15, 11, tzinfo=timezone.utc)
-    led.transfer(a, b, 1234)
-    ck.now = datetime(2026, 4, 1, 0, tzinfo=timezone.utc)
-    led.deposit(a, 1)
-    s = led.monthly_statement(a, 2026, 3)
-    assert s == "\n".join([
-        f"Statement {a} (ALICE) 2026-03",
-        "Opening balance: EUR 10.00",
-        "2026-03-02 TX00000002 deposit +EUR 5.00 -> EUR 15.00 refund",
-        f"2026-03-15 TX00000003 transfer_out -EUR 12.34 -> EUR 2.66 xfer {a}>{b}",
-        "Closing balance: EUR 2.66",
-    ])
-    empty = led.monthly_statement(b, 2026, 1)
-    assert empty == f"Statement {b} (BOB) 2026-01\nOpening balance: EUR 0.00\nClosing balance: EUR 0.00"
-    with pytest.raises(E().ValidationError):
-        led.monthly_statement(a, 2026, 13)
-
-
-# ---------------------------------------------------------------- stage 9
-def cli(tmp_path, *args):
-    env = dict(os.environ, PYTHONPATH=os.getcwd())
-    r = subprocess.run([sys.executable, "-m", "vxledger", str(tmp_path / "db.json"), *args], capture_output=True,
-                       text=True, env=env, timeout=60)
-    return r
-
-
-def test_s9_cli_flow(tmp_path):
-    r = cli(tmp_path, "open", "Alice", "--currency", "EUR"); assert r.returncode == 0, r.stderr
-    a = r.stdout.strip()
-    r = cli(tmp_path, "open", "Bob", "--currency", "EUR"); b = r.stdout.strip()
-    r = cli(tmp_path, "deposit", a, "1,000.50", "--memo", "pay"); assert r.returncode == 0 and r.stdout.strip() == "TX00000001"
-    r = cli(tmp_path, "transfer", a, b, "0.50"); assert r.stdout.strip() == "TX00000002"
-    r = cli(tmp_path, "withdraw", b, "0.25"); assert r.stdout.strip() == "TX00000003"
-    r = cli(tmp_path, "balance", a); assert r.returncode == 0 and r.stdout.strip() == "EUR 1,000.00"
-    r = cli(tmp_path, "balance", b); assert r.stdout.strip() == "EUR 0.25"
-    from vxledger.ledger import Ledger
-    assert Ledger.load(str(tmp_path / "db.json")).balance(a) == 100000
-
-
-def test_s9_cli_statement(tmp_path):
-    a = cli(tmp_path, "open", "Alice", "--currency", "EUR").stdout.strip()
-    cli(tmp_path, "deposit", a, "5")
-    ym = datetime.now(timezone.utc).strftime("%Y-%m")
-    r = cli(tmp_path, "statement", a, ym)
-    assert r.returncode == 0
-    lines = r.stdout.strip().splitlines()
-    assert lines[0] == f"Statement {a} (ALICE) {ym}" and lines[-1] == "Closing balance: EUR 5.00"
-
-
-def test_s9_cli_error_message(tmp_path):
-    a = cli(tmp_path, "open", "Alice", "--currency", "EUR").stdout.strip()
-    r = cli(tmp_path, "withdraw", a, "5")
-    assert r.returncode != 0
-    from vxledger.errors import InsufficientFundsError
-    # log records may also reach stderr (logging's last-resort handler); one line must be the error line
-    assert any(l.startswith(f"error {InsufficientFundsError.code}:") for l in r.stderr.splitlines())
-
-
-# ---------------------------------------------------------------- stage 10
-def test_s10_holds():
-    led = L()
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    led.deposit(a, 1000); led.set_overdraft(a, 100)
-    h1 = led.place_hold(a, 600, "card")
-    h2 = led.place_hold(a, 400, "hotel")
-    assert (h1, h2) == ("HOLD-0001", "HOLD-0002")
-    assert led.available(a) == 100 and led.balance(a) == 1000
-    with pytest.raises(E().InsufficientFundsError):
-        led.place_hold(a, 101, "x")
-    with pytest.raises(E().InsufficientFundsError):
-        led.withdraw(a, 101)
-    with pytest.raises(E().InsufficientFundsError):
-        led.transfer(a, b, 101)
-    led.withdraw(a, 100)
-    led.release_hold(h1)
-    assert led.available(a) == 600
-    with pytest.raises(E().UnknownHoldError):
-        led.release_hold(h1)
-    with pytest.raises(E().UnknownHoldError):
-        led.release_hold("HOLD-0099")
-    with pytest.raises(E().ValidationError):
-        led.place_hold(a, 0, "x")
-    assert len(led.history(a)) == 2  # holds are not transactions
-    assert led.deposit(b, 1) == "TX00000003"
-
-
-def test_s10_holds_persist(tmp_path):
-    led = L()
-    a = led.open_account("A", "EUR")
-    led.deposit(a, 1000)
-    h = led.place_hold(a, 300, "x")
-    p = str(tmp_path / "db.json"); led.save(p)
-    from vxledger.ledger import Ledger
-    led2 = Ledger.load(p)
-    assert led2.available(a) == 700
-    led2.release_hold(h)
-    assert led2.available(a) == 1000
-    assert led2.place_hold(a, 1, "y") == "HOLD-0002"
-
-
-# ---------------------------------------------------------------- stage 11
 class Cap(logging.Handler):
     def __init__(self):
         super().__init__(logging.DEBUG); self.records = []
@@ -429,72 +73,532 @@ def cap():
     root.removeHandler(h); root.setLevel(old)
 
 
+# ---------------------------------------------------------------- stage 1
+def test_s1_errors_exist():
+    er = E()
+    for n in ("ValidationError", "UnknownRoomError", "UnknownBookingError", "ConflictError", "CapacityError", "LoadError"):
+        assert issubclass(getattr(er, n), Exception)
+    assert len({getattr(er, n) for n in ("ValidationError", "UnknownRoomError", "UnknownBookingError",
+                                         "ConflictError", "CapacityError", "LoadError")}) == 6
+
+
+def test_s1_parse_duration_ok():
+    p = TU().parse_duration
+    assert [p(x) for x in ("45", "45m", "2h", "1h30m", "1h5m", "1h05m", " 90 ", "10h", "0h15m")] == \
+        [45, 45, 120, 90, 65, 65, 90, 600, 15]
+
+
+def test_s1_parse_duration_bad():
+    for x in ("", "0", "0m", "1h60m", "1.5h", "abc", "-5", "1h 30m", "h", "30mm", "2H", "1h300m"):
+        with pytest.raises(E().ValidationError):
+            TU().parse_duration(x)
+
+
+def test_s1_format_duration():
+    f = TU().format_duration
+    assert [f(x) for x in (0, 45, 60, 90, 125, 600)] == ["0m", "45m", "1h", "1h30m", "2h05m", "10h"]
+    with pytest.raises(E().ValidationError):
+        f(-1)
+
+
+def test_s1_parse_start():
+    d = TU().parse_start(" 2026-03-02T09:15 ")
+    assert d == datetime(2026, 3, 2, 9, 15, tzinfo=timezone.utc) and d.utcoffset().total_seconds() == 0
+
+
+def test_s1_parse_start_bad():
+    for x in ("2026-03-02 09:00", "2026-03-02T9:00", "2026-02-30T09:00", "2026-03-02T09:00:00", "", "2026-03-02T24:00"):
+        with pytest.raises(E().ValidationError):
+            TU().parse_start(x)
+
+
+def test_s1_format_start_roundtrip():
+    t = TU()
+    assert t.format_start(t.parse_start("2026-12-31T23:45")) == "2026-12-31T23:45"
+    assert t.format_start(datetime(2026, 3, 2, 9, 0, 59, tzinfo=timezone.utc)) == "2026-03-02T09:00"
+
+
+def test_s1_file_helper_writes(tmp_path):
+    from roomly import fileio
+    p = tmp_path / "x.txt"
+    fileio.safe_write(str(p), "hello\n")
+    fileio.safe_write(str(p), "again\n")
+    assert p.read_text() == "again\n" and os.listdir(tmp_path) == ["x.txt"]
+
+
+# ---------------------------------------------------------------- stage 2
+def test_s2_import_and_empty():
+    from roomly import Scheduler
+    assert Scheduler().rooms() == []
+
+
+def test_s2_add_room_and_get():
+    s = S()
+    r = s.add_room("  Alpha  ", 10)
+    assert s.room(r) == {"id": r, "name": "Alpha", "capacity": 10}
+
+
+def test_s2_rooms_in_order():
+    s, a, b = two()
+    c = s.add_room("Gamma", 6)
+    assert [x["id"] for x in s.rooms()] == [a, b, c] and [x["name"] for x in s.rooms()] == ["Alpha", "Beta", "Gamma"]
+
+
+def test_s2_name_validation():
+    s = S()
+    s.add_room("Alpha", 10)
+    for n in ("", "   ", "alpha", " ALPHA "):
+        with pytest.raises(E().ValidationError):
+            s.add_room(n, 5)
+
+
+def test_s2_capacity_validation():
+    s = S()
+    for c in (0, -1, True, "5", 2.0):
+        with pytest.raises(E().ValidationError):
+            s.add_room(f"Room {c!r}", c)
+    assert s.rooms() == []
+
+
+def test_s2_unknown_room():
+    with pytest.raises(E().UnknownRoomError):
+        S().room("R999")
+
+
+# ---------------------------------------------------------------- stage 3
+def test_s3_book_and_get():
+    s, a, _ = two()
+    bid = s.book(a, "2026-03-02T09:00", 90, "Sprint review", 6)
+    b = s.booking(bid)
+    assert {k: b[k] for k in ("id", "room", "start", "end", "title", "attendees")} == \
+        {"id": bid, "room": a, "start": "2026-03-02T09:00", "end": "2026-03-02T10:30", "title": "Sprint review",
+         "attendees": 6}
+
+
+def test_s3_booking_ids_shared_sequence():
+    s, a, b = two()
+    x = s.book(a, "2026-03-02T09:00", 30, "x")
+    y = s.book(b, "2026-03-02T09:00", 30, "y")
+    z = s.book(a, "2026-03-02T11:00", 30, "z")
+    assert len({x, y, z}) == 3 and x < y < z
+
+
+def test_s3_overlap_conflict():
+    s, a, b = two()
+    s.book(a, "2026-03-02T10:00", 60, "first")
+    for st, d in (("2026-03-02T10:00", 60), ("2026-03-02T09:30", 60), ("2026-03-02T10:30", 15), ("2026-03-02T09:00", 180)):
+        with pytest.raises(E().ConflictError):
+            s.book(a, st, d, "clash")
+    s.book(b, "2026-03-02T10:00", 60, "other room")
+
+
+def test_s3_non_overlapping_ok():
+    s, a, _ = two()
+    s.book(a, "2026-03-02T10:00", 60, "first")
+    s.book(a, "2026-03-02T11:30", 60, "later")
+    s.book(a, "2026-03-02T08:00", 60, "earlier")
+    s.book(a, "2026-03-03T10:00", 60, "next day")
+
+
+def test_s3_duration_validation():
+    s, a, _ = two()
+    for d in (0, -30, True, "60"):
+        with pytest.raises(E().ValidationError):
+            s.book(a, "2026-03-02T09:00", d, "bad")
+
+
+def test_s3_bad_start():
+    s, a, _ = two()
+    with pytest.raises(E().ValidationError):
+        s.book(a, "2026-03-02 09:00", 30, "bad")
+
+
+def test_s3_attendees():
+    s, a, b = two()
+    with pytest.raises(E().CapacityError):
+        s.book(b, "2026-03-02T09:00", 30, "big", 5)
+    for n in (0, -1):
+        with pytest.raises(E().ValidationError):
+            s.book(b, "2026-03-02T09:00", 30, "none", n)
+    s.book(b, "2026-03-02T09:00", 30, "full", 4)
+
+
+def test_s3_unknowns():
+    s, a, _ = two()
+    with pytest.raises(E().UnknownRoomError):
+        s.book("R999", "2026-03-02T09:00", 30, "x")
+    with pytest.raises(E().UnknownBookingError):
+        s.booking("BK-99999")
+
+
+def test_s3_failed_book_changes_nothing():
+    s, a, _ = two()
+    first = s.book(a, "2026-03-02T10:00", 60, "first")
+    with pytest.raises(E().ConflictError):
+        s.book(a, "2026-03-02T10:30", 30, "clash")
+    nxt = s.book(a, "2026-03-02T14:00", 30, "next")
+    num = lambda i: int(re.sub(r"\D", "", i))
+    assert num(nxt) == num(first) + 1
+
+
+# ---------------------------------------------------------------- stage 4
+def test_s4_cancel_frees_slot():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T10:00", 60, "first")
+    s.cancel(x)
+    s.book(a, "2026-03-02T10:00", 60, "again")
+    with pytest.raises(E().UnknownBookingError):
+        s.booking(x)
+
+
+def test_s4_cancel_twice_or_unknown():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T10:00", 60, "first")
+    s.cancel(x)
+    with pytest.raises(E().UnknownBookingError):
+        s.cancel(x)
+    with pytest.raises(E().UnknownBookingError):
+        s.cancel("BK-99999")
+
+
+def test_s4_day_bookings_sorted():
+    s, a, b = two()
+    y = s.book(a, "2026-03-02T14:00", 30, "late")
+    x = s.book(a, "2026-03-02T09:00", 30, "early")
+    s.book(a, "2026-03-03T09:00", 30, "tomorrow")
+    s.book(b, "2026-03-02T09:00", 30, "other room")
+    assert [d["id"] for d in s.day_bookings(a, "2026-03-02")] == [x, y]
+    assert s.day_bookings(a, "2026-03-04") == []
+
+
+def test_s4_day_bookings_excludes_cancelled():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 30, "x")
+    y = s.book(a, "2026-03-02T11:00", 30, "y")
+    s.cancel(x)
+    assert [d["id"] for d in s.day_bookings(a, "2026-03-02")] == [y]
+
+
+def test_s4_day_validation():
+    s, a, _ = two()
+    for d in ("2026-3-2", "02.03.2026", "2026-02-30", ""):
+        with pytest.raises(E().ValidationError):
+            s.day_bookings(a, d)
+    with pytest.raises(E().UnknownRoomError):
+        s.day_bookings("R999", "2026-03-02")
+
+
+def test_s4_clock_used_for_cancel():
+    s, a, _ = two(S(clock=lambda: datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)))
+    x = s.book(a, "2026-03-02T09:00", 30, "x")
+    s.cancel(x)
+
+
+# ---------------------------------------------------------------- stage 5
+def test_s5_roundtrip(tmp_path):
+    from roomly.scheduler import Scheduler
+    s, a, b = two()
+    x = s.book(a, "2026-03-02T09:00", 90, "Planning", 3)
+    s.book(b, "2026-03-02T10:00", 30, "Sync", 2)
+    p = str(tmp_path / "db.json")
+    s.save(p)
+    t = Scheduler.load(p, clock=lambda: T0)
+    assert t.rooms() == s.rooms()
+    assert t.booking(x)["start"] == "2026-03-02T09:00" and t.booking(x)["end"] == "2026-03-02T10:30"
+    assert t.booking(x)["title"] == "Planning" and t.booking(x)["attendees"] == 3
+    with pytest.raises(E().ConflictError):
+        t.book(a, "2026-03-02T09:30", 30, "clash")
+
+
+def test_s5_version_field(tmp_path):
+    s, a, _ = two()
+    p = tmp_path / "db.json"
+    s.save(str(p))
+    assert json.loads(p.read_text())["version"] == 3
+
+
+def test_s5_sequences_continue(tmp_path):
+    from roomly.scheduler import Scheduler
+    s, a, b = two()
+    s.book(a, "2026-03-02T09:00", 30, "x")
+    last = s.book(a, "2026-03-02T11:00", 30, "y")
+    s.cancel(last)
+    p = str(tmp_path / "db.json")
+    s.save(p)
+    t = Scheduler.load(p, clock=lambda: T0)
+    nb = t.book(a, "2026-03-02T15:00", 30, "z")
+    assert nb != last and nb > last
+    assert t.add_room("Gamma", 3) > b
+
+
+def test_s5_load_errors(tmp_path):
+    from roomly.scheduler import Scheduler
+    (tmp_path / "bad.json").write_text("{not json")
+    (tmp_path / "v.json").write_text(json.dumps({"version": 2}))
+    (tmp_path / "nov.json").write_text(json.dumps({"rooms": []}))
+    for n in ("bad.json", "v.json", "nov.json"):
+        with pytest.raises(E().LoadError):
+            Scheduler.load(str(tmp_path / n))
+
+
+# ---------------------------------------------------------------- stage 6
+def test_s6_import_ok(tmp_path):
+    s, a, b = two()
+    r = s.import_csv(_csv(tmp_path, [[a, "2026-03-02T09:00", "1h", "Standup", "3"],
+                                     [b, "2026-03-02T09:00", "30m", "Call", ""],
+                                     [a, "2026-03-02T11:00", "90", "Review", "5"]]))
+    assert r["imported"] == 3 and r["errors"] == []
+    bs = s.day_bookings(a, "2026-03-02")
+    assert [(x["start"], x["end"], x["title"], x["attendees"]) for x in bs] == \
+        [("2026-03-02T09:00", "2026-03-02T10:00", "Standup", 3), ("2026-03-02T11:00", "2026-03-02T12:30", "Review", 5)]
+    assert s.day_bookings(b, "2026-03-02")[0]["attendees"] == 1
+
+
+def test_s6_import_errors_listed(tmp_path):
+    s, a, b = two()
+    er = E()
+    r = s.import_csv(_csv(tmp_path, [[a, "2026-03-02T09:00", "1h", "ok", "2"],
+                                     ["R999", "2026-03-02T09:00", "1h", "unknown room", "1"],
+                                     [a, "2026-03-02T09:30", "1h", "clash with row 2", "1"],
+                                     [b, "2026-03-02T09:00", "1h", "too many", "9"],
+                                     [b, "yesterday", "1h", "bad start", "1"],
+                                     [b, "2026-03-02T12:00", "1.5h", "bad duration", "1"],
+                                     [b, "2026-03-02T14:00", "1h", "bad attendees", "x"]]))
+    assert [list(e) for e in r["errors"]] == [[3, er.UnknownRoomError.slug], [4, er.ConflictError.slug],
+                                              [5, er.CapacityError.slug], [6, er.ValidationError.slug],
+                                              [7, er.ValidationError.slug], [8, er.ValidationError.slug]]
+
+
+def test_s6_rows_see_earlier_rows(tmp_path):
+    s, a, _ = two()
+    r = s.import_csv(_csv(tmp_path, [[a, "2026-03-02T09:00", "1h", "one", "1"],
+                                     [a, "2026-03-02T10:30", "1h", "two", "1"]]))
+    assert r["imported"] == 2
+    with pytest.raises(E().ConflictError):
+        s.book(a, "2026-03-02T10:30", 30, "clash")
+
+
+# ---------------------------------------------------------------- stage 7
+def test_s7_weekly_series():
+    s, a, _ = two()
+    ids = s.book_series(a, "2026-03-02T09:00", 4, 7, 60, "Weekly", 3)
+    assert len(ids) == 4
+    assert [s.booking(i)["start"] for i in ids] == ["2026-03-02T09:00", "2026-03-09T09:00", "2026-03-16T09:00",
+                                                    "2026-03-23T09:00"]
+    assert all(s.booking(i)["title"] == "Weekly" and s.booking(i)["attendees"] == 3 for i in ids)
+
+
+def test_s7_every_days():
+    s, a, _ = two()
+    ids = s.book_series(a, "2026-03-02T09:00", 3, 2, 30, "Alt")
+    assert [s.booking(i)["start"][:10] for i in ids] == ["2026-03-02", "2026-03-04", "2026-03-06"]
+
+
+def test_s7_series_all_or_nothing():
+    s, a, _ = two()
+    s.book(a, "2026-03-16T09:30", 30, "blocker")
+    with pytest.raises(E().ConflictError):
+        s.book_series(a, "2026-03-02T09:00", 4, 7, 60, "Weekly")
+    assert s.day_bookings(a, "2026-03-02") == [] and s.day_bookings(a, "2026-03-09") == []
+
+
+def test_s7_series_validation():
+    s, a, _ = two()
+    with pytest.raises(E().ValidationError):
+        s.book_series(a, "2026-03-02T09:00", 3, 0, 30, "x")
+    with pytest.raises(E().ValidationError):
+        s.book_series(a, "2026-03-02T09:00", 0, 7, 30, "x")
+    with pytest.raises(E().UnknownRoomError):
+        s.book_series("R999", "2026-03-02T09:00", 3, 7, 30, "x")
+
+
+# ---------------------------------------------------------------- stage 8
+def test_s8_day_report():
+    s, a, b = two()
+    s.book(a, "2026-03-02T11:00", 30, "Sync", 2)
+    s.book(a, "2026-03-02T09:00", 90, "Sprint review", 6)
+    s.book(b, "2026-03-02T10:00", 60, "Interview", 3)
+    s.book(b, "2026-03-03T10:00", 60, "Tomorrow", 3)
+    assert s.day_report("2026-03-02") == "\n".join([
+        "Rooms on 2026-03-02",
+        f"{a} Alpha: 2 bookings, 2h",
+        "  09:00-10:30 Sprint review (6)",
+        "  11:00-11:30 Sync (2)",
+        f"{b} Beta: 1 bookings, 1h",
+        "  10:00-11:00 Interview (3)",
+        "Total: 3h"])
+
+
+def test_s8_report_bad_day():
+    s, a, _ = two()
+    with pytest.raises(E().ValidationError):
+        s.day_report("March 2")
+
+
+def test_s8_report_minutes():
+    s, a, b = two()
+    s.book(a, "2026-03-02T09:00", 45, "A", 1)
+    s.book(b, "2026-03-02T09:00", 20, "B", 1)
+    rep = s.day_report("2026-03-02").splitlines()
+    assert f"{a} Alpha: 1 bookings, 45m" in rep and f"{b} Beta: 1 bookings, 20m" in rep and rep[-1] == "Total: 1h05m"
+
+
+# ---------------------------------------------------------------- stage 9
+def test_s9_cli_flow(tmp_path):
+    r = cli(tmp_path, "add-room", "Alpha", "10")
+    assert r.returncode == 0, r.stderr
+    room = r.stdout.strip()
+    r = cli(tmp_path, "book", room, "2030-03-04T09:00", "--duration", "1h30m", "--title", "Planning", "--attendees", "4")
+    assert r.returncode == 0, r.stderr
+    bid = r.stdout.strip()
+    r = cli(tmp_path, "list", room, "2030-03-04")
+    assert r.returncode == 0 and r.stdout.strip() == f"{bid} 09:00-10:30 Planning"
+
+
+def test_s9_cli_report(tmp_path):
+    room = cli(tmp_path, "add-room", "Alpha", "10").stdout.strip()
+    cli(tmp_path, "book", room, "2030-03-04T09:00", "--duration", "60", "--title", "Sync", "--attendees", "2")
+    r = cli(tmp_path, "report", "2030-03-04")
+    assert r.returncode == 0 and r.stdout.strip().splitlines() == \
+        ["Rooms on 2030-03-04", f"{room} Alpha: 1 bookings, 1h", "  09:00-10:00 Sync (2)", "Total: 1h"]
+
+
+def test_s9_cli_cancel_persists(tmp_path):
+    room = cli(tmp_path, "add-room", "Alpha", "10").stdout.strip()
+    bid = cli(tmp_path, "book", room, "2030-03-04T09:00", "--duration", "60", "--title", "X").stdout.strip()
+    r = cli(tmp_path, "cancel", bid)
+    assert r.returncode == 0 and r.stdout.strip() == ""
+    assert cli(tmp_path, "list", room, "2030-03-04").stdout.strip() == ""
+
+
+def test_s9_cli_error_line(tmp_path):
+    room = cli(tmp_path, "add-room", "Alpha", "2").stdout.strip()
+    r = cli(tmp_path, "book", room, "2030-03-04T09:00", "--duration", "60", "--attendees", "3")
+    assert r.returncode != 0 and any(l.startswith(f"error {E().CapacityError.slug}:") for l in r.stderr.splitlines())
+    r = cli(tmp_path, "book", "R999", "2030-03-04T09:00", "--duration", "60")
+    assert r.returncode != 0 and any(l.startswith(f"error {E().UnknownRoomError.slug}:") for l in r.stderr.splitlines())
+
+
+def test_s9_cli_saves(tmp_path):
+    cli(tmp_path, "add-room", "Alpha", "10")
+    cli(tmp_path, "add-room", "Beta", "5")
+    from roomly.scheduler import Scheduler
+    assert [r["name"] for r in Scheduler.load(str(tmp_path / "db.json")).rooms()] == ["Alpha", "Beta"]
+
+
+# ---------------------------------------------------------------- stage 10
+def test_s10_move():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 90, "Plan", 3)
+    s.move(x, "2026-03-02T14:00")
+    b = s.booking(x)
+    assert (b["start"], b["end"], b["title"], b["attendees"], b["id"]) == \
+        ("2026-03-02T14:00", "2026-03-02T15:30", "Plan", 3, x)
+
+
+def test_s10_move_overlapping_itself():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 90, "Plan")
+    s.move(x, "2026-03-02T09:30")
+    assert s.booking(x)["end"] == "2026-03-02T11:00"
+
+
+def test_s10_move_conflict_changes_nothing():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 60, "x")
+    s.book(a, "2026-03-02T13:00", 60, "y")
+    with pytest.raises(E().ConflictError):
+        s.move(x, "2026-03-02T12:30")
+    assert s.booking(x)["start"] == "2026-03-02T09:00"
+    s.book(a, "2026-03-02T11:00", 60, "slot still free")
+
+
+def test_s10_move_unknown_and_cancelled():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 60, "x")
+    s.cancel(x)
+    for i in (x, "BK-99999"):
+        with pytest.raises(E().UnknownBookingError):
+            s.move(i, "2026-03-02T12:00")
+
+
+def test_s10_move_persists(tmp_path):
+    from roomly.scheduler import Scheduler
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 60, "x")
+    s.move(x, "2026-03-03T10:00")
+    p = str(tmp_path / "db.json"); s.save(p)
+    assert Scheduler.load(p, clock=lambda: T0).booking(x)["start"] == "2026-03-03T10:00"
+
+
+# ---------------------------------------------------------------- stage 11
 def test_s11_info_per_mutation(cap):
-    led = L()
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
+    s = S()
     cap.records.clear()
-    tx = led.deposit(a, 1000)
-    tx2 = led.transfer(a, b, 10)
-    h = led.place_hold(a, 5, "r")
-    led.release_hold(h)
-    led.set_overdraft(b, 10)
-    infos = [r for r in cap.records if r.levelno == logging.INFO]
-    assert len(infos) == 5
-    msgs = [r.getMessage() for r in infos]
-    assert tx in msgs[0] and tx2 in msgs[1] and h in msgs[2] and h in msgs[3] and b in msgs[4]
+    a = s.add_room("Alpha", 10)
+    x = s.book(a, "2026-03-02T09:00", 60, "x")
+    s.move(x, "2026-03-02T11:00")
+    s.cancel(x)
+    infos = [r.getMessage() for r in cap.records if r.levelno == logging.INFO]
+    assert len(infos) == 4 and a in infos[0] and all(x in m for m in infos[1:])
 
 
-def test_s11_open_logged(cap):
-    led = L()
-    a = led.open_account("A", "EUR")
-    infos = [r for r in cap.records if r.levelno == logging.INFO]
-    assert len(infos) == 1 and a in infos[0].getMessage()
-
-
-def test_s11_warning_on_error(cap):
-    led = L()
-    a = led.open_account("A", "EUR")
+def test_s11_info_series_and_import(cap, tmp_path):
+    s, a, b = two()
     cap.records.clear()
-    with pytest.raises(E().InsufficientFundsError):
-        led.withdraw(a, 1)
-    warns = [r for r in cap.records if r.levelno == logging.WARNING]
-    assert len(warns) == 1 and str(E().InsufficientFundsError.code) in warns[0].getMessage()
+    ids = s.book_series(a, "2026-03-02T09:00", 3, 7, 30, "w")
+    s.import_csv(_csv(tmp_path, [[b, "2026-03-02T09:00", "1h", "i1", "1"], [b, "2026-03-02T11:00", "1h", "i2", "1"]]))
+    infos = [r.getMessage() for r in cap.records if r.levelno == logging.INFO]
+    assert len(infos) == 5 and all(any(i in m for m in infos) for i in ids)
+
+
+def test_s11_warning_with_slug(cap):
+    s, a, _ = two()
+    s.book(a, "2026-03-02T09:00", 60, "x")
+    cap.records.clear()
+    with pytest.raises(E().ConflictError):
+        s.book(a, "2026-03-02T09:30", 30, "y")
+    with pytest.raises(E().UnknownRoomError):
+        s.room("R999")
+    w = [r.getMessage() for r in cap.records if r.levelno == logging.WARNING]
+    assert len(w) == 2 and E().ConflictError.slug in w[0] and E().UnknownRoomError.slug in w[1]
+
+
+def test_s11_no_info_on_failure(cap):
+    s, a, _ = two()
+    cap.records.clear()
+    with pytest.raises(E().ValidationError):
+        s.add_room("", 3)
     assert not [r for r in cap.records if r.levelno == logging.INFO]
 
 
-def test_s11_interest_and_import_logged(cap, tmp_path):
-    led = L()
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    led.deposit(a, 10000); led.deposit(b, 10000)
-    cap.records.clear()
-    txs = led.apply_interest(100)
-    infos = [r.getMessage() for r in cap.records if r.levelno == logging.INFO]
-    assert len(infos) == 2 and txs[0] in infos[0] and txs[1] in infos[1]
-    cap.records.clear()
-    p = _csv(tmp_path, [["2026-01-05", a, "1", "x"], ["2026-01-05", a, "zz", "y"], ["2026-01-05", b, "2", "z"]])
-    led.import_csv(p)
-    infos = [r for r in cap.records if r.levelno == logging.INFO]
-    assert len(infos) == 2
-
-
 # ---------------------------------------------------------------- stage 12
-def test_s12_search():
-    led = L(clock=Clock())
-    a = led.open_account("A", "EUR"); b = led.open_account("B", "EUR")
-    t1 = led.deposit(a, 100, "Coffee beans")
-    led.deposit(b, 100, "rent")
-    t3 = led.transfer(a, b, 10, "coffee split")
-    res = led.search("COFFEE")
-    assert [(r["tx"], r["account"]) for r in res] == sorted([(t1, a), (t3, a), (t3, b)])
-    assert res[0]["memo"] == "Coffee beans" and res[0]["kind"] == "deposit" and res[0]["balance_after"] == 100
-    assert led.search("nothing") == []
-    with pytest.raises(E().ValidationError):
-        led.search("")
+def test_s12_find():
+    s, a, b = two()
+    y = s.book(a, "2026-03-03T09:00", 30, "Team Sync")
+    x = s.book(b, "2026-03-02T09:00", 30, "sync with HR")
+    s.book(a, "2026-03-02T09:00", 30, "Lunch")
+    assert [r["id"] for r in s.find("  SYNC ")] == [x, y]
+    assert s.find("nothing") == []
 
 
-def test_s12_error_classes():
-    er = E()
-    names = ["AmountError", "ValidationError", "UnknownAccountError", "InsufficientFundsError",
-             "CurrencyMismatchError", "LoadError", "UnknownHoldError"]
-    for n in names:
-        assert issubclass(getattr(er, n), Exception)
+def test_s12_find_excludes_cancelled():
+    s, a, _ = two()
+    x = s.book(a, "2026-03-02T09:00", 30, "Sync")
+    s.cancel(x)
+    assert s.find("sync") == []
+
+
+def test_s12_find_empty_query():
+    s, _, _ = two()
+    for q in ("", "   "):
+        with pytest.raises(E().ValidationError):
+            s.find(q)
+
+
+def test_s12_find_order_same_start():
+    s, a, b = two()
+    x = s.book(a, "2026-03-02T09:00", 30, "Sync A")
+    y = s.book(b, "2026-03-02T09:00", 30, "Sync B")
+    assert [r["id"] for r in s.find("sync")] == [x, y]
+    assert s.find("sync")[0]["room"] == a
