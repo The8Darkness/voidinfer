@@ -5,20 +5,17 @@ engines, with harness-side context compaction: when the next prompt would pass C
 writes a handoff summary that replaces the conversation. Commands run in WSL Ubuntu.
 
 Suites
-  polyglot  Aider polyglot benchmark, Python + C++ exercises; tests hidden during attempt 1, failing test output
-            shown for attempt 2 (aider's protocol, run as an agent).
-  lh        Long-horizon compaction survival (lh_spec.py): 12 stages building `vxledger`; project conventions only in
-            the first message; filler = reference source pasted with every stage to fill the context.
+  lh1  `vxledger` ledger library (lh1_spec.py)
+  lh2  `roomly` room-booking library (lh2_spec.py)
+Both: 12 stages, conventions and team decisions only in mid-session team chat, filler forces compaction;
+scored by hidden/<suite> (functional tests, one rule test per decision, convention checker).
 
-Usage: python -I bench.py --engine ours|nv --suite lh|polyglot --conc N --window W [--filler F] [--runs R] --tag T
+Usage: python -I bench.py --engine ours|nv --suite lh1|lh2 --conc N --window W [--filler F] [--runs R] --tag T
 """
 import argparse, concurrent.futures as cf, importlib, http.client, json, os, re, subprocess, sys, threading, time, traceback, urllib.request, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import lh_spec  # noqa: E402
-import lh2_spec  # noqa: E402
-import lh3_spec  # noqa: E402
 
 # Paths: override with AB_<NAME> environment variables (defaults are the machine the published runs used).
 ROOT = os.environ.get("AB_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -339,63 +336,13 @@ class Agent:
 
 
 # ---------------------------------------------------------------- suites
-def lh_job(job, window, filler_tokens, log):
-    run_wd = f"/root/agentbench/work/{job['id']}"
-    sh("/root", f"rm -rf {run_wd} && mkdir -p {run_wd} && cd {run_wd} && git init -q")
-    ag = Agent(run_wd, window, "STAGE_COMPLETE", log)
-    stage_info = []
-    t_start = time.time()
-    status = "ok"
-    try:
-        for k, spec in enumerate(lh_spec.STAGES[:STAGES]):
-            fill = filler(f"lh-stage-{k}", filler_tokens)
-            parts = []
-            if k == 0:
-                parts.append(lh_spec.BRIEF)
-            if fill:
-                parts.append(f"For context, here is part {k + 1} of the legacy C++ ledger engine we are replacing. It is "
-                             f"reference material only; do not port it.\n```cpp\n{fill}\n```")
-            parts.append(spec)
-            ag.pending.append({"role": "user", "content": "\n\n".join(parts)})
-            c0 = ag.compactions
-            done, steps = ag.run_until_done(30)
-            stage_info.append({"stage": k + 1, "done": done, "steps": steps, "compactions": ag.compactions - c0})
-            log({"event": "stage", **stage_info[-1], "elapsed_s": round(time.time() - t_start, 1)})
-            if not done:
-                ag.pending.append({"role": "user", "content": "Step limit for this stage reached; we move on."})
-    except Exception as e:
-        status = f"error: {e}"
-        log({"event": "job_error", "error": traceback.format_exc()[-1500:]})
-    wall = time.time() - t_start
-    # score
-    _, out = sh(run_wd, f"cp {WSL_ROOT}/hidden/lh/test_functional.py ./_hidden_test_functional.py && "
-                        f"python -m pytest -q --tb=no -rA -p no:cacheprovider _hidden_test_functional.py; "
-                        f"rm -f _hidden_test_functional.py", timeout=600)
-    passed = re.findall(r"^PASSED \S+::(\S+)", out, re.M)
-    failed = re.findall(r"^(?:FAILED|ERROR) \S+::(\S+)", out, re.M)
-    _, conv = sh(run_wd, f"python {WSL_ROOT}/hidden/lh/check_conventions.py 2>/dev/null | tail -1", timeout=600)
-    try:
-        conv = json.loads(conv.strip().splitlines()[-1])
-    except Exception:
-        conv = {"ok": {}, "score": 0, "raw": conv[-500:]}
-    recall = []
-    for s in ag.summaries:
-        hit = {k: bool(re.search(rx, s, re.I)) for k, rx in lh_spec.RECALL.items()}
-        recall.append(hit)
-    return {"status": status, "wall_s": round(wall, 1), "stages": stage_info, "compactions": ag.compactions,
-            "tests_passed": len(passed), "tests_failed": len(failed), "passed": passed, "failed": failed,
-            "conventions": conv.get("ok", {}), "conv_score": conv.get("score", 0), "conv_detail": conv.get("detail"),
-            "summary_recall": recall, "summaries": ag.summaries, "calls": ag.calls,
-            "t_llm_s": round(ag.t_llm, 1), "t_exec_s": round(ag.t_exec, 1)}
-
-
-def lh2_job(job, window, filler_tokens, log, S=lh2_spec, suite="lh2"):
-    """Long-horizon v2/v3: rules only in per-stage team notes (lh2_spec.py / lh3_spec.py); functional + rule tests +
+def lh_job(job, window, filler_tokens, log, S, suite):
+    """Long-horizon run: rules only in per-stage team notes (<suite>_spec.py); functional + rule tests +
     conventions from hidden/<suite>."""
     run_wd = f"/root/agentbench/work/{job['id']}"
     sh("/root", f"rm -rf {run_wd} && mkdir -p {run_wd} && cd {run_wd} && git init -q")
     ag = Agent(run_wd, window, "STAGE_COMPLETE", log)
-    stage_info, side_info = [], []
+    stage_info = []
     t_start = time.time()
     status = "ok"
     try:
@@ -405,38 +352,24 @@ def lh2_job(job, window, filler_tokens, log, S=lh2_spec, suite="lh2"):
             if k == 0:
                 parts.append(S.BRIEF)
             parts.append(f"Team chat since the last stage:\n```text\n{S.NOTES[k]}\n```")
-            if getattr(S, "DISTRACT", None) and S.DISTRACT[k]:
-                parts.append(f"{S.DISTRACT_INTRO}\n```text\n{S.DISTRACT[k]}\n```")
             if fill:
                 intro = getattr(S, "FILLER_INTRO", "For context, here is part {k} of the legacy C++ ledger engine we are "
                                                    "replacing. It is reference material only; do not port it.")
                 parts.append(intro.format(k=k + 1) + f"\n```cpp\n{fill}\n```")
             parts.append(spec)
-            ops = S.SETUP(k) if getattr(S, "SETUP", None) else {}
-            if ops:   # lh5: exports that exist only during this stage
-                src = os.path.join(ROOT, "tmp_ops", job["id"], str(k))
-                for rel, text in ops.items():
-                    os.makedirs(os.path.dirname(os.path.join(src, rel)), exist_ok=True)
-                    with open(os.path.join(src, rel), "w", encoding="utf-8", newline="\n") as f:
-                        f.write(text)
-                sh(run_wd, f"rm -rf ops && cp -r {WSL_ROOT}/tmp_ops/{job['id']}/{k}/ops ./ops")
             ag.pending.append({"role": "user", "content": "\n\n".join(parts)})
             ag.stage_pending = True
             c0 = ag.compactions
             done, steps = ag.run_until_done(30)
             stage_info.append({"stage": k + 1, "done": done, "steps": steps, "compactions": ag.compactions - c0})
             log({"event": "stage", **stage_info[-1], "elapsed_s": round(time.time() - t_start, 1)})
-            if ops:
-                sh(run_wd, "rm -rf ops")
             if not done:
                 ag.pending.append({"role": "user", "content": "Step limit for this stage reached; we move on."})
-            if getattr(S, "SIDE", False) and k < min(STAGES, len(S.STAGES)) - 1:
-                side_info.append(side_task(ag, run_wd, suite, k + 1, filler_tokens, log))
     except Exception as e:
         status = f"error: {e}"
         log({"event": "job_error", "error": traceback.format_exc()[-1500:]})
     wall = time.time() - t_start
-    H = f"{WSL_ROOT}/hidden/{getattr(S, 'HIDDEN', suite)}"
+    H = f"{WSL_ROOT}/hidden/{suite}"
     _, out = sh(run_wd, f"cp {H}/test_functional.py ./_hidden_test_functional.py && cp {H}/test_rules.py ./_hidden_test_rules.py && "
                         f"python -m pytest -q --tb=no -rA -p no:cacheprovider _hidden_test_functional.py _hidden_test_rules.py; "
                         f"rm -f _hidden_test_functional.py _hidden_test_rules.py", timeout=600)
@@ -462,110 +395,19 @@ def lh2_job(job, window, filler_tokens, log, S=lh2_spec, suite="lh2"):
             "rules_passed": sum(1 for f, _ in passed if "rules" in f),
             "passed": [f"{f}::{t}" for f, t in passed], "failed": [f"{f}::{t}" for f, t in failed],
             "conventions": conv.get("ok", {}), "conv_score": conv.get("score", 0), "conv_detail": conv.get("detail"),
-            "recall2": recall, "summaries": ag.summaries, "calls": ag.calls, "side": side_info,
+            "recall2": recall, "summaries": ag.summaries, "calls": ag.calls,
             "t_llm_s": round(ag.t_llm, 1), "t_exec_s": round(ag.t_exec, 1)}
-
-
-def side_task(ag, run_wd, suite, n, filler_tokens, log):
-    """lh6: an unrelated look-up task between two stages, with its own ~filler_tokens of legacy source, so every
-    stage boundary costs one extra compaction. The answer is a constant planted in the middle of the source."""
-    value = zlib.crc32(f"{suite}-side-{n}".encode()) % 90000 + 10000
-    fill = filler(f"{suite}-side-{n}", filler_tokens)
-    lines = fill.split("\n")
-    mid = len(lines) // 2
-    lines.insert(mid, f"static constexpr int kSideCheck{n} = {value};  // calibration constant")
-    msg = (f"Side task (not part of roomly; it changes nothing about the roomly project, its stages or its decisions). "
-           f"Below is another part of the legacy C++ facility service. Find the integer value of the constant "
-           f"`kSideCheck{n}` and write only that number into side/answer_{n}.txt (create the directory if needed). "
-           f"Then reply with a bash block containing only `echo STAGE_COMPLETE`; the next roomly stage follows after that."
-           f"\n```cpp\n" + "\n".join(lines) + "\n```")
-    ag.pending.append({"role": "user", "content": msg})
-    c0, t0 = ag.compactions, time.time()
-    done, steps = ag.run_until_done(8)
-    _, out = sh(run_wd, f"cat side/answer_{n}.txt 2>/dev/null")
-    ok = out.strip() == str(value)
-    info = {"side": n, "done": done, "steps": steps, "compactions": ag.compactions - c0, "ok": ok,
-            "wall_s": round(time.time() - t0, 1)}
-    log({"event": "side", **info})
-    if not done:
-        ag.pending.append({"role": "user", "content": "Step limit for the side task reached; we move on."})
-    return info
-
-
-POLY = os.path.join(ROOT, "repos", "polyglot")
-
-
-def poly_tasks():
-    out = []
-    for lang in ("python", "cpp"):
-        base = os.path.join(POLY, lang, "exercises", "practice")
-        for ex in sorted(os.listdir(base)):
-            cfg = json.load(open(os.path.join(base, ex, ".meta", "config.json")))
-            out.append({"lang": lang, "ex": ex, "files": cfg["files"]})
-    return out
-
-
-def poly_job(job, window, filler_tokens, log):
-    t = job["task"]
-    lang, ex = t["lang"], t["ex"]
-    src = f"{WSL_ROOT}/repos/polyglot/{lang}/exercises/practice/{ex}"
-    wd = f"/root/agentbench/work/{job['id']}/{ex}"  # exercism CMakeLists names the target after the directory
-    tests = t["files"]["test"]
-    sh("/root", f"rm -rf {wd} && mkdir -p {wd} && cp -r {src}/. {wd}/ && cd {wd} && rm -rf .meta .approaches "
-                + " ".join(f"'{x}'" for x in tests))
-    docs = os.path.join(POLY, lang, "exercises", "practice", ex, ".docs")
-    instr = ""
-    for name in ("introduction.md", "instructions.md", "instructions.append.md"):
-        p = os.path.join(docs, name)
-        if os.path.exists(p):
-            instr += open(p, encoding="utf-8").read().strip() + "\n\n"
-    files = " ".join(t["files"]["solution"])
-    task = (f"# {ex}\n\n{instr}Use the above instructions to modify the supplied files: {files}\n"
-            "Don't change the names of existing functions or classes, as they may be referenced from other code like "
-            "unit tests, etc. Only use standard libraries, don't suggest installing any packages.\n"
-            "When you are done, reply with a bash block containing only `echo TASK_COMPLETE`.")
-    ag = Agent(wd, window, "TASK_COMPLETE", log)
-    ag.pending.append({"role": "user", "content": task})
-    t0 = time.time()
-    if lang == "python":
-        test_cmd = f"python -m pytest -q --tb=short -p no:cacheprovider {' '.join(tests)}"
-    else:
-        test_cmd = "rm -rf build && mkdir -p build && cd build && cmake -DEXERCISM_RUN_ALL_TESTS=1 .. >/dev/null && make 2>&1"
-    restore = f"cp {' '.join(src + '/' + x for x in tests)} . 2>/dev/null; " if lang == "python" else \
-        f"for f in {' '.join(tests)}; do cp {src}/$f ./$f; done; "
-    res = {"status": "ok"}
-    try:
-        _, steps1 = ag.run_until_done(20)
-        rc, out = sh(wd, restore + test_cmd, timeout=600)
-        p1 = rc == 0
-        res.update(pass1=p1, steps1=steps1)
-        p2, steps2 = p1, 0
-        if not p1:
-            ag.pending.append({"role": "user", "content": "The hidden tests failed:\n```\n" + out[-4000:] + "\n```\n"
-                                                         "Fix the code so the tests pass. The test files are now in the "
-                                                         "working directory; do not modify them. Reply with `echo TASK_COMPLETE` when done."})
-            _, steps2 = ag.run_until_done(20)
-            rc, out = sh(wd, restore + test_cmd, timeout=600)
-            p2 = rc == 0
-        res.update(pass2=p2, steps2=steps2, test_tail=out[-1500:])
-    except Exception as e:
-        res.update(status=f"error: {e}", pass1=res.get("pass1", False), pass2=False)
-        log({"event": "job_error", "error": traceback.format_exc()[-1500:]})
-    res.update(wall_s=round(time.time() - t0, 1), compactions=ag.compactions, calls=ag.calls,
-               t_llm_s=round(ag.t_llm, 1), t_exec_s=round(ag.t_exec, 1), lang=lang, ex=ex)
-    return res
 
 
 # ---------------------------------------------------------------- runner
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", required=True, choices=["ours", "nv"])
-    ap.add_argument("--suite", required=True, choices=["lh", "lh2", "lh3", "lh4", "lh5", "lh6", "lh7", "polyglot"])
+    ap.add_argument("--suite", required=True, choices=["lh1", "lh2"])
     ap.add_argument("--conc", type=int, default=1)
     ap.add_argument("--window", type=int, required=True)
     ap.add_argument("--filler", type=int, default=0)
     ap.add_argument("--runs", type=int, default=1)
-    ap.add_argument("--limit", type=int, default=0, help="polyglot: first N tasks only")
     ap.add_argument("--tag", required=True)
     ap.add_argument("--no-server", action="store_true")
     a = ap.parse_args()
@@ -575,21 +417,9 @@ def main():
     done_ids = set()
     if os.path.exists(out_path):
         done_ids = {json.loads(l)["id"] for l in open(out_path, encoding="utf-8") if l.strip()}
-    if a.suite.startswith("lh"):
-        jobs = [{"id": f"{a.tag}.{a.engine}.lh{r}" if a.suite == "lh" else f"{a.tag}.{a.engine}.{a.suite}_{r}"} for r in range(a.runs)]
-        if a.suite == "lh":
-            fn = lh_job
-        else:
-            S = importlib.import_module(f"{a.suite}_spec")
-            fn = lambda job, w, f, log: lh2_job(job, w, f, log, S=S, suite=a.suite)
-    else:
-        tasks = poly_tasks()
-        if os.environ.get("POLY_LANG"):
-            tasks = [t for t in tasks if t["lang"] == os.environ["POLY_LANG"]]
-        if a.limit:
-            tasks = tasks[:a.limit]
-        jobs = [{"id": f"{a.tag}.{a.engine}.{t['lang']}.{t['ex']}.r{r}", "task": t} for r in range(a.runs) for t in tasks]
-        fn = poly_job
+    jobs = [{"id": f"{a.tag}.{a.engine}.{a.suite}_{r}"} for r in range(a.runs)]
+    S = importlib.import_module(f"{a.suite}_spec")
+    fn = lambda job, w, f, log: lh_job(job, w, f, log, S=S, suite=a.suite)
     jobs = [j for j in jobs if j["id"] not in done_ids]
     print(f"{len(jobs)} jobs to run -> {out_path}", flush=True)
     if not jobs:

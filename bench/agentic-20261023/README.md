@@ -21,22 +21,22 @@ exact server command lines are stored with the agent results (`results/<tag>/<en
 
 | Path | What |
 |---|---|
-| `harness/bench.py` | Agent loop, compaction, sandbox execution, scoring (all `lh*` suites) |
-| `harness/lh_spec.py` … `lh7_spec.py` | Stage texts, decisions, conventions and filler plan for each suite version |
+| `harness/bench.py` | Agent loop, compaction, sandbox execution, scoring |
+| `harness/lh1_spec.py`, `lh2_spec.py` | Stage texts, decisions, conventions and filler plan for the two projects |
 | `hidden/<suite>/` | Hidden tests (`test_functional.py`, `test_rules.py`), convention checker, reference solution (`ref/`) |
 | `harness/report.py` | Aggregates `results/<tag>/<engine>.jsonl` into tables (Mann-Whitney U per row) |
 | `harness/aime.py` | AIME 2026 runner and report (avg@k, majority vote, pass@k, paired sign-flip permutation test) |
 | `harness/decode_sweep.py` | Decode tok/s and time to first token from 3K to 200K tokens of context |
 | `harness/speed_rows.py` | Two requests at once (aggregate decode) and 100K-token agent resume, re-measured on the release build (not in the top-level README) |
 | `harness/setup_wsl.sh` | Creates the WSL Python environment (pytest) that runs the agent's commands |
-| `results/lh2_c1_w208896`, `results/lh3_c1_w208896` | Per-run agent results for the two README agent tests (6 runs per engine) |
+| `results/lh1_c1_w208896`, `results/lh2_c1_w208896` | Per-run agent results for the two README agent tests (6 runs per engine) |
 | `results/aime2026`, `results/aime2026_c1_200k` | Every AIME generation: answer, correctness, finish reason, tokens, seconds |
 | `results/decode_sweep` | Decode sweep, two-request and resume rows |
 
 The decode and resume scripts reuse `../engine-compare/capacity_20261020.py`, which handles server
 start-up, streamed requests and timing.
 
-## Coding agents (`lh2` = ledger library, `lh3` = room-booking library)
+## Coding agents (`lh1` = ledger library, `lh2` = room-booking library)
 
 - **Loop.** The loop is mini-swe-agent style: each reply holds one bash block, which runs in a WSL Ubuntu sandbox.
   - Commands time out after 120 s, and observations are capped at 24K characters.
@@ -53,24 +53,15 @@ start-up, streamed requests and timing.
   - The reference solutions in `hidden/<suite>/ref` score full marks.
 
 ```bat
-python -I harness/bench.py --engine ours --suite lh2 --conc 1 --window 208896 --filler 100000 --runs 6 --tag lh2_c1_w208896
-python -I harness/bench.py --engine nv   --suite lh2 --conc 1 --window 208896 --filler 100000 --runs 6 --tag lh2_c1_w208896
+python -I harness/bench.py --engine ours --suite lh1 --conc 1 --window 208896 --filler 100000 --runs 6 --tag lh1_c1_w208896
+python -I harness/bench.py --engine nv   --suite lh1 --conc 1 --window 208896 --filler 100000 --runs 6 --tag lh1_c1_w208896
 python -I harness/report.py
 ```
 
-Use `--suite lh3 --tag lh3_c1_w208896` for the room-booking project. NInfer needs `NV_KV=208896`,
+Use `--suite lh2 --tag lh2_c1_w208896` for the room-booking project. NInfer needs `NV_KV=208896`,
 because `--kv-capacity auto` misses this window by a few MB. Before the first run, `wsl -d Ubuntu-24.04 bash harness/setup_wsl.sh`
 creates the sandbox Python. The filler is a large C++ source file, pre-tokenized into a JSON list of token IDs
 (`AB_SRC_IDS`). The source file itself is not included; any large source file works, though scores may differ slightly.
-
-`harness/bench.py` also contains the other suite versions that are not in the README:
-- `lh4`: revisions;
-- `lh5`: facts delivered in tool output;
-- `lh6`: 22 compactions;
-- `lh7`: deferred decisions;
-- `polyglot`: Aider polyglot.
-
-None of them showed a significant difference between the engines.
 
 ## AIME 2026
 

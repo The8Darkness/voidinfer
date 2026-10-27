@@ -1,4 +1,4 @@
-"""Hidden functional tests for the 12 vxledger stages. They only check what the stage messages state;
+"""Hidden functional tests for the 12 vxledger stages (statement names upper case, hold ids HOLD-0001, default transfer memo). They only check what the stage messages state;
 the project conventions (default currency, id format, logging prefix, exit status, ...) are checked by
 check_conventions.py. Tests use explicit currencies and returned ids so they never depend on a convention."""
 import csv, json, logging, os, subprocess, sys
@@ -316,14 +316,14 @@ def test_s8_statement():
     led.deposit(a, 1)
     s = led.monthly_statement(a, 2026, 3)
     assert s == "\n".join([
-        f"Statement {a} (Alice) 2026-03",
+        f"Statement {a} (ALICE) 2026-03",
         "Opening balance: EUR 10.00",
         "2026-03-02 TX00000002 deposit +EUR 5.00 -> EUR 15.00 refund",
-        "2026-03-15 TX00000003 transfer_out -EUR 12.34 -> EUR 2.66",
+        f"2026-03-15 TX00000003 transfer_out -EUR 12.34 -> EUR 2.66 xfer {a}>{b}",
         "Closing balance: EUR 2.66",
     ])
     empty = led.monthly_statement(b, 2026, 1)
-    assert empty == f"Statement {b} (Bob) 2026-01\nOpening balance: EUR 0.00\nClosing balance: EUR 0.00"
+    assert empty == f"Statement {b} (BOB) 2026-01\nOpening balance: EUR 0.00\nClosing balance: EUR 0.00"
     with pytest.raises(E().ValidationError):
         led.monthly_statement(a, 2026, 13)
 
@@ -356,7 +356,7 @@ def test_s9_cli_statement(tmp_path):
     r = cli(tmp_path, "statement", a, ym)
     assert r.returncode == 0
     lines = r.stdout.strip().splitlines()
-    assert lines[0] == f"Statement {a} (Alice) {ym}" and lines[-1] == "Closing balance: EUR 5.00"
+    assert lines[0] == f"Statement {a} (ALICE) {ym}" and lines[-1] == "Closing balance: EUR 5.00"
 
 
 def test_s9_cli_error_message(tmp_path):
@@ -375,7 +375,7 @@ def test_s10_holds():
     led.deposit(a, 1000); led.set_overdraft(a, 100)
     h1 = led.place_hold(a, 600, "card")
     h2 = led.place_hold(a, 400, "hotel")
-    assert (h1, h2) == ("HOLD-1", "HOLD-2")
+    assert (h1, h2) == ("HOLD-0001", "HOLD-0002")
     assert led.available(a) == 100 and led.balance(a) == 1000
     with pytest.raises(E().InsufficientFundsError):
         led.place_hold(a, 101, "x")
@@ -389,7 +389,7 @@ def test_s10_holds():
     with pytest.raises(E().UnknownHoldError):
         led.release_hold(h1)
     with pytest.raises(E().UnknownHoldError):
-        led.release_hold("HOLD-99")
+        led.release_hold("HOLD-0099")
     with pytest.raises(E().ValidationError):
         led.place_hold(a, 0, "x")
     assert len(led.history(a)) == 2  # holds are not transactions
@@ -407,7 +407,7 @@ def test_s10_holds_persist(tmp_path):
     assert led2.available(a) == 700
     led2.release_hold(h)
     assert led2.available(a) == 1000
-    assert led2.place_hold(a, 1, "y") == "HOLD-2"
+    assert led2.place_hold(a, 1, "y") == "HOLD-0002"
 
 
 # ---------------------------------------------------------------- stage 11
